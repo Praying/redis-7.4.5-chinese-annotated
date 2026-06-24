@@ -7,9 +7,24 @@
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
+/*
+ * Redis Object（对象）系统实现
+ *
+ * 本文件实现了 Redis 的核心对象系统，包括：
+ * - 各种类型对象的创建和释放（string、list、set、hash、sorted set、stream、module）
+ * - 对象编码转换和优化（如 RAW/EMBSTR/INT 编码之间的转换）
+ * - 引用计数管理（refcount）
+ * - LRU/LFU 淘汰信息管理
+ * - 内存使用量计算和内存诊断
+ * - OBJECT 和 MEMORY 命令的实现
+ *
+ * Redis 中每个值都被封装为一个 robj（Redis Object）结构体，
+ * 包含类型（type）、编码（encoding）、引用计数（refcount）等元信息。
+ */
+
 #include "server.h"
 #include "functions.h"
-#include "intset.h"  /* Compact integer set structure */
+#include "intset.h"  /* 紧凑的整数集合结构 */
 #include <math.h>
 #include <ctype.h>
 
@@ -17,8 +32,12 @@
 #define strtold(a,b) ((long double)strtod((a),(b)))
 #endif
 
-/* ===================== Creation and parsing of objects ==================== */
+/* ===================== 对象的创建和解析 ==================== */
 
+/* 创建一个新的 Redis 对象。
+ * 参数 type 为对象类型（如 OBJ_STRING、OBJ_LIST 等），
+ * 参数 ptr 为指向实际数据的指针。
+ * 默认编码为 OBJ_ENCODING_RAW，引用计数初始化为 1。 */
 robj *createObject(int type, void *ptr) {
     robj *o = zmalloc(sizeof(*o));
     o->type = type;
@@ -29,11 +48,14 @@ robj *createObject(int type, void *ptr) {
     return o;
 }
 
+/* 初始化对象的 LRU 或 LFU 信息。
+ * 如果当前淘汰策略使用 LFU，则设置 LFU 计数器（高 16 位为时间，低 8 位为访问频率）；
+ * 否则设置 LRU 时钟值（用于 LRU 淘汰算法计算空闲时间）。
+ * 共享对象（refcount == OBJ_SHARED_REFCOUNT）不需要初始化，直接返回。 */
 void initObjectLRUOrLFU(robj *o) {
     if (o->refcount == OBJ_SHARED_REFCOUNT)
         return;
-    /* Set the LRU to the current lruclock (minutes resolution), or
-     * alternatively the LFU counter. */
+    /* 根据当前淘汰策略设置 LRU 时钟（分钟精度）或 LFU 计数器 */
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
         o->lru = (LFUGetTimeInMinutes() << 8) | LFU_INIT_VAL;
     } else {
@@ -42,16 +64,12 @@ void initObjectLRUOrLFU(robj *o) {
     return;
 }
 
-/* Set a special refcount in the object to make it "shared":
- * incrRefCount and decrRefCount() will test for this special refcount
- * and will not touch the object. This way it is free to access shared
- * objects such as small integers from different threads without any
- * mutex.
+/* 设置对象的引用计数为特殊值 OBJ_SHARED_REFCOUNT，使其成为"共享对象"。
+ * incrRefCount 和 decrRefCount 会检测到这个特殊值而不会修改引用计数，
+ * 这样可以从不同线程安全地访问共享对象（如小整数），无需互斥锁。
  *
- * A common pattern to create shared objects:
- *
+ * 创建共享对象的常见模式：
  * robj *myobject = makeObjectShared(createObject(...));
- *
  */
 robj *makeObjectShared(robj *o) {
     serverAssert(o->refcount == 1);
@@ -59,22 +77,24 @@ robj *makeObjectShared(robj *o) {
     return o;
 }
 
-/* Create a string object with encoding OBJ_ENCODING_RAW, that is a plain
- * string object where o->ptr points to a proper sds string. */
+/* 创建一个编码为 OBJ_ENCODING_RAW 的字符串对象，
+ * 即普通的字符串对象，o->ptr 指向一个有效的 sds 字符串。 */
 robj *createRawStringObject(const char *ptr, size_t len) {
     return createObject(OBJ_STRING, sdsnewlen(ptr,len));
 }
 
-/* Create a string object with encoding OBJ_ENCODING_EMBSTR, that is
- * an object where the sds string is actually an unmodifiable string
- * allocated in the same chunk as the object itself. */
+/* 创建一个编码为 OBJ_ENCODING_EMBSTR 的字符串对象，
+ * 即嵌入式字符串对象：sds 字符串与对象本身分配在同一块内存中。
+ * 这种编码方式减少了内存分配次数和内存碎片，提高了缓存命中率。
+ * 注意：EMBSTR 编码的字符串是不可修改的。 */
 robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    /* 一次性分配 robj + sdshdr8 + 字符串数据 + \0 终止符 */
     robj *o = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+len+1);
     struct sdshdr8 *sh = (void*)(o+1);
 
     o->type = OBJ_STRING;
     o->encoding = OBJ_ENCODING_EMBSTR;
-    o->ptr = sh+1;
+    o->ptr = sh+1;  /* 指向 sdshdr8 之后的 buf 区域 */
     o->refcount = 1;
     o->lru = 0;
 
@@ -92,12 +112,11 @@ robj *createEmbeddedStringObject(const char *ptr, size_t len) {
     return o;
 }
 
-/* Create a string object with EMBSTR encoding if it is smaller than
- * OBJ_ENCODING_EMBSTR_SIZE_LIMIT, otherwise the RAW encoding is
- * used.
+/* 创建字符串对象：如果长度小于等于 OBJ_ENCODING_EMBSTR_SIZE_LIMIT（44字节），
+ * 使用 EMBSTR 编码（对象和字符串在同一块内存中），否则使用 RAW 编码。
  *
- * The current limit of 44 is chosen so that the biggest string object
- * we allocate as EMBSTR will still fit into the 64 byte arena of jemalloc. */
+ * 当前限制为 44 字节，是为了确保最大的 EMBSTR 字符串对象
+ * 仍然能放入 jemalloc 的 64 字节内存块中。 */
 #define OBJ_ENCODING_EMBSTR_SIZE_LIMIT 44
 robj *createStringObject(const char *ptr, size_t len) {
     if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT)
@@ -106,14 +125,14 @@ robj *createStringObject(const char *ptr, size_t len) {
         return createRawStringObject(ptr,len);
 }
 
-/* Same as CreateRawStringObject, can return NULL if allocation fails */
+/* 与 createRawStringObject 相同，但在分配失败时返回 NULL 而不是崩溃 */
 robj *tryCreateRawStringObject(const char *ptr, size_t len) {
     sds str = sdstrynewlen(ptr,len);
     if (!str) return NULL;
     return createObject(OBJ_STRING, str);
 }
 
-/* Same as createStringObject, can return NULL if allocation fails */
+/* 与 createStringObject 相同，但在分配失败时返回 NULL 而不是崩溃 */
 robj *tryCreateStringObject(const char *ptr, size_t len) {
     if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT)
         return createEmbeddedStringObject(ptr,len);
@@ -121,21 +140,26 @@ robj *tryCreateStringObject(const char *ptr, size_t len) {
         return tryCreateRawStringObject(ptr,len);
 }
 
-/* Create a string object from a long long value according to the specified flag. */
-#define LL2STROBJ_AUTO 0       /* automatically create the optimal string object */
-#define LL2STROBJ_NO_SHARED 1  /* disallow shared objects */
-#define LL2STROBJ_NO_INT_ENC 2 /* disallow integer encoded objects. */
+/* 根据指定的标志，从 long long 值创建字符串对象。
+ * 标志控制是否允许使用共享对象或整数编码。 */
+#define LL2STROBJ_AUTO 0       /* 自动创建最优的字符串对象 */
+#define LL2STROBJ_NO_SHARED 1  /* 禁止使用共享对象 */
+#define LL2STROBJ_NO_INT_ENC 2 /* 禁止使用整数编码 */
 robj *createStringObjectFromLongLongWithOptions(long long value, int flag) {
     robj *o;
 
     if (value >= 0 && value < OBJ_SHARED_INTEGERS && flag == LL2STROBJ_AUTO) {
+        /* 值在共享整数范围内且允许使用共享对象，直接返回预分配的共享整数 */
         o = shared.integers[value];
     } else {
         if ((value >= LONG_MIN && value <= LONG_MAX) && flag != LL2STROBJ_NO_INT_ENC) {
+            /* 值在 long 范围内且允许整数编码，使用 OBJ_ENCODING_INT 编码
+             * 将整数值直接存储在 ptr 指针中，无需额外分配内存 */
             o = createObject(OBJ_STRING, NULL);
             o->encoding = OBJ_ENCODING_INT;
             o->ptr = (void*)((long)value);
         } else {
+            /* 值超出范围或禁止整数编码，转换为字符串后创建对象 */
             char buf[LONG_STR_SIZE];
             int len = ll2string(buf, sizeof(buf), value);
             o = createStringObject(buf, len);
@@ -144,52 +168,45 @@ robj *createStringObjectFromLongLongWithOptions(long long value, int flag) {
     return o;
 }
 
-/* Wrapper for createStringObjectFromLongLongWithOptions() always demanding
- * to create a shared object if possible. */
+/* createStringObjectFromLongLongWithOptions 的包装函数，
+ * 总是尽可能使用共享对象。 */
 robj *createStringObjectFromLongLong(long long value) {
     return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_AUTO);
 }
 
-/* The function avoids returning a shared integer when LFU/LRU info
- * are needed, that is, when the object is used as a value in the key
- * space(for instance when the INCR command is used), and Redis is
- * configured to evict based on LFU/LRU, so we want LFU/LRU values
- * specific for each key. */
+/* 为键空间中的值创建字符串对象时，避免返回共享整数。
+ * 当对象用作键空间中的值时（例如 INCR 命令），如果 Redis 配置了
+ * 基于 LFU/LRU 的淘汰策略，每个键需要独立的 LFU/LRU 信息，
+ * 因此不能使用共享对象（共享对象的 LRU 字段是共享的）。 */
 robj *createStringObjectFromLongLongForValue(long long value) {
     if (server.maxmemory == 0 || !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) {
-        /* If the maxmemory policy permits, we can still return shared integers */
+        /* 如果淘汰策略允许，仍然可以返回共享整数 */
         return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_AUTO);
     } else {
         return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_NO_SHARED);
     }
 }
 
-/* Create a string object that contains an sds inside it. That means it can't be
- * integer encoded (OBJ_ENCODING_INT), and it'll always be an EMBSTR type. */
+/* 创建一个包含 sds 的字符串对象。这意味着它不能使用整数编码（OBJ_ENCODING_INT），
+ * 将始终使用 EMBSTR 编码类型。 */
 robj *createStringObjectFromLongLongWithSds(long long value) {
     return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_NO_INT_ENC);
 }
 
-/* Create a string object from a long double. If humanfriendly is non-zero
- * it does not use exponential format and trims trailing zeroes at the end,
- * however this results in loss of precision. Otherwise exp format is used
- * and the output of snprintf() is not modified.
- *
- * The 'humanfriendly' option is used for INCRBYFLOAT and HINCRBYFLOAT. */
+/* 从 long double 值创建字符串对象。
+ * 如果 humanfriendly 为非零值，不使用指数格式并去除末尾的零，
+ * 但这会导致精度损失。否则使用指数格式，不修改 snprintf() 的输出。
+ * 'humanfriendly' 选项用于 INCRBYFLOAT 和 HINCRBYFLOAT 命令。 */
 robj *createStringObjectFromLongDouble(long double value, int humanfriendly) {
     char buf[MAX_LONG_DOUBLE_CHARS];
     int len = ld2string(buf,sizeof(buf),value,humanfriendly? LD_STR_HUMAN: LD_STR_AUTO);
     return createStringObject(buf,len);
 }
 
-/* Duplicate a string object, with the guarantee that the returned object
- * has the same encoding as the original one.
- *
- * This function also guarantees that duplicating a small integer object
- * (or a string object that contains a representation of a small integer)
- * will always result in a fresh object that is unshared (refcount == 1).
- *
- * The resulting object always has refcount set to 1. */
+/* 复制字符串对象，保证返回的对象与原始对象具有相同的编码。
+ * 复制小整数对象（或包含小整数表示的字符串对象）时，
+ * 总是返回一个新的非共享对象（refcount == 1）。
+ * 返回的对象的引用计数始终设置为 1。 */
 robj *dupStringObject(const robj *o) {
     robj *d;
 
@@ -211,6 +228,8 @@ robj *dupStringObject(const robj *o) {
     }
 }
 
+/* 创建一个 quicklist 编码的 list 对象。
+ * fill 参数控制每个节点的最大容量，compress 参数控制压缩深度。 */
 robj *createQuicklistObject(int fill, int compress) {
     quicklist *l = quicklistNew(fill, compress);
     robj *o = createObject(OBJ_LIST,l);
@@ -218,6 +237,8 @@ robj *createQuicklistObject(int fill, int compress) {
     return o;
 }
 
+/* 创建一个 listpack 编码的 list 对象。
+ * listpack 是一种紧凑的序列化结构，适用于小列表。 */
 robj *createListListpackObject(void) {
     unsigned char *lp = lpNew(0);
     robj *o = createObject(OBJ_LIST,lp);
@@ -225,6 +246,7 @@ robj *createListListpackObject(void) {
     return o;
 }
 
+/* 创建一个使用 hashtable（字典）编码的 set 对象。 */
 robj *createSetObject(void) {
     dict *d = dictCreate(&setDictType);
     robj *o = createObject(OBJ_SET,d);
@@ -232,6 +254,8 @@ robj *createSetObject(void) {
     return o;
 }
 
+/* 创建一个使用 intset（整数集合）编码的 set 对象。
+ * intset 适用于所有元素都是整数的小集合。 */
 robj *createIntsetObject(void) {
     intset *is = intsetNew();
     robj *o = createObject(OBJ_SET,is);
@@ -239,6 +263,7 @@ robj *createIntsetObject(void) {
     return o;
 }
 
+/* 创建一个使用 listpack 编码的 set 对象。 */
 robj *createSetListpackObject(void) {
     unsigned char *lp = lpNew(0);
     robj *o = createObject(OBJ_SET, lp);
@@ -246,6 +271,8 @@ robj *createSetListpackObject(void) {
     return o;
 }
 
+/* 创建一个使用 listpack 编码的 hash 对象。
+ * hash 对象初始时使用 listpack 编码，当元素过多时会转换为 hashtable 编码。 */
 robj *createHashObject(void) {
     unsigned char *zl = lpNew(0);
     robj *o = createObject(OBJ_HASH, zl);
@@ -253,6 +280,9 @@ robj *createHashObject(void) {
     return o;
 }
 
+/* 创建一个使用 skiplist 编码的 sorted set（有序集合）对象。
+ * zset 同时使用跳表（skiplist）和字典（dict）来实现，
+ * 跳表用于范围查询，字典用于按成员名快速查找分数。 */
 robj *createZsetObject(void) {
     zset *zs = zmalloc(sizeof(*zs));
     robj *o;
@@ -264,6 +294,8 @@ robj *createZsetObject(void) {
     return o;
 }
 
+/* 创建一个使用 listpack 编码的 sorted set 对象。
+ * 适用于小型有序集合。 */
 robj *createZsetListpackObject(void) {
     unsigned char *lp = lpNew(0);
     robj *o = createObject(OBJ_ZSET,lp);
@@ -271,6 +303,7 @@ robj *createZsetListpackObject(void) {
     return o;
 }
 
+/* 创建一个 stream（流）对象。 */
 robj *createStreamObject(void) {
     stream *s = streamNew();
     robj *o = createObject(OBJ_STREAM,s);
@@ -278,6 +311,8 @@ robj *createStreamObject(void) {
     return o;
 }
 
+/* 创建一个 module（模块）对象。
+ * mt 为模块类型定义，value 为模块自定义的数据。 */
 robj *createModuleObject(moduleType *mt, void *value) {
     moduleValue *mv = zmalloc(sizeof(*mv));
     mv->type = mt;
@@ -285,12 +320,16 @@ robj *createModuleObject(moduleType *mt, void *value) {
     return createObject(OBJ_MODULE,mv);
 }
 
+/* 释放字符串对象。只有 RAW 编码需要释放 sds 内存，
+ * EMBSTR 编码与 robj 在同一块内存中，随 robj 一起释放，
+ * INT 编码不指向额外内存。 */
 void freeStringObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_RAW) {
         sdsfree(o->ptr);
     }
 }
 
+/* 释放 list 对象。根据编码类型释放对应的底层数据结构。 */
 void freeListObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistRelease(o->ptr);
@@ -301,6 +340,7 @@ void freeListObject(robj *o) {
     }
 }
 
+/* 释放 set 对象。根据编码类型释放字典、intset 或 listpack。 */
 void freeSetObject(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_HT:
@@ -315,6 +355,7 @@ void freeSetObject(robj *o) {
     }
 }
 
+/* 释放 sorted set 对象。skiplist 编码需要同时释放字典和跳表。 */
 void freeZsetObject(robj *o) {
     zset *zs;
     switch (o->encoding) {
@@ -332,34 +373,44 @@ void freeZsetObject(robj *o) {
     }
 }
 
+/* 释放 hash 对象。委托给 hashTypeFree 处理。 */
 void freeHashObject(robj *o) {
     hashTypeFree(o);
 }
 
+/* 释放 module 对象。调用模块注册的 free 回调释放模块数据。 */
 void freeModuleObject(robj *o) {
     moduleValue *mv = o->ptr;
     mv->type->free(mv->value);
     zfree(mv);
 }
 
+/* 释放 stream 对象。 */
 void freeStreamObject(robj *o) {
     freeStream(o->ptr);
 }
 
+/* 增加对象的引用计数。
+ * 特殊引用计数（OBJ_SHARED_REFCOUNT 和 OBJ_STATIC_REFCOUNT）不受影响：
+ * - OBJ_SHARED_REFCOUNT：共享对象，引用计数不可变
+ * - OBJ_STATIC_REFCOUNT：栈上分配的对象，不应被保留 */
 void incrRefCount(robj *o) {
     if (o->refcount < OBJ_FIRST_SPECIAL_REFCOUNT) {
         o->refcount++;
     } else {
         if (o->refcount == OBJ_SHARED_REFCOUNT) {
-            /* Nothing to do: this refcount is immutable. */
+            /* 无需操作：共享对象的引用计数不可变 */
         } else if (o->refcount == OBJ_STATIC_REFCOUNT) {
             serverPanic("You tried to retain an object allocated in the stack");
         }
     }
 }
 
+/* 减少对象的引用计数。当引用计数降为 0 时，释放对象及其底层数据。
+ * 特殊引用计数（OBJ_SHARED_REFCOUNT）不会被减少。 */
 void decrRefCount(robj *o) {
     if (o->refcount == 1) {
+        /* 引用计数为 1，说明没有其他引用，释放对象 */
         switch(o->type) {
         case OBJ_STRING: freeStringObject(o); break;
         case OBJ_LIST: freeListObject(o); break;
@@ -377,25 +428,27 @@ void decrRefCount(robj *o) {
     }
 }
 
-/* See dismissObject() */
+/* 释放 sds 字符串的物理内存页面。参见 dismissObject() 的说明。 */
 void dismissSds(sds s) {
     dismissMemory(sdsAllocPtr(s), sdsAllocSize(s));
 }
 
-/* See dismissObject() */
+/* 释放字符串对象的物理内存页面。参见 dismissObject() 的说明。 */
 void dismissStringObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_RAW) {
         dismissSds(o->ptr);
     }
 }
 
-/* See dismissObject() */
+/* 释放 list 对象的物理内存页面。参见 dismissObject() 的说明。
+ * 只有当平均节点大小大于页面大小时才遍历所有节点，
+ * 因为只有在这种情况下才有可能释放出物理页面。 */
 void dismissListObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklist *ql = o->ptr;
         serverAssert(ql->len != 0);
-        /* We iterate all nodes only when average node size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
+        /* 只有当平均节点大小大于页面大小时才遍历所有节点，
+         * 这样才有较高的概率真正释放出物理页面。 */
         if (size_hint / ql->len >= server.page_size) {
             quicklistNode *node = ql->head;
             while (node) {
@@ -414,13 +467,12 @@ void dismissListObject(robj *o, size_t size_hint) {
     }
 }
 
-/* See dismissObject() */
+/* 释放 set 对象的物理内存页面。参见 dismissObject() 的说明。 */
 void dismissSetObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_HT) {
         dict *set = o->ptr;
         serverAssert(dictSize(set) != 0);
-        /* We iterate all nodes only when average member size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
+        /* 只有当平均成员大小大于页面大小时才遍历所有节点 */
         if (size_hint / dictSize(set) >= server.page_size) {
             dictEntry *de;
             dictIterator *di = dictGetIterator(set);
@@ -430,7 +482,7 @@ void dismissSetObject(robj *o, size_t size_hint) {
             dictReleaseIterator(di);
         }
 
-        /* Dismiss hash table memory. */
+        /* 释放哈希表本身的内存页面 */
         dismissMemory(set->ht_table[0], DICTHT_SIZE(set->ht_size_exp[0])*sizeof(dictEntry*));
         dismissMemory(set->ht_table[1], DICTHT_SIZE(set->ht_size_exp[1])*sizeof(dictEntry*));
     } else if (o->encoding == OBJ_ENCODING_INTSET) {
@@ -442,14 +494,13 @@ void dismissSetObject(robj *o, size_t size_hint) {
     }
 }
 
-/* See dismissObject() */
+/* 释放 sorted set 对象的物理内存页面。参见 dismissObject() 的说明。 */
 void dismissZsetObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
         zskiplist *zsl = zs->zsl;
         serverAssert(zsl->length != 0);
-        /* We iterate all nodes only when average member size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
+        /* 只有当平均成员大小大于页面大小时才遍历跳表节点 */
         if (size_hint / zsl->length >= server.page_size) {
             zskiplistNode *zn = zsl->tail;
             while (zn != NULL) {
@@ -458,7 +509,7 @@ void dismissZsetObject(robj *o, size_t size_hint) {
             }
         }
 
-        /* Dismiss hash table memory. */
+        /* 释放哈希表本身的内存页面 */
         dict *d = zs->dict;
         dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0])*sizeof(dictEntry*));
         dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1])*sizeof(dictEntry*));
@@ -469,25 +520,23 @@ void dismissZsetObject(robj *o, size_t size_hint) {
     }
 }
 
-/* See dismissObject() */
+/* 释放 hash 对象的物理内存页面。参见 dismissObject() 的说明。 */
 void dismissHashObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_HT) {
         dict *d = o->ptr;
         serverAssert(dictSize(d) != 0);
-        /* We iterate all fields only when average field/value size is bigger than
-         * a page size, and there's a high chance we'll actually dismiss something. */
+        /* 只有当平均字段/值大小大于页面大小时才遍历所有字段 */
         if (size_hint / dictSize(d) >= server.page_size) {
             dictEntry *de;
             dictIterator *di = dictGetIterator(d);
             while ((de = dictNext(di)) != NULL) {
-                /* Only dismiss values memory since the field size
-                 * usually is small. */
+                /* 只释放值的内存，因为字段名通常很小 */
                 dismissSds(dictGetVal(de));
             }
             dictReleaseIterator(di);
         }
 
-        /* Dismiss hash table memory. */
+        /* 释放哈希表本身的内存页面 */
         dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0])*sizeof(dictEntry*));
         dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1])*sizeof(dictEntry*));
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
@@ -500,15 +549,15 @@ void dismissHashObject(robj *o, size_t size_hint) {
     }
 }
 
-/* See dismissObject() */
+/* 释放 stream 对象的物理内存页面。参见 dismissObject() 的说明。
+ * 只遍历 stream 的条目（entries），虽然 size_hint 可能包含
+ * 序列化的消费者组信息，但通常 stream 条目占据了大部分空间。 */
 void dismissStreamObject(robj *o, size_t size_hint) {
     stream *s = o->ptr;
     rax *rax = s->rax;
     if (raxSize(rax) == 0) return;
 
-    /* Iterate only on stream entries, although size_hint may include serialized
-     * consumer groups info, but usually, stream entries take up most of
-     * the space. */
+    /* 只有当平均条目大小大于页面大小时才遍历所有条目 */
     if (size_hint / raxSize(rax) >= server.page_size) {
         raxIterator ri;
         raxStart(&ri,rax);
@@ -520,25 +569,22 @@ void dismissStreamObject(robj *o, size_t size_hint) {
     }
 }
 
-/* When creating a snapshot in a fork child process, the main process and child
- * process share the same physical memory pages, and if / when the parent
- * modifies any keys due to write traffic, it'll cause CoW which consume
- * physical memory. In the child process, after serializing the key and value,
- * the data is definitely not accessed again, so to avoid unnecessary CoW, we
- * try to release their memory back to OS. see dismissMemory().
+/* 在 fork 子进程中创建快照时，主进程和子进程共享相同的物理内存页面。
+ * 当主进程因写操作修改键时，会触发写时复制（CoW），消耗物理内存。
+ * 在子进程中，序列化键和值之后，数据不会再被访问，
+ * 因此为了减少不必要的 CoW，我们尝试将内存释放回操作系统。
+ * 参见 dismissMemory()。
  *
- * Because of the cost of iterating all node/field/member/entry of complex data
- * types, we iterate and dismiss them only when approximate average we estimate
- * the size of an individual allocation is more than a page size of OS.
- * 'size_hint' is the size of serialized value. This method is not accurate, but
- * it can reduce unnecessary iteration for complex data types that are probably
- * not going to release any memory. */
+ * 由于遍历复杂数据类型的所有节点/字段/成员/条目的开销很大，
+ * 只有当估计的单个分配的平均大小大于操作系统页面大小时才遍历并释放。
+ * 'size_hint' 是序列化值的大小。这种方法不太准确，
+ * 但可以减少对可能不会释放任何内存的复杂数据类型的不必要遍历。 */
 void dismissObject(robj *o, size_t size_hint) {
-    /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
+    /* 如果启用了透明大页面（THP），madvise(MADV_DONTNEED) 可能不起作用 */
     if (server.thp_enabled) return;
 
-    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-     * so we avoid these pointless loops when they're not going to do anything. */
+    /* 目前只在 Linux 上使用 jemalloc 时才使用 zmadvise_dontneed，
+     * 因此在其他情况下避免无意义的遍历。 */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     if (o->refcount != 1) return;
     switch(o->type) {
@@ -555,15 +601,17 @@ void dismissObject(robj *o, size_t size_hint) {
 #endif
 }
 
-/* This variant of decrRefCount() gets its argument as void, and is useful
- * as free method in data structures that expect a 'void free_object(void*)'
- * prototype for the free method. */
+/* decrRefCount 的 void* 参数版本，可作为数据结构的 free 方法使用。
+ * 适用于期望 'void free_object(void*)' 原型的场景。 */
 void decrRefCountVoid(void *o) {
     decrRefCount(o);
 }
 
+/* 检查对象的类型是否与期望的类型匹配。
+ * NULL 被视为空键，不报错。
+ * 如果类型不匹配，向客户端发送 WRONGTYPE 错误并返回 1。 */
 int checkType(client *c, robj *o, int type) {
-    /* A NULL is considered an empty key */
+    /* NULL 被视为空键 */
     if (o && o->type != type) {
         addReplyErrorObject(c,shared.wrongtypeerr);
         return 1;
@@ -571,10 +619,13 @@ int checkType(client *c, robj *o, int type) {
     return 0;
 }
 
+/* 检查 sds 字符串是否可以表示为 long long 整数。 */
 int isSdsRepresentableAsLongLong(sds s, long long *llval) {
     return string2ll(s,sdslen(s),llval) ? C_OK : C_ERR;
 }
 
+/* 检查字符串对象是否可以表示为 long long 整数。
+ * INT 编码的对象直接取出指针中的值，其他编码则解析字符串。 */
 int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
     if (o->encoding == OBJ_ENCODING_INT) {
@@ -585,14 +636,14 @@ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
     }
 }
 
-/* Optimize the SDS string inside the string object to require little space,
- * in case there is more than 10% of free space at the end of the SDS. */
+/* 优化字符串对象中的 SDS 字符串，释放多余的空闲空间。
+ * 当 SDS 末尾有超过 10% 的空闲空间时进行优化。
+ * 字符串可能在以下情况下有空闲空间：
+ * 1. 当参数长度大于 PROTO_MBULK_BIG_ARG 时，查询缓冲区可能被直接用作 SDS 字符串
+ * 2. 使用 Lua 的参数缓存机制时
+ * 3. 从 RM_TrimStringAllocation 调用时（trim_small_values 为 true） */
 void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
     if (o->encoding != OBJ_ENCODING_RAW) return;
-    /* A string may have free space in the following cases:
-     * 1. When an arg len is greater than PROTO_MBULK_BIG_ARG the query buffer may be used directly as the SDS string.
-     * 2. When utilizing the argument caching mechanism in Lua. 
-     * 3. When calling from RM_TrimStringAllocation (trim_small_values is true). */
     size_t len = sdslen(o->ptr);
     if (len >= PROTO_MBULK_BIG_ARG ||
         trim_small_values||
@@ -603,61 +654,63 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
     }
 }
 
-/* Try to encode a string object in order to save space */
+/* 尝试对字符串对象进行编码优化以节省空间。
+ * 优化策略（按优先级）：
+ * 1. 如果字符串可以表示为小整数（0-9999），使用共享整数对象
+ * 2. 如果字符串可以表示为 long 整数，使用 INT 编码
+ * 3. 如果字符串较短（<=44字节），使用 EMBSTR 编码
+ * 4. 否则尝试优化 SDS 字符串的内存分配 */
 robj *tryObjectEncodingEx(robj *o, int try_trim) {
     long value;
     sds s = o->ptr;
     size_t len;
 
-    /* Make sure this is a string object, the only type we encode
-     * in this function. Other types use encoded memory efficient
-     * representations but are handled by the commands implementing
-     * the type. */
+    /* 确保这是字符串对象，这是本函数唯一处理的类型。
+     * 其他类型使用内存高效的编码表示，但由实现该类型的命令处理。 */
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
 
-    /* We try some specialized encoding only for objects that are
-     * RAW or EMBSTR encoded, in other words objects that are still
-     * in represented by an actually array of chars. */
+    /* 只对 RAW 或 EMBSTR 编码的对象尝试特殊编码，
+     * 即只有仍然是实际字符数组的对象才进行优化。 */
     if (!sdsEncodedObject(o)) return o;
 
-    /* It's not safe to encode shared objects: shared objects can be shared
-     * everywhere in the "object space" of Redis and may end in places where
-     * they are not handled. We handle them only as values in the keyspace. */
+    /* 对共享对象进行编码是不安全的：共享对象可能在 Redis 的"对象空间"
+     * 中的任何地方被共享，可能出现在无法处理优化后编码的地方。
+     * 我们只在键空间中作为值时才处理它们。 */
      if (o->refcount > 1) return o;
 
-    /* Check if we can represent this string as a long integer.
-     * Note that we are sure that a string larger than 20 chars is not
-     * representable as a 32 nor 64 bit integer. */
+    /* 检查是否可以将此字符串表示为 long 整数。
+     * 长度超过 20 个字符的字符串肯定不能表示为 32 位或 64 位整数。 */
     len = sdslen(s);
     if (len <= 20 && string2l(s,len,&value)) {
-        /* This object is encodable as a long. Try to use a shared object.
-         * Note that we avoid using shared integers when maxmemory is used
-         * because every object needs to have a private LRU field for the LRU
-         * algorithm to work well. */
+        /* 此对象可以编码为 long。尝试使用共享对象。
+         * 注意：当使用 maxmemory 时避免使用共享整数，
+         * 因为每个对象需要有私有的 LRU 字段才能使 LRU 算法正常工作。 */
         if ((server.maxmemory == 0 ||
             !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
             value >= 0 &&
             value < OBJ_SHARED_INTEGERS)
         {
+            /* 使用共享整数对象，释放当前对象 */
             decrRefCount(o);
             return shared.integers[value];
         } else {
             if (o->encoding == OBJ_ENCODING_RAW) {
+                /* RAW 编码转换为 INT 编码，直接将值存储在指针中 */
                 sdsfree(o->ptr);
                 o->encoding = OBJ_ENCODING_INT;
                 o->ptr = (void*) value;
                 return o;
             } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
+                /* EMBSTR 编码无法原地转换，创建新的对象 */
                 decrRefCount(o);
                 return createStringObjectFromLongLongForValue(value);
             }
         }
     }
 
-    /* If the string is small and is still RAW encoded,
-     * try the EMBSTR encoding which is more efficient.
-     * In this representation the object and the SDS string are allocated
-     * in the same chunk of memory to save space and cache misses. */
+    /* 如果字符串较短且仍然是 RAW 编码，尝试使用更高效的 EMBSTR 编码。
+     * 在这种表示中，对象和 SDS 字符串分配在同一块内存中，
+     * 以节省空间和减少缓存未命中。 */
     if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
         robj *emb;
 
@@ -667,29 +720,34 @@ robj *tryObjectEncodingEx(robj *o, int try_trim) {
         return emb;
     }
 
-    /* We can't encode the object...
-     * Do the last try, and at least optimize the SDS string inside */
+    /* 无法进一步优化编码...
+     * 最后尝试优化 SDS 字符串本身的内存分配 */
     if (try_trim)
         trimStringObjectIfNeeded(o, 0);
 
-    /* Return the original object. */
+    /* 返回原始对象 */
     return o;
 }
 
+/* tryObjectEncodingEx 的便捷包装，总是尝试 trim */
 robj *tryObjectEncoding(robj *o) {
     return tryObjectEncodingEx(o, 1);
 }
 
-/* Get a decoded version of an encoded object (returned as a new object).
- * If the object is already raw-encoded just increment the ref count. */
+/* 获取编码对象的解码版本（作为新对象返回）。
+ * 如果对象已经是 RAW 编码（sds 字符串），则只增加引用计数。
+ * 如果是 INT 编码，将整数值转换为字符串后创建新对象。
+ * 注意：返回的对象的引用计数总是 >= 1，调用者需要在使用完后调用 decrRefCount。 */
 robj *getDecodedObject(robj *o) {
     robj *dec;
 
     if (sdsEncodedObject(o)) {
+        /* 已经是字符串编码，直接增加引用计数 */
         incrRefCount(o);
         return o;
     }
     if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_INT) {
+        /* INT 编码，将整数转换为字符串 */
         char buf[32];
 
         ll2string(buf,32,(long)o->ptr);
@@ -700,16 +758,14 @@ robj *getDecodedObject(robj *o) {
     }
 }
 
-/* Compare two string objects via strcmp() or strcoll() depending on flags.
- * Note that the objects may be integer-encoded. In such a case we
- * use ll2string() to get a string representation of the numbers on the stack
- * and compare the strings, it's much faster than calling getDecodedObject().
+/* 根据标志使用 strcmp() 或 strcoll() 比较两个字符串对象。
+ * 注意：对象可能是整数编码的。在这种情况下，使用 ll2string() 在栈上
+ * 获取数字的字符串表示并比较字符串，这比调用 getDecodedObject() 快得多。
  *
- * Important note: when REDIS_COMPARE_BINARY is used a binary-safe comparison
- * is used. */
+ * 重要说明：当使用 REDIS_COMPARE_BINARY 时，使用二进制安全的比较。 */
 
-#define REDIS_COMPARE_BINARY (1<<0)
-#define REDIS_COMPARE_COLL (1<<1)
+#define REDIS_COMPARE_BINARY (1<<0)  /* 二进制比较 */
+#define REDIS_COMPARE_COLL (1<<1)    /* 本地化排序比较 */
 
 int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
     serverAssertWithInfo(NULL,a,a->type == OBJ_STRING && b->type == OBJ_STRING);
@@ -732,8 +788,10 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
         bstr = bufb;
     }
     if (flags & REDIS_COMPARE_COLL) {
+        /* 使用本地化排序比较（受 locale 影响） */
         return strcoll(astr,bstr);
     } else {
+        /* 使用二进制比较（字节级比较） */
         int cmp;
 
         minlen = (alen < blen) ? alen : blen;
@@ -743,31 +801,32 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
     }
 }
 
-/* Wrapper for compareStringObjectsWithFlags() using binary comparison. */
+/* 使用二进制比较的包装函数 */
 int compareStringObjects(const robj *a, const robj *b) {
     return compareStringObjectsWithFlags(a,b,REDIS_COMPARE_BINARY);
 }
 
-/* Wrapper for compareStringObjectsWithFlags() using collation. */
+/* 使用本地化排序比较的包装函数 */
 int collateStringObjects(const robj *a, const robj *b) {
     return compareStringObjectsWithFlags(a,b,REDIS_COMPARE_COLL);
 }
 
-/* Equal string objects return 1 if the two objects are the same from the
- * point of view of a string comparison, otherwise 0 is returned. Note that
- * this function is faster then checking for (compareStringObject(a,b) == 0)
- * because it can perform some more optimization. */
+/* 比较两个字符串对象是否相等，相等返回 1，否则返回 0。
+ * 此函数比 (compareStringObject(a,b) == 0) 更快，
+ * 因为它对整数编码的对象进行了额外优化：
+ * 如果两个对象都是 INT 编码，直接比较指针值即可。 */
 int equalStringObjects(robj *a, robj *b) {
     if (a->encoding == OBJ_ENCODING_INT &&
         b->encoding == OBJ_ENCODING_INT){
-        /* If both strings are integer encoded just check if the stored
-         * long is the same. */
+        /* 如果两个字符串都是整数编码，直接比较存储的 long 值 */
         return a->ptr == b->ptr;
     } else {
         return compareStringObjects(a,b) == 0;
     }
 }
 
+/* 获取字符串对象的长度。
+ * sds 编码直接返回 sdslen，INT 编码返回数字的位数。 */
 size_t stringObjectLen(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
     if (sdsEncodedObject(o)) {
@@ -777,6 +836,8 @@ size_t stringObjectLen(robj *o) {
     }
 }
 
+/* 从字符串对象中提取 double 值。
+ * NULL 对象返回 0，sds 编码解析字符串，INT 编码直接转换。 */
 int getDoubleFromObject(const robj *o, double *target) {
     double value;
 
@@ -797,6 +858,7 @@ int getDoubleFromObject(const robj *o, double *target) {
     return C_OK;
 }
 
+/* 从字符串对象中提取 double 值，失败时向客户端回复错误信息。 */
 int getDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg) {
     double value;
     if (getDoubleFromObject(o, &value) != C_OK) {
@@ -811,6 +873,7 @@ int getDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *m
     return C_OK;
 }
 
+/* 从字符串对象中提取 long double 值。 */
 int getLongDoubleFromObject(robj *o, long double *target) {
     long double value;
 
@@ -831,6 +894,7 @@ int getLongDoubleFromObject(robj *o, long double *target) {
     return C_OK;
 }
 
+/* 从字符串对象中提取 long double 值，失败时向客户端回复错误信息。 */
 int getLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, const char *msg) {
     long double value;
     if (getLongDoubleFromObject(o, &value) != C_OK) {
@@ -845,6 +909,7 @@ int getLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, cons
     return C_OK;
 }
 
+/* 从字符串对象中提取 long long 值。 */
 int getLongLongFromObject(robj *o, long long *target) {
     long long value;
 
@@ -864,6 +929,7 @@ int getLongLongFromObject(robj *o, long long *target) {
     return C_OK;
 }
 
+/* 从字符串对象中提取 long long 值，失败时向客户端回复错误信息。 */
 int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg) {
     long long value;
     if (getLongLongFromObject(o, &value) != C_OK) {
@@ -878,6 +944,7 @@ int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const ch
     return C_OK;
 }
 
+/* 从字符串对象中提取 long 值，超出范围时向客户端回复错误信息。 */
 int getLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
     long long value;
 
@@ -894,6 +961,8 @@ int getLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) 
     return C_OK;
 }
 
+/* 从字符串对象中提取 long 值，并检查是否在 [min, max] 范围内。
+ * 超出范围时向客户端回复错误信息。 */
 int getRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *target, const char *msg) {
     if (getLongFromObjectOrReply(c, o, target, msg) != C_OK) return C_ERR;
     if (*target < min || *target > max) {
@@ -907,6 +976,7 @@ int getRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *
     return C_OK;
 }
 
+/* 从字符串对象中提取正的 long 值（>= 0）。 */
 int getPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
     if (msg) {
         return getRangeLongFromObjectOrReply(c, o, 0, LONG_MAX, target, msg);
@@ -915,6 +985,7 @@ int getPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const cha
     }
 }
 
+/* 从字符串对象中提取 int 值。 */
 int getIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg) {
     long value;
 
@@ -925,6 +996,8 @@ int getIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg) {
     return C_OK;
 }
 
+/* 将编码常量转换为可读的字符串名称。
+ * 用于 OBJECT ENCODING 命令和调试输出。 */
 char *strEncoding(int encoding) {
     switch(encoding) {
     case OBJ_ENCODING_RAW: return "raw";
@@ -941,37 +1014,32 @@ char *strEncoding(int encoding) {
     }
 }
 
-/* =========================== Memory introspection ========================= */
+/* =========================== 内存自省 ========================= */
 
 
-/* This is a helper function with the goal of estimating the memory
- * size of a radix tree that is used to store Stream IDs.
+/* 估算用于存储 Stream ID 的基数树（radix tree）的内存使用量。
  *
- * Note: to guess the size of the radix tree is not trivial, so we
- * approximate it considering 16 bytes of data overhead for each
- * key (the ID), and then adding the number of bare nodes, plus some
- * overhead due by the data and child pointers. This secret recipe
- * was obtained by checking the average radix tree created by real
- * workloads, and then adjusting the constants to get numbers that
- * more or less match the real memory usage.
+ * 注意：准确估算基数树的大小并不简单，因此我们近似计算：
+ * 每个键（ID）考虑 16 字节的数据开销，然后加上节点数量，
+ * 再加上数据和子指针的一些开销。这个"秘诀"是通过检查
+ * 实际工作负载创建的平均基数树，然后调整常数来得到
+ * 与实际内存使用大致匹配的数字。
  *
- * Actually the number of nodes and keys may be different depending
- * on the insertion speed and thus the ability of the radix tree
- * to compress prefixes. */
+ * 实际上，节点和键的数量可能因插入速度不同而有所差异，
+ * 这会影响基数树压缩前缀的能力。 */
 size_t streamRadixTreeMemoryUsage(rax *rax) {
     size_t size = sizeof(*rax);
     size = rax->numele * sizeof(streamID);
     size += rax->numnodes * sizeof(raxNode);
-    /* Add a fixed overhead due to the aux data pointer, children, ... */
+    /* 加上辅助数据指针、子节点等的固定开销 */
     size += rax->numnodes * sizeof(long)*30;
     return size;
 }
 
-/* Returns the size in bytes consumed by the key's value in RAM.
- * Note that the returned value is just an approximation, especially in the
- * case of aggregated data types where only "sample_size" elements
- * are checked and averaged to estimate the total size. */
-#define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
+/* 返回键的值在 RAM 中占用的字节数。
+ * 注意：返回的值只是近似值，特别是对于聚合数据类型，
+ * 只检查 "sample_size" 个元素并取平均值来估算总大小。 */
+#define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* 默认采样数量 */
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     dict *d;
     dictIterator *di;
@@ -1135,15 +1203,15 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     return asize;
 }
 
-/* Release data obtained with getMemoryOverheadData(). */
+/* 释放 getMemoryOverheadData() 返回的数据结构。 */
 void freeMemoryOverheadData(struct redisMemOverhead *mh) {
     zfree(mh->db);
     zfree(mh);
 }
 
-/* Return a struct redisMemOverhead filled with memory overhead
- * information used for the MEMORY OVERHEAD and INFO command. The returned
- * structure pointer should be freed calling freeMemoryOverheadData(). */
+/* 返回一个填充了内存开销信息的 redisMemOverhead 结构体，
+ * 用于 MEMORY STATS 和 INFO 命令。
+ * 返回的结构体指针应通过 freeMemoryOverheadData() 释放。 */
 struct redisMemOverhead *getMemoryOverheadData(void) {
     int j;
     size_t mem_total = 0;
@@ -1268,26 +1336,25 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     return mh;
 }
 
-/* Helper for "MEMORY allocator-stats", used as a callback for the jemalloc
- * stats output. */
+/* "MEMORY allocator-stats" 的辅助函数，用作 jemalloc 统计输出的回调。 */
 void inputCatSds(void *result, const char *str) {
-    /* result is actually a (sds *), so re-cast it here */
+    /* result 实际上是 (sds *)，这里重新转换类型 */
     sds *info = (sds *)result;
     *info = sdscat(*info, str);
 }
 
-/* This implements MEMORY DOCTOR. An human readable analysis of the Redis
- * memory condition. */
+/* 实现 MEMORY DOCTOR 命令。对 Redis 内存状况进行人类可读的分析。
+ * 检测各种内存问题并生成诊断报告。 */
 sds getMemoryDoctorReport(void) {
-    int empty = 0;          /* Instance is empty or almost empty. */
-    int big_peak = 0;       /* Memory peak is much larger than used mem. */
-    int high_frag = 0;      /* High fragmentation. */
-    int high_alloc_frag = 0;/* High allocator fragmentation. */
-    int high_proc_rss = 0;  /* High process rss overhead. */
-    int high_alloc_rss = 0; /* High rss overhead. */
-    int big_slave_buf = 0;  /* Slave buffers are too big. */
-    int big_client_buf = 0; /* Client buffers are too big. */
-    int many_scripts = 0;   /* Script cache has too many scripts. */
+    int empty = 0;          /* 实例为空或几乎为空 */
+    int big_peak = 0;       /* 内存峰值远大于当前使用量 */
+    int high_frag = 0;      /* 高碎片率 */
+    int high_alloc_frag = 0;/* 分配器碎片率高 */
+    int high_proc_rss = 0;  /* 进程 RSS 开销高 */
+    int high_alloc_rss = 0; /* 分配器 RSS 开销高 */
+    int big_slave_buf = 0;  /* 副本缓冲区过大 */
+    int big_client_buf = 0; /* 客户端缓冲区过大 */
+    int many_scripts = 0;   /* 脚本缓存中脚本过多 */
     int num_reports = 0;
     struct redisMemOverhead *mh = getMemoryOverheadData();
 
@@ -1390,31 +1457,31 @@ sds getMemoryDoctorReport(void) {
     return s;
 }
 
-/* Set the object LRU/LFU depending on server.maxmemory_policy.
- * The lfu_freq arg is only relevant if policy is MAXMEMORY_FLAG_LFU.
- * The lru_idle and lru_clock args are only relevant if policy
- * is MAXMEMORY_FLAG_LRU.
- * Either or both of them may be <0, in that case, nothing is set. */
+/* 根据 server.maxmemory_policy 设置对象的 LRU/LFU 信息。
+ * lfu_freq 参数仅在策略为 MAXMEMORY_FLAG_LFU 时相关。
+ * lru_idle 和 lru_clock 参数仅在策略为 MAXMEMORY_FLAG_LRU 时相关。
+ * 任何一个或两个参数都可能 < 0，在这种情况下不设置任何值。
+ * 成功设置返回 1，未设置返回 0。 */
 int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
                        long long lru_clock, int lru_multiplier) {
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
         if (lfu_freq >= 0) {
             serverAssert(lfu_freq <= 255);
+            /* LFU 编码：高 16 位为时间（分钟），低 8 位为访问频率 */
             val->lru = (LFUGetTimeInMinutes()<<8) | lfu_freq;
             return 1;
         }
     } else if (lru_idle >= 0) {
-        /* Provided LRU idle time is in seconds. Scale
-         * according to the LRU clock resolution this Redis
-         * instance was compiled with (normally 1000 ms, so the
-         * below statement will expand to lru_idle*1000/1000. */
+        /* 提供的 LRU 空闲时间单位为秒。根据此 Redis 实例编译时的
+         * LRU 时钟分辨率进行缩放（通常为 1000 毫秒，
+         * 所以下面的语句将展开为 lru_idle*1000/1000）。 */
         lru_idle = lru_idle*lru_multiplier/LRU_CLOCK_RESOLUTION;
-        long lru_abs = lru_clock - lru_idle; /* Absolute access time. */
-        /* If the LRU field underflows (since lru_clock is a wrapping clock),
-         * we need to make it positive again. This be handled by the unwrapping
-         * code in estimateObjectIdleTime. I.e. imagine a day when lru_clock
-         * wrap arounds (happens once in some 6 months), and becomes a low
-         * value, like 10, an lru_idle of 1000 should be near LRU_CLOCK_MAX. */
+        long lru_abs = lru_clock - lru_idle; /* 绝对访问时间 */
+        /* 如果 LRU 字段下溢（因为 lru_clock 是循环时钟），
+         * 需要将其重新变为正值。这由 estimateObjectIdleTime 中的
+         * 解包代码处理。例如，想象 lru_clock 循环的那天
+         * （大约每 6 个月发生一次），它变成一个低值（如 10），
+         * 那么 lru_idle 为 1000 时应该接近 LRU_CLOCK_MAX。 */
         if (lru_abs < 0)
             lru_abs += LRU_CLOCK_MAX;
         val->lru = lru_abs;
@@ -1423,22 +1490,27 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
     return 0;
 }
 
-/* ======================= The OBJECT and MEMORY commands =================== */
+/* ======================= OBJECT 和 MEMORY 命令 =================== */
 
-/* This is a helper function for the OBJECT command. We need to lookup keys
- * without any modification of LRU or other parameters. */
+/* OBJECT 命令的辅助函数。查找键但不修改 LRU 或其他参数。
+ * 使用 LOOKUP_NOTOUCH 标志避免更新访问时间。 */
 robj *objectCommandLookup(client *c, robj *key) {
     return lookupKeyReadWithFlags(c->db,key,LOOKUP_NOTOUCH|LOOKUP_NONOTIFY);
 }
 
+/* 查找键，如果不存在则回复错误。 */
 robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply) {
     robj *o = objectCommandLookup(c,key);
     if (!o) addReplyOrErrorObject(c, reply);
     return o;
 }
 
-/* Object command allows to inspect the internals of a Redis Object.
- * Usage: OBJECT <refcount|encoding|idletime|freq> <key> */
+/* OBJECT 命令允许检查 Redis 对象的内部信息。
+ * 用法：OBJECT <refcount|encoding|idletime|freq> <key>
+ * - REFCOUNT：返回值的引用计数
+ * - ENCODING：返回内部编码类型
+ * - IDLETIME：返回键的空闲时间（秒）
+ * - FREQ：返回键的访问频率指数 */
 void objectCommand(client *c) {
     robj *o;
 
@@ -1492,10 +1564,13 @@ NULL
     }
 }
 
-/* The memory command will eventually be a complete interface for the
- * memory introspection capabilities of Redis.
- *
- * Usage: MEMORY usage <key> */
+/* MEMORY 命令提供 Redis 内存自省能力的完整接口。
+ * 用法：
+ * - MEMORY DOCTOR：返回内存问题报告
+ * - MALLOC-STATS：返回内存分配器的内部统计
+ * - PURGE：尝试清除脏页以回收内存
+ * - STATS：返回服务器内存使用信息
+ * - USAGE <key> [SAMPLES <count>]：返回键及其值占用的内存字节数 */
 void memoryCommand(client *c) {
     if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
         const char *help[] = {
@@ -1514,6 +1589,8 @@ NULL
         };
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
+        /* MEMORY USAGE <key> [SAMPLES <count>]
+         * 计算指定键在内存中占用的字节数 */
         dictEntry *de;
         long long samples = OBJ_COMPUTE_SIZE_DEF_SAMPLES;
         for (int j = 3; j < c->argc; j++) {
@@ -1527,7 +1604,7 @@ NULL
                     return;
                 }
                 if (samples == 0) samples = LLONG_MAX;
-                j++; /* skip option argument. */
+                j++; /* 跳过选项参数 */
             } else {
                 addReplyErrorObject(c,shared.syntaxerr);
                 return;
@@ -1537,11 +1614,13 @@ NULL
             addReplyNull(c);
             return;
         }
+        /* 计算值的内存占用 + 键名的内存占用 + dictEntry 的内存占用 */
         size_t usage = objectComputeSize(c->argv[2],dictGetVal(de),samples,c->db->id);
         usage += sdsZmallocSize(dictGetKey(de));
         usage += dictEntryMemUsage();
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
+        /* MEMORY STATS：返回服务器内存使用的详细统计信息 */
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
         addReplyMapLen(c,31+mh->num_dbs);
@@ -1654,6 +1733,7 @@ NULL
 
         freeMemoryOverheadData(mh);
     } else if (!strcasecmp(c->argv[1]->ptr,"malloc-stats") && c->argc == 2) {
+        /* MEMORY MALLOC-STATS：返回内存分配器的内部统计信息 */
 #if defined(USE_JEMALLOC)
         sds info = sdsempty();
         je_malloc_stats_print(inputCatSds, &info, NULL);
@@ -1663,10 +1743,12 @@ NULL
         addReplyBulkCString(c,"Stats not supported for the current allocator");
 #endif
     } else if (!strcasecmp(c->argv[1]->ptr,"doctor") && c->argc == 2) {
+        /* MEMORY DOCTOR：返回内存诊断报告 */
         sds report = getMemoryDoctorReport();
         addReplyVerbatim(c,report,sdslen(report),"txt");
         sdsfree(report);
     } else if (!strcasecmp(c->argv[1]->ptr,"purge") && c->argc == 2) {
+        /* MEMORY PURGE：尝试清除脏页以回收内存 */
         if (jemalloc_purge() == 0)
             addReply(c, shared.ok);
         else

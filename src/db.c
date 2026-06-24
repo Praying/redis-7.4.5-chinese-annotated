@@ -18,73 +18,70 @@
 #include "bio.h"
 
 /*-----------------------------------------------------------------------------
- * C-level DB API
+ * C-level DB API（数据库底层 C 语言 API）
+ * 这些函数提供了 Redis 数据库的核心操作接口，包括 key 的查找、添加、
+ * 删除、过期处理等基础功能，是上层命令实现的基石。
  *----------------------------------------------------------------------------*/
 
-/* Flags for expireIfNeeded */
-#define EXPIRE_FORCE_DELETE_EXPIRED 1
-#define EXPIRE_AVOID_DELETE_EXPIRED 2
+/* expireIfNeeded 函数的标志位 */
+#define EXPIRE_FORCE_DELETE_EXPIRED 1  /* 强制删除已过期的 key（即使在 replica 上也执行删除） */
+#define EXPIRE_AVOID_DELETE_EXPIRED 2  /* 仅检查过期状态，但不实际删除 key（避免传播删除操作） */
 
-/* Return values for expireIfNeeded */
+/* expireIfNeeded 函数的返回值 */
 typedef enum {
-    KEY_VALID = 0, /* Could be volatile and not yet expired, non-volatile, or even non-existing key. */
-    KEY_EXPIRED, /* Logically expired but not yet deleted. */
-    KEY_DELETED /* The key was deleted now. */
+    KEY_VALID = 0, /* key 仍然有效：可能是未过期的易失性 key、持久化 key、或不存在的 key */
+    KEY_EXPIRED,   /* key 已逻辑过期但尚未被删除 */
+    KEY_DELETED    /* key 已过期且已被删除 */
 } keyStatus;
 
 keyStatus expireIfNeeded(redisDb *db, robj *key, int flags);
 int keyIsExpired(redisDb *db, robj *key);
 static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de);
 
-/* Update LFU when an object is accessed.
- * Firstly, decrement the counter if the decrement time is reached.
- * Then logarithmically increment the counter, and update the access time. */
+/* 当对象被访问时更新 LFU（最不经常使用）计数器。
+ * 首先，如果已到达衰减时间，则递减计数器。
+ * 然后以对数方式递增计数器，并更新访问时间。
+ * LFU 策略通过 log(freq) + 时间衰减 来估计访问热度，用于内存淘汰决策。 */
 void updateLFU(robj *val) {
     unsigned long counter = LFUDecrAndReturn(val);
     counter = LFULogIncr(counter);
     val->lru = (LFUGetTimeInMinutes()<<8) | counter;
 }
 
-/* Lookup a key for read or write operations, or return NULL if the key is not
- * found in the specified DB. This function implements the functionality of
- * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
+/* 查找一个 key 用于读或写操作，如果在指定数据库中未找到则返回 NULL。
+ * 此函数实现了 lookupKeyRead()、lookupKeyWrite() 及其 WithFlags() 变体的核心逻辑。
  *
- * Side-effects of calling this function:
+ * 调用此函数的副作用：
  *
- * 1. A key gets expired if it reached it's TTL.
- * 2. The key's last access time is updated.
- * 3. The global keys hits/misses stats are updated (reported in INFO).
- * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
+ * 1. 如果 key 已到达 TTL（生存时间），则使其过期（删除）。
+ * 2. 更新 key 的最后访问时间。
+ * 3. 更新全局 key 命中/未命中统计（在 INFO 命令中报告）。
+ * 4. 如果启用了 keyspace notification（键空间通知），则在 key 未命中时触发 "keymiss" 通知。
  *
- * Flags change the behavior of this command:
+ * 标志位（flags）可以改变此命令的行为：
  *
- *  LOOKUP_NONE (or zero): No special flags are passed.
- *  LOOKUP_NOTOUCH: Don't alter the last access time of the key.
- *  LOOKUP_NONOTIFY: Don't trigger keyspace event on key miss.
- *  LOOKUP_NOSTATS: Don't increment key hits/misses counters.
- *  LOOKUP_WRITE: Prepare the key for writing (delete expired keys even on
- *                replicas, use separate keyspace stats and events (TODO)).
- *  LOOKUP_NOEXPIRE: Perform expiration check, but avoid deleting the key,
- *                   so that we don't have to propagate the deletion.
+ *  LOOKUP_NONE（或 0）：无特殊标志。
+ *  LOOKUP_NOTOUCH：不修改 key 的最后访问时间。
+ *  LOOKUP_NONOTIFY：在 key 未命中时不触发 keyspace 事件。
+ *  LOOKUP_NOSTATS：不递增 key 命中/未命中计数器。
+ *  LOOKUP_WRITE：为写操作准备 key（即使在 replica 上也删除已过期的 key，
+ *                使用独立的 keyspace 统计和事件（TODO））。
+ *  LOOKUP_NOEXPIRE：执行过期检查，但避免删除 key，这样就不需要传播删除操作。
  *
- * Note: this function also returns NULL if the key is logically expired but
- * still existing, in case this is a replica and the LOOKUP_WRITE is not set.
- * Even if the key expiry is master-driven, we can correctly report a key is
- * expired on replicas even if the master is lagging expiring our key via DELs
- * in the replication link. */
+ * 注意：如果 key 已逻辑过期但仍然存在，且当前是 replica 且未设置 LOOKUP_WRITE 标志，
+ * 此函数也会返回 NULL。即使 key 的过期由 master 驱动，我们也可以在 replica 上
+ * 正确报告 key 已过期，即使 master 通过复制链接中的 DEL 操作延迟过期处理。 */
 robj *lookupKey(redisDb *db, robj *key, int flags) {
     dictEntry *de = dbFind(db, key->ptr);
     robj *val = NULL;
     if (de) {
         val = dictGetVal(de);
-        /* Forcing deletion of expired keys on a replica makes the replica
-         * inconsistent with the master. We forbid it on readonly replicas, but
-         * we have to allow it on writable replicas to make write commands
-         * behave consistently.
+        /* 在 replica 上强制删除已过期的 key 会导致 replica 与 master 不一致。
+         * 我们在只读 replica 上禁止此操作，但在可写 replica 上必须允许，
+         * 以确保写命令的行为一致性。
          *
-         * It's possible that the WRITE flag is set even during a readonly
-         * command, since the command may trigger events that cause modules to
-         * perform additional writes. */
+         * 即使在只读命令期间也可能设置 WRITE 标志，因为该命令可能触发
+         * 模块执行额外的写操作。 */
         int is_ro_replica = server.masterhost && server.repl_slave_ro;
         int expire_flags = 0;
         if (flags & LOOKUP_WRITE && !is_ro_replica)
@@ -98,60 +95,57 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
     }
 
     if (val) {
-        /* Update the access time for the ageing algorithm.
-         * Don't do it if we have a saving child, as this will trigger
-         * a copy on write madness. */
+        /* 更新用于老化算法的访问时间。
+         * 如果存在子进程正在执行保存操作，则不更新，因为这会触发大量的写时复制（copy-on-write）。 */
         if (server.current_client && server.current_client->flags & CLIENT_NO_TOUCH &&
             server.current_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)){
             if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+                /* 使用 LFU（最不经常使用）淘汰策略 */
                 updateLFU(val);
             } else {
+                /* 使用 LRU（最近最少使用）淘汰策略 */
                 val->lru = LRU_CLOCK();
             }
         }
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
             server.stat_keyspace_hits++;
-        /* TODO: Use separate hits stats for WRITE */
+        /* TODO: 为 WRITE 操作使用独立的命中统计 */
     } else {
+        /* key 未命中，触发 keyspace 通知 */
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
             notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
             server.stat_keyspace_misses++;
-        /* TODO: Use separate misses stats and notify event for WRITE */
+        /* TODO: 为 WRITE 操作使用独立的未命中统计和通知事件 */
     }
 
     return val;
 }
 
-/* Lookup a key for read operations, or return NULL if the key is not found
- * in the specified DB.
+/* 查找一个 key 用于读操作，如果在指定数据库中未找到则返回 NULL。
  *
- * This API should not be used when we write to the key after obtaining
- * the object linked to the key, but only for read only operations.
+ * 此 API 不应在获取与 key 关联的对象后对其进行写操作时使用，
+ * 仅用于只读操作。
  *
- * This function is equivalent to lookupKey(). The point of using this function
- * rather than lookupKey() directly is to indicate that the purpose is to read
- * the key. */
+ * 此函数等价于 lookupKey()。使用此函数而不是直接调用 lookupKey()
+ * 的目的是明确表示该操作的目的是读取 key。 */
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
     serverAssert(!(flags & LOOKUP_WRITE));
     return lookupKey(db, key, flags);
 }
 
-/* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
- * common case. */
+/* 类似于 lookupKeyReadWithFlags()，但不使用任何标志，这是最常见的情况。 */
 robj *lookupKeyRead(redisDb *db, robj *key) {
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
 }
 
-/* Lookup a key for write operations, and as a side effect, if needed, expires
- * the key if its TTL is reached. It's equivalent to lookupKey() with the
- * LOOKUP_WRITE flag added.
+/* 查找一个 key 用于写操作，作为副作用，如果需要，会在 key 的 TTL 到期时使其过期。
+ * 等价于带 LOOKUP_WRITE 标志的 lookupKey()。
  *
- * Returns the linked value object if the key exists or NULL if the key
- * does not exist in the specified DB. */
+ * 如果 key 存在，返回关联的 value 对象；如果 key 在指定数据库中不存在，返回 NULL。 */
 robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
     return lookupKey(db, key, flags | LOOKUP_WRITE);
 }
@@ -160,60 +154,64 @@ robj *lookupKeyWrite(redisDb *db, robj *key) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NONE);
 }
 
+/* 查找一个 key 用于读操作，如果 key 不存在则向客户端返回指定的 reply。
+ * 常用于需要在 key 不存在时返回错误或特定值的命令实现中。 */
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
     robj *o = lookupKeyRead(c->db, key);
     if (!o) addReplyOrErrorObject(c, reply);
     return o;
 }
 
+/* 查找一个 key 用于写操作，如果 key 不存在则向客户端返回指定的 reply。 */
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     robj *o = lookupKeyWrite(c->db, key);
     if (!o) addReplyOrErrorObject(c, reply);
     return o;
 }
 
-/* Add the key to the DB. It's up to the caller to increment the reference
- * counter of the value if needed.
+/* 将 key 添加到数据库。调用者负责递增 value 的引用计数（如果需要的话）。
  *
- * If the update_if_existing argument is false, the program is aborted
- * if the key already exists, otherwise, it can fall back to dbOverwrite. */
+ * 如果 update_if_existing 参数为 false，当 key 已存在时程序会中止；
+ * 如果为 true，则可以回退到 dbOverwrite（覆盖写入）。 */
 static dictEntry *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing) {
     dictEntry *existing;
     int slot = getKeySlot(key->ptr);
     dictEntry *de = kvstoreDictAddRaw(db->keys, slot, key->ptr, &existing);
     if (update_if_existing && existing) {
+        /* key 已存在且允许更新，覆盖其值 */
         dbSetValue(db, key, val, 1, existing);
         return existing;
     }
     serverAssertWithInfo(NULL, key, de != NULL);
+    /* 复制 key 的 SDS 字符串（kvstore 拥有该副本的所有权） */
     kvstoreDictSetKey(db->keys, slot, de, sdsdup(key->ptr));
+    /* 初始化对象的 LRU/LFU 时钟信息 */
     initObjectLRUOrLFU(val);
     kvstoreDictSetVal(db->keys, slot, de, val);
+    /* 通知有新的 key 可用（用于解除阻塞的客户端） */
     signalKeyAsReady(db, key, val->type);
+    /* 触发 keyspace 通知 */
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
     return de;
 }
 
+/* 将 key 添加到数据库的公共接口。如果 key 已存在则中止程序。 */
 dictEntry *dbAdd(redisDb *db, robj *key, robj *val) {
     return dbAddInternal(db, key, val, 0);
 }
 
-/* Returns key's hash slot when cluster mode is enabled, or 0 when disabled.
- * The only difference between this function and getKeySlot, is that it's not using cached key slot from the current_client
- * and always calculates CRC hash.
- * This is useful when slot needs to be calculated for a key that user didn't request for, such as in case of eviction. */
+/* 返回 key 的哈希槽（hash slot），集群模式下返回实际的槽位号，非集群模式下返回 0。
+ * 与 getKeySlot 的区别是：此函数不使用 current_client 中缓存的槽位，
+ * 始终计算 CRC 哈希。适用于需要为用户未请求的 key 计算槽位的场景（如淘汰 eviction）。 */
 int calculateKeySlot(sds key) {
     return server.cluster_enabled ? keyHashSlot(key, (int) sdslen(key)) : 0;
 }
 
-/* Return slot-specific dictionary for key based on key's hash slot when cluster mode is enabled, else 0.*/
+/* 返回 key 所属的哈希槽对应的字典索引。集群模式下返回实际槽位，否则返回 0。
+ * 这是一个性能优化：使用当前命令中预设的 slot id，避免重复计算 key 的哈希值。
+ * 此优化仅在 current_client 的 `CLIENT_EXECUTING_COMMAND` 标志被设置时生效，
+ * 该标志只在 `call` 方法执行命令期间被设置。其他请求 key 槽位的流程会回退到 calculateKeySlot。 */
 int getKeySlot(sds key) {
-    /* This is performance optimization that uses pre-set slot id from the current command,
-     * in order to avoid calculation of the key hash.
-     * This optimization is only used when current_client flag `CLIENT_EXECUTING_COMMAND` is set.
-     * It only gets set during the execution of command under `call` method. Other flows requesting
-     * the key slot would fallback to calculateKeySlot.
-     */
     if (server.current_client && server.current_client->slot >= 0 && server.current_client->flags & CLIENT_EXECUTING_COMMAND) {
         debugServerAssertWithInfo(server.current_client, NULL, calculateKeySlot(key)==server.current_client->slot);
         return server.current_client->slot;
@@ -221,17 +219,14 @@ int getKeySlot(sds key) {
     return calculateKeySlot(key);
 }
 
-/* This is a special version of dbAdd() that is used only when loading
- * keys from the RDB file: the key is passed as an SDS string that is
- * retained by the function (and not freed by the caller).
+/* 这是 dbAdd() 的特殊版本，仅用于从 RDB 文件加载 key 时：
+ * key 以 SDS 字符串形式传递，函数会保留该字符串（调用者无需释放）。
  *
- * Moreover this function will not abort if the key is already busy, to
- * give more control to the caller, nor will signal the key as ready
- * since it is not useful in this context.
+ * 此外，如果 key 已存在，函数不会中止程序（给调用者更多控制权），
+ * 也不会触发 key ready 信号（在此上下文中没有意义）。
  *
- * The function returns 1 if the key was added to the database, taking
- * ownership of the SDS string, otherwise 0 is returned, and is up to the
- * caller to free the SDS string. */
+ * 如果 key 成功添加到数据库，返回 1（函数获得 SDS 字符串的所有权）；
+ * 否则返回 0，由调用者负责释放 SDS 字符串。 */
 int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
     int slot = getKeySlot(key);
     dictEntry *de = kvstoreDictAddRaw(db->keys, slot, key, NULL);
@@ -241,46 +236,44 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
     return 1;
 }
 
-/* Overwrite an existing key with a new value. Incrementing the reference
- * count of the new value is up to the caller.
- * This function does not modify the expire time of the existing key.
+/* 用新值覆盖已存在的 key。新值的引用计数递增由调用者负责。
+ * 此函数不会修改已存在的 key 的过期时间。
  *
- * The 'overwrite' flag is an indication whether this is done as part of a
- * complete replacement of their key, which can be thought as a deletion and
- * replacement (in which case we need to emit deletion signals), or just an
- * update of a value of an existing key (when false).
+ * 'overwrite' 标志指示这是否作为 key 的完整替换的一部分（可理解为删除+替换，
+ * 此时需要发送删除信号），还是仅更新现有 key 的值（当 overwrite 为 false 时）。
  *
- * The dictEntry input is optional, can be used if we already have one.
+ * dictEntry 输入是可选的，如果已有的话可以传入以避免重复查找。
  *
- * The program is aborted if the key was not already present. */
+ * 如果 key 不存在，程序会中止。 */
 static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de) {
     int slot = getKeySlot(key->ptr);
     if (!de) de = kvstoreDictFind(db->keys, slot, key->ptr);
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
 
+    /* 保留旧对象的 LRU 时钟信息，避免访问时间被重置 */
     val->lru = old->lru;
 
     if (overwrite) {
-        /* RM_StringDMA may call dbUnshareStringValue which may free val, so we
-         * need to incr to retain old */
+        /* RM_StringDMA 可能调用 dbUnshareStringValue 从而释放 val，
+         * 因此需要递增 old 的引用计数以保留它 */
         incrRefCount(old);
-        /* Although the key is not really deleted from the database, we regard
-         * overwrite as two steps of unlink+add, so we still need to call the unlink
-         * callback of the module. */
+        /* 虽然 key 并未真正从数据库中删除，我们将覆盖视为 unlink+add 两步操作，
+         * 因此仍需要调用模块的 unlink 回调。 */
         moduleNotifyKeyUnlink(key,old,db->id,DB_FLAG_KEY_OVERWRITE);
-        /* We want to try to unblock any module clients or clients using a blocking XREADGROUP */
+        /* 尝试解除阻塞的模块客户端或使用阻塞 XREADGROUP 的客户端 */
         signalDeletedKeyAsReady(db,key,old->type);
         decrRefCount(old);
-        /* Because of RM_StringDMA, old may be changed, so we need get old again */
+        /* 由于 RM_StringDMA 可能修改 old，需要重新获取 */
         old = dictGetVal(de);
     }
     kvstoreDictSetVal(db->keys, slot, de, val);
 
-    /* if hash with HFEs, take care to remove from global HFE DS */
+    /* 如果是带字段过期时间（HFE）的 hash 对象，需要从全局 HFE 数据结构中移除 */
     if (old->type == OBJ_HASH)
         hashTypeRemoveFromExpires(&db->hexpires, old);
 
+    /* 根据 lazyfree 配置决定同步或异步释放旧对象 */
     if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key,old,db->id);
     } else {
@@ -288,25 +281,23 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     }
 }
 
-/* Replace an existing key with a new value, we just replace value and don't
- * emit any events */
+/* 用新值替换已存在的 key，仅替换值而不触发任何事件（如 keyspace 通知）。 */
 void dbReplaceValue(redisDb *db, robj *key, robj *val) {
     dbSetValue(db, key, val, 0, NULL);
 }
 
-/* High level Set operation. This function can be used in order to set
- * a key, whatever it was existing or not, to a new object.
+/* 高层 Set 操作。此函数可用于将 key 设置为新对象，无论 key 是否已存在。
  *
- * 1) The ref count of the value object is incremented.
- * 2) clients WATCHing for the destination key notified.
- * 3) The expire time of the key is reset (the key is made persistent),
- *    unless 'SETKEY_KEEPTTL' is enabled in flags.
- * 4) The key lookup can take place outside this interface outcome will be
- *    delivered with 'SETKEY_ALREADY_EXIST' or 'SETKEY_DOESNT_EXIST'
+ * 此函数执行以下操作：
+ * 1) 递增 value 对象的引用计数。
+ * 2) 通知正在 WATCH（监视）目标 key 的客户端。
+ * 3) 重置 key 的过期时间（使 key 变为持久化的），
+ *    除非在 flags 中启用了 'SETKEY_KEEPTTL'。
+ * 4) key 的查找可以在此接口外部进行，通过 'SETKEY_ALREADY_EXIST' 或
+ *    'SETKEY_DOESNT_EXIST' 标志传入查找结果。
  *
- * All the new keys in the database should be created via this interface.
- * The client 'c' argument may be set to NULL if the operation is performed
- * in a context where there is no clear client performing the operation. */
+ * 数据库中所有新 key 都应通过此接口创建。
+ * 如果操作在没有明确客户端的上下文中执行，client 'c' 参数可以设置为 NULL。 */
 void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
     int keyfound = 0;
 
@@ -329,10 +320,9 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
 }
 
-/* Return a random key, in form of a Redis object.
- * If there are no keys, NULL is returned.
+/* 返回一个随机 key（Redis 对象形式）。如果数据库中没有 key，返回 NULL。
  *
- * The function makes sure to return keys not already expired. */
+ * 此函数确保返回的 key 不是已过期的。 */
 robj *dbRandomKey(redisDb *db) {
     dictEntry *de;
     int maxtries = 100;
@@ -349,14 +339,12 @@ robj *dbRandomKey(redisDb *db) {
         keyobj = createStringObject(key,sdslen(key));
         if (dbFindExpires(db, key)) {
             if (allvolatile && (server.masterhost || isPausedActions(PAUSE_ACTION_EXPIRE)) && --maxtries == 0) {
-                /* If the DB is composed only of keys with an expire set,
-                 * it could happen that all the keys are already logically
-                 * expired in the slave, so the function cannot stop because
-                 * expireIfNeeded() is false, nor it can stop because
-                 * dictGetFairRandomKey() returns NULL (there are keys to return).
-                 * To prevent the infinite loop we do some tries, but if there
-                 * are the conditions for an infinite loop, eventually we
-                 * return a key name that may be already expired. */
+                /* 如果数据库中所有 key 都设置了过期时间，在 slave 上可能出现
+                 * 所有 key 都已逻辑过期的情况。此时函数无法停止，因为
+                 * expireIfNeeded() 返回 false（不删除），dictGetFairRandomKey()
+                 * 也不会返回 NULL（仍有 key 可返回）。
+                 * 为防止无限循环，我们设置最大重试次数，如果满足无限循环的条件，
+                 * 最终返回一个可能已过期的 key 名称。 */
                 return keyobj;
             }
             if (expireIfNeeded(db,keyobj,0) != KEY_VALID) {
@@ -368,7 +356,9 @@ robj *dbRandomKey(redisDb *db) {
     }
 }
 
-/* Helper for sync and async delete. */
+/* 同步和异步删除的辅助函数。
+ * 根据 async 参数决定是否异步释放 value 对象的内存。
+ * 使用两阶段 unlink（two-phase unlink）以避免在模块回调期间出现竞态条件。 */
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     dictEntry **plink;
     int table;
@@ -377,27 +367,27 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     if (de) {
         robj *val = dictGetVal(de);
 
-        /* If hash object with expiry on fields, remove it from HFE DS of DB */
+        /* 如果是带字段过期时间（HFE）的 hash 对象，先从全局 HFE 数据结构中移除 */
         if (val->type == OBJ_HASH)
             hashTypeRemoveFromExpires(&db->hexpires, val);
 
-        /* RM_StringDMA may call dbUnshareStringValue which may free val, so we
-         * need to incr to retain val */
+        /* RM_StringDMA 可能调用 dbUnshareStringValue 从而释放 val，
+         * 因此需要递增引用计数以保留 val */
         incrRefCount(val);
-        /* Tells the module that the key has been unlinked from the database. */
+        /* 通知模块该 key 已从数据库中取消链接 */
         moduleNotifyKeyUnlink(key,val,db->id,flags);
-        /* We want to try to unblock any module clients or clients using a blocking XREADGROUP */
+        /* 尝试解除阻塞的模块客户端或使用阻塞 XREADGROUP 的客户端 */
         signalDeletedKeyAsReady(db,key,val->type);
-        /* We should call decr before freeObjAsync. If not, the refcount may be
-         * greater than 1, so freeObjAsync doesn't work */
+        /* 必须在 freeObjAsync 之前调用 decr，否则引用计数可能大于 1，
+         * 导致 freeObjAsync 无法实际释放内存 */
         decrRefCount(val);
         if (async) {
-            /* Because of dbUnshareStringValue, the val in de may change. */
+            /* 异步释放 value 对象的内存 */
             freeObjAsync(key, dictGetVal(de), db->id);
             kvstoreDictSetVal(db->keys, slot, de, NULL);
         }
-        /* Deleting an entry from the expires dict will not free the sds of
-         * the key, because it is shared with the main dictionary. */
+        /* 从 expires 字典中删除条目不会释放 key 的 SDS 字符串，
+         * 因为它与主字典共享同一份 SDS。 */
         kvstoreDictDelete(db->expires, slot, key->ptr);
 
         kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, de, plink, table);
@@ -407,49 +397,43 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     }
 }
 
-/* Delete a key, value, and associated expiration entry if any, from the DB */
+/* 从数据库中同步删除 key、value 及关联的过期条目（如果有的话）。 */
 int dbSyncDelete(redisDb *db, robj *key) {
     return dbGenericDelete(db, key, 0, DB_FLAG_KEY_DELETED);
 }
 
-/* Delete a key, value, and associated expiration entry if any, from the DB. If
- * the value consists of many allocations, it may be freed asynchronously. */
+/* 从数据库中删除 key、value 及关联的过期条目。
+ * 如果 value 包含大量内存分配，可能会异步释放。 */
 int dbAsyncDelete(redisDb *db, robj *key) {
     return dbGenericDelete(db, key, 1, DB_FLAG_KEY_DELETED);
 }
 
-/* This is a wrapper whose behavior depends on the Redis lazy free
- * configuration. Deletes the key synchronously or asynchronously. */
+/* 删除 key 的包装函数，行为取决于 Redis 的 lazy free 配置。
+ * 根据 server.lazyfree_lazy_server_del 配置决定同步或异步删除。 */
 int dbDelete(redisDb *db, robj *key) {
     return dbGenericDelete(db, key, server.lazyfree_lazy_server_del, DB_FLAG_KEY_DELETED);
 }
 
-/* Prepare the string object stored at 'key' to be modified destructively
- * to implement commands like SETBIT or APPEND.
+/* 准备对存储在 'key' 处的字符串对象进行破坏性修改，
+ * 用于实现 SETBIT 或 APPEND 等命令。
  *
- * An object is usually ready to be modified unless one of the two conditions
- * are true:
+ * 对象通常已准备好被修改，除非满足以下两个条件之一：
  *
- * 1) The object 'o' is shared (refcount > 1), we don't want to affect
- *    other users.
- * 2) The object encoding is not "RAW".
+ * 1) 对象 'o' 是共享的（引用计数 > 1），我们不想影响其他使用者。
+ * 2) 对象的编码不是 "RAW"（原始字符串编码）。
  *
- * If the object is found in one of the above conditions (or both) by the
- * function, an unshared / not-encoded copy of the string object is stored
- * at 'key' in the specified 'db'. Otherwise the object 'o' itself is
- * returned.
+ * 如果函数发现对象满足上述条件之一（或两者），则会在指定数据库的 'key' 处
+ * 存储一个非共享/非编码的字符串对象副本。否则直接返回对象 'o' 本身。
  *
- * USAGE:
+ * 使用方式：
  *
- * The object 'o' is what the caller already obtained by looking up 'key'
- * in 'db', the usage pattern looks like this:
+ * 对象 'o' 是调用者通过在 'db' 中查找 'key' 已经获得的，使用模式如下：
  *
  * o = lookupKeyWrite(db,key);
  * if (checkType(c,o,OBJ_STRING)) return;
  * o = dbUnshareStringValue(db,key,o);
  *
- * At this point the caller is ready to modify the object, for example
- * using an sdscat() call to append some data, or anything else.
+ * 此时调用者可以安全地修改对象，例如使用 sdscat() 追加数据，或其他操作。
  */
 robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
     serverAssert(o->type == OBJ_STRING);
@@ -462,12 +446,14 @@ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
     return o;
 }
 
-/* Remove all keys from the database(s) structure. The dbarray argument
- * may not be the server main DBs (could be a temporary DB).
+/* 从数据库结构中移除所有 key。dbarray 参数不一定是服务器的主数据库
+ * （可以是临时数据库 tempDb）。
  *
- * The dbnum can be -1 if all the DBs should be emptied, or the specified
- * DB index if we want to empty only a single database.
- * The function returns the number of keys removed from the database(s). */
+ * dbnum 参数：
+ *   -1 表示清空所有数据库，
+ *   其他值表示只清空指定索引的单个数据库。
+ *
+ * 函数返回从数据库中移除的 key 数量。 */
 long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
                            void(callback)(dict*))
 {
@@ -486,13 +472,13 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
         if (async) {
             emptyDbAsync(&dbarray[j]);
         } else {
-            /* Destroy global HFE DS before deleting the hashes since ebuckets
-             * DS is embedded in the stored objects. */
+            /* 在删除 hash 之前先销毁全局 HFE（hash field expiration）数据结构，
+             * 因为 ebuckets 数据结构嵌入在存储的对象中。 */
             ebDestroy(&dbarray[j].hexpires, &hashExpireBucketsType, NULL);
             kvstoreEmpty(dbarray[j].keys, callback);
             kvstoreEmpty(dbarray[j].expires, callback);
         }
-        /* Because all keys of database are removed, reset average ttl. */
+        /* 由于数据库的所有 key 都已移除，重置平均 TTL */
         dbarray[j].avg_ttl = 0;
         dbarray[j].expires_cursor = 0;
     }
@@ -500,21 +486,20 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
     return removed;
 }
 
-/* Remove all data (keys and functions) from all the databases in a
- * Redis server. If callback is given the function is called from
- * time to time to signal that work is in progress.
+/* 从 Redis 服务器的所有数据库中移除所有数据（key 和函数库）。
+ * 如果提供了 callback，函数会不时调用它以通知处理进度。
  *
- * The dbnum can be -1 if all the DBs should be flushed, or the specified
- * DB number if we want to flush only a single Redis database number.
+ * dbnum 参数：
+ *   -1 表示清空所有数据库，
+ *   其他值表示只清空指定编号的单个数据库。
  *
- * Flags are be EMPTYDB_NO_FLAGS if no special flags are specified or
- * EMPTYDB_ASYNC if we want the memory to be freed in a different thread
- * and the function to return ASAP. EMPTYDB_NOFUNCTIONS can also be set
- * to specify that we do not want to delete the functions.
+ * flags 参数：
+ *   EMPTYDB_NO_FLAGS：无特殊标志（同步清空）。
+ *   EMPTYDB_ASYNC：在不同线程中释放内存，函数尽快返回。
+ *   EMPTYDB_NOFUNCTIONS：指定不删除函数库。
  *
- * On success the function returns the number of keys removed from the
- * database(s). Otherwise -1 is returned in the specific case the
- * DB number is out of range, and errno is set to EINVAL. */
+ * 成功时返回从数据库中移除的 key 数量。
+ * 如果 DB 编号超出范围，返回 -1 并将 errno 设置为 EINVAL。 */
 long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
     int async = (flags & EMPTYDB_ASYNC);
     int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
@@ -526,17 +511,16 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
         return -1;
     }
 
-    /* Fire the flushdb modules event. */
+    /* 触发 flushdb 模块事件 */
     moduleFireServerEvent(REDISMODULE_EVENT_FLUSHDB,
                           REDISMODULE_SUBEVENT_FLUSHDB_START,
                           &fi);
 
-    /* Make sure the WATCHed keys are affected by the FLUSH* commands.
-     * Note that we need to call the function while the keys are still
-     * there. */
+    /* 确保被 WATCH 监视的 key 会受到 FLUSH* 命令的影响。
+     * 注意：需要在 key 仍然存在时调用此函数。 */
     signalFlushedDb(dbnum, async);
 
-    /* Empty redis database structure. */
+    /* 清空 Redis 数据库结构 */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
 
     if (dbnum == -1) flushSlaveKeysWithExpireList();
@@ -546,8 +530,8 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
         functionsLibCtxClearCurrent(async);
     }
 
-    /* Also fire the end event. Note that this event will fire almost
-     * immediately after the start event if the flush is asynchronous. */
+    /* 也触发结束事件。注意：如果 flush 是异步的，此事件几乎会在
+     * 开始事件之后立即触发。 */
     moduleFireServerEvent(REDISMODULE_EVENT_FLUSHDB,
                           REDISMODULE_SUBEVENT_FLUSHDB_END,
                           &fi);
@@ -555,7 +539,8 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
     return removed;
 }
 
-/* Initialize temporary db on replica for use during diskless replication. */
+/* 在 replica 上初始化临时数据库，用于无盘复制（diskless replication）期间。
+ * 临时数据库用于接收从 master 传播过来的数据，之后再与主数据库交换。 */
 redisDb *initTempDb(void) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_DICTS_ON_DEMAND;
@@ -574,15 +559,15 @@ redisDb *initTempDb(void) {
     return tempDb;
 }
 
-/* Discard tempDb, this can be slow (similar to FLUSHALL), but it's always async. */
+/* 丢弃临时数据库 tempDb。此操作可能较慢（类似 FLUSHALL），但始终是异步的。 */
 void discardTempDb(redisDb *tempDb, void(callback)(dict*)) {
     int async = 1;
 
-    /* Release temp DBs. */
+    /* 释放临时数据库 */
     emptyDbStructure(tempDb, -1, async, callback);
     for (int i=0; i<server.dbnum; i++) {
-        /* Destroy global HFE DS before deleting the hashes since ebuckets DS is
-         * embedded in the stored objects. */
+        /* 在删除 hash 之前先销毁全局 HFE 数据结构，
+         * 因为 ebuckets 数据结构嵌入在存储的对象中。 */
         ebDestroy(&tempDb[i].hexpires, &hashExpireBucketsType, NULL);
         kvstoreRelease(tempDb[i].keys);
         kvstoreRelease(tempDb[i].expires);
@@ -591,6 +576,7 @@ void discardTempDb(redisDb *tempDb, void(callback)(dict*)) {
     zfree(tempDb);
 }
 
+/* 选择客户端要操作的数据库。id 范围为 [0, server.dbnum-1]。 */
 int selectDb(client *c, int id) {
     if (id < 0 || id >= server.dbnum)
         return C_ERR;
@@ -598,6 +584,7 @@ int selectDb(client *c, int id) {
     return C_OK;
 }
 
+/* 返回服务器所有数据库中 key 的总数 */
 long long dbTotalServerKeyCount(void) {
     long long total = 0;
     int j;
@@ -608,21 +595,22 @@ long long dbTotalServerKeyCount(void) {
 }
 
 /*-----------------------------------------------------------------------------
- * Hooks for key space changes.
+ * 键空间变更钩子（Hooks for key space changes）
  *
- * Every time a key in the database is modified the function
- * signalModifiedKey() is called.
+ * 每当数据库中的 key 被修改时，会调用 signalModifiedKey() 函数。
+ * 每当数据库被清空时，会调用 signalFlushDb() 函数。
  *
- * Every time a DB is flushed the function signalFlushDb() is called.
+ * 这些钩子用于维护 WATCH 机制和客户端缓存跟踪（client-side caching）的一致性。
  *----------------------------------------------------------------------------*/
 
-/* Note that the 'c' argument may be NULL if the key was modified out of
- * a context of a client. */
+/* 当 key 被修改时调用此函数，通知相关的 WATCH 监视器和客户端缓存跟踪。
+ * 注意：如果 key 的修改不在客户端上下文中执行，'c' 参数可以为 NULL。 */
 void signalModifiedKey(client *c, redisDb *db, robj *key) {
-    touchWatchedKey(db,key);
-    trackingInvalidateKey(c,key,1);
+    touchWatchedKey(db,key);         /* 通知 WATCH 该 key 的客户端，使其事务失败 */
+    trackingInvalidateKey(c,key,1);  /* 使客户端缓存跟踪中该 key 失效 */
 }
 
+/* 当数据库被清空时调用此函数，处理所有受影响的 WATCH 和客户端缓存跟踪。 */
 void signalFlushedDb(int dbid, int async) {
     int startdb, enddb;
     if (dbid == -1) {
@@ -633,30 +621,32 @@ void signalFlushedDb(int dbid, int async) {
     }
 
     for (int j = startdb; j <= enddb; j++) {
+        /* 扫描并处理因数据库清空而需要解除阻塞的 XREADGROUP 客户端 */
         scanDatabaseForDeletedKeys(&server.db[j], NULL);
+        /* 通知所有在此数据库上被 WATCH 的 key */
         touchAllWatchedKeysInDb(&server.db[j], NULL);
     }
 
+    /* 使客户端缓存跟踪中所有 key 失效 */
     trackingInvalidateKeysOnFlush(async);
 
-    /* Changes in this method may take place in swapMainDbWithTempDb as well,
-     * where we execute similar calls, but with subtle differences as it's
-     * not simply flushing db. */
+    /* 注意：此方法中的更改也可能在 swapMainDbWithTempDb 中发生，
+     * 在那里我们执行类似的调用，但有细微差异，因为它不是简单的清空数据库。 */
 }
 
 /*-----------------------------------------------------------------------------
- * Type agnostic commands operating on the key space
+ * 与类型无关的键空间操作命令
+ * 这些命令不依赖于 key 的具体数据类型，直接操作键空间。
  *----------------------------------------------------------------------------*/
 
-/* Return the set of flags to use for the emptyData() call for FLUSHALL
- * and FLUSHDB commands.
+/* 返回 FLUSHALL 和 FLUSHDB 命令应使用的 emptyData() 调用标志。
  *
- * sync: flushes the database in an sync manner.
- * async: flushes the database in an async manner.
- * no option: determine sync or async according to the value of lazyfree-lazy-user-flush.
+ * sync：同步清空数据库。
+ * async：异步清空数据库。
+ * 无选项：根据 lazyfree-lazy-user-flush 配置值决定同步或异步。
  *
- * On success C_OK is returned and the flags are stored in *flags, otherwise
- * C_ERR is returned and the function sends an error to the client. */
+ * 成功时返回 C_OK 并将标志存储在 *flags 中，
+ * 否则返回 C_ERR 并向客户端发送错误信息。 */
 int getFlushCommandFlags(client *c, int *flags) {
     /* Parse the optional ASYNC option. */
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"sync")) {
@@ -672,7 +662,7 @@ int getFlushCommandFlags(client *c, int *flags) {
     return C_OK;
 }
 
-/* Flushes the whole server data set. */
+/* 清空服务器的所有数据集，并在配置了持久化时保存新的 RDB 快照。 */
 void flushAllDataAndResetRDB(int flags) {
     server.dirty += emptyData(-1,flags,NULL);
     if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
@@ -683,58 +673,64 @@ void flushAllDataAndResetRDB(int flags) {
     }
 
 #if defined(USE_JEMALLOC)
-    /* jemalloc 5 doesn't release pages back to the OS when there's no traffic.
-     * for large databases, flushdb blocks for long anyway, so a bit more won't
-     * harm and this way the flush and purge will be synchronous. */
+    /* jemalloc 5 在没有流量时不会将页面归还给操作系统。
+     * 对于大型数据库，flushdb 本身就会阻塞较长时间，所以额外的开销影响不大，
+     * 这样可以使 flush 和 purge（清除）操作同步完成。 */
     if (!(flags & EMPTYDB_ASYNC)) {
-        /* Only clear the current thread cache.
-         * Ignore the return call since this will fail if the tcache is disabled. */
+        /* 仅清除当前线程的缓存。
+         * 忽略返回值，因为当 tcache 被禁用时此调用会失败。 */
         je_mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
 
-        jemalloc_purge();
+        jemalloc_purge();  /* 强制 jemalloc 归还内存给操作系统 */
     }
 #endif
 }
 
-/* Optimized FLUSHALL\FLUSHDB SYNC command finished to run by lazyfree thread */
+/* 优化的 FLUSHALL/FLUSHDB SYNC 命令，在 lazyfree 线程中完成后调用的回调函数。 */
+/* lazyfree 线程完成 FLUSHALL/FLUSHDB 同步优化后的回调函数。 */
 void flushallSyncBgDone(uint64_t client_id) {
 
     client *c = lookupClientByID(client_id);
 
-    /* Verify that client still exists */
+    /* 验证客户端是否仍然存在 */
     if (!(c && c->flags & CLIENT_BLOCKED)) return;
 
-    /* Update current_client (Called functions might rely on it) */
+    /* 更新 current_client（被调用的函数可能依赖它） */
     client *old_client = server.current_client;
     server.current_client = c;
 
-    /* Don't update blocked_us since command was processed in bg by lazy_free thread */
+    /* 不更新 blocked_us，因为命令在后台由 lazy_free 线程处理 */
     updateStatsOnUnblock(c, 0 /*blocked_us*/, elapsedUs(c->bstate.lazyfreeStartTime), 0);
 
-    /* lazyfree bg job always succeed */
+    /* lazyfree 后台作业始终成功 */
     addReply(c, shared.ok);
 
-    /* mark client as unblocked */
+    /* 将客户端标记为已解除阻塞 */
     unblockClient(c, 1);
 
-    /* FLUSH command is finished. resetClient() and update replication offset. */
+    /* FLUSH 命令已完成。执行 resetClient() 并更新复制偏移量。 */
     commandProcessed(c);
 
-    /* On flush completion, update the client's memory */
+    /* flush 完成后，更新客户端的内存使用量 */
     updateClientMemUsageAndBucket(c);
 
-    /* restore current_client */
+    /* 恢复 current_client */
     server.current_client = old_client;
 }
 
+/* FLUSHALL 和 FLUSHDB 命令的公共实现。
+ * isFlushAll: 1 表示 FLUSHALL（清空所有数据库），0 表示 FLUSHDB（清空当前数据库）。
+ *
+ * 优化策略：对于 SYNC 模式，如果可能，将其转换为阻塞式 ASYNC 执行，
+ * 这样客户端会阻塞等待直到 lazyfree 线程完成所有清理工作。 */
 void flushCommandCommon(client *c, int isFlushAll) {
-    int blocking_async = 0; /* FLUSHALL\FLUSHDB SYNC opt to run as blocking ASYNC */
+    int blocking_async = 0; /* 是否将 FLUSHALL/FLUSHDB SYNC 转换为阻塞式 ASYNC 执行 */
     int flags;
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
 
-    /* in case of SYNC, check if we can optimize and run it in bg as blocking ASYNC */
+    /* 对于 SYNC 模式，检查是否可以优化为后台阻塞式 ASYNC 执行 */
     if ((!(flags & EMPTYDB_ASYNC)) && (!(c->flags & CLIENT_AVOID_BLOCKING_ASYNC_FLUSH))) {
-        /* Run as ASYNC */
+        /* 转换为 ASYNC 模式执行 */
         flags |= EMPTYDB_ASYNC;
         blocking_async = 1;
     }
@@ -744,15 +740,14 @@ void flushCommandCommon(client *c, int isFlushAll) {
     else
         server.dirty += emptyData(c->db->id,flags | EMPTYDB_NOFUNCTIONS,NULL);
 
-    /* Without the forceCommandPropagation, when DB(s) was already empty,
-     * FLUSHALL\FLUSHDB will not be replicated nor put into the AOF. */
+    /* 没有 forceCommandPropagation 的话，当数据库已经为空时，
+     * FLUSHALL/FLUSHDB 不会被复制到 replica 也不会写入 AOF。 */
     forceCommandPropagation(c, PROPAGATE_REPL | PROPAGATE_AOF);
 
-    /* if blocking ASYNC, block client and add completion job request to BIO lazyfree
-     * worker's queue. To be called and reply with OK only after all preceding pending
-     * lazyfree jobs in queue were processed */
+    /* 如果是阻塞式 ASYNC，阻塞客户端并将完成作业请求添加到 BIO lazyfree 工作线程队列。
+     * 只有在队列中所有之前的 pending lazyfree 作业处理完成后，才会调用回调并回复 OK。 */
     if (blocking_async) {
-        /* measure bg job till completion as elapsed time of flush command */
+        /* 记录后台作业从开始到完成的耗时，作为 flush 命令的 elapsed time */
         elapsedStart(&c->bstate.lazyfreeStartTime);
 
         c->bstate.timeout = 0;
@@ -762,15 +757,15 @@ void flushCommandCommon(client *c, int isFlushAll) {
         addReply(c, shared.ok);
     }
 #if defined(USE_JEMALLOC)
-    /* jemalloc 5 doesn't release pages back to the OS when there's no traffic.
-     * for large databases, flushdb blocks for long anyway, so a bit more won't
-     * harm and this way the flush and purge will be synchronous.
+    /* jemalloc 5 在没有流量时不会将页面归还给操作系统。
+     * 对于大型数据库，flushdb 本身就会阻塞较长时间，所以额外的开销影响不大，
+     * 这样可以使 flush 和 purge 操作同步完成。
      *
-     * Take care purge only FLUSHDB for sync flow. FLUSHALL sync flow already
-     * applied at flushAllDataAndResetRDB. Async flow will apply only later on */
+     * 注意：仅对 FLUSHDB 的同步流程执行 purge。FLUSHALL 的同步流程已在
+     * flushAllDataAndResetRDB 中处理。异步流程将在稍后才执行 purge。 */
     if ((!isFlushAll) && (!(flags & EMPTYDB_ASYNC))) {
-        /* Only clear the current thread cache.
-         * Ignore the return call since this will fail if the tcache is disabled. */
+        /* 仅清除当前线程的缓存。
+         * 忽略返回值，因为当 tcache 被禁用时此调用会失败。 */
         je_mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
 
         jemalloc_purge();
@@ -779,20 +774,20 @@ void flushCommandCommon(client *c, int isFlushAll) {
 }
 
 /* FLUSHALL [SYNC|ASYNC]
- *
- * Flushes the whole server data set. */
+ * 清空整个服务器的数据集（所有数据库）。 */
 void flushallCommand(client *c) {
     flushCommandCommon(c, 1);
 }
 
 /* FLUSHDB [SYNC|ASYNC]
- *
- * Flushes the currently SELECTed Redis DB. */
+ * 清空当前 SELECT 的 Redis 数据库。 */
 void flushdbCommand(client *c) {
     flushCommandCommon(c, 0);
 }
 
-/* This command implements DEL and UNLINK. */
+/* DEL 和 UNLINK 命令的通用实现。
+ * lazy: 1 表示异步删除（UNLINK），0 表示同步删除（DEL）。
+ * DEL 是同步删除，UNLINK 是异步删除，后者对于大对象更高效。 */
 void delGenericCommand(client *c, int lazy) {
     int numdel = 0, j;
 
@@ -812,16 +807,18 @@ void delGenericCommand(client *c, int lazy) {
     addReplyLongLong(c,numdel);
 }
 
+/* DEL key [key ...] 命令。根据 lazyfree_lazy_user_del 配置决定同步或异步删除。 */
 void delCommand(client *c) {
     delGenericCommand(c,server.lazyfree_lazy_user_del);
 }
 
+/* UNLINK key [key ...] 命令。始终异步删除。 */
 void unlinkCommand(client *c) {
     delGenericCommand(c,1);
 }
 
-/* EXISTS key1 key2 ... key_N.
- * Return value is the number of keys existing. */
+/* EXISTS key1 key2 ... key_N 命令。
+ * 返回值是存在的 key 数量。使用 LOOKUP_NOTOUCH 避免修改 key 的访问时间。 */
 void existsCommand(client *c) {
     long long count = 0;
     int j;
@@ -832,6 +829,8 @@ void existsCommand(client *c) {
     addReplyLongLong(c,count);
 }
 
+/* SELECT dbid 命令。选择要操作的数据库编号。
+ * 集群模式下只允许选择 DB 0。 */
 void selectCommand(client *c) {
     int id;
 
@@ -849,6 +848,7 @@ void selectCommand(client *c) {
     }
 }
 
+/* RANDOMKEY 命令。从当前数据库中随机返回一个 key（不删除）。 */
 void randomkeyCommand(client *c) {
     robj *key;
 
@@ -861,6 +861,8 @@ void randomkeyCommand(client *c) {
     decrRefCount(key);
 }
 
+/* KEYS pattern 命令。返回匹配给定模式的所有 key。
+ * 警告：在大型数据库上执行 KEYS 会阻塞服务器很长时间，生产环境应使用 SCAN 代替。 */
 void keysCommand(client *c) {
     dictEntry *de;
     sds pattern = c->argv[1]->ptr;
@@ -868,6 +870,7 @@ void keysCommand(client *c) {
     unsigned long numkeys = 0;
     void *replylen = addReplyDeferredLen(c);
     allkeys = (pattern[0] == '*' && plen == 1);
+    /* 集群模式下，如果模式不是 "*"，尝试计算模式所属的槽位以优化遍历 */
     if (server.cluster_enabled && !allkeys) {
         pslot = patternHashSlot(pattern, plen);
     }
@@ -875,12 +878,14 @@ void keysCommand(client *c) {
     kvstoreIterator *kvs_it = NULL;
     if (pslot != -1) {
         if (!kvstoreDictSize(c->db->keys, pslot)) {
-            /* Requested slot is empty */
+            /* 请求的槽位为空，直接返回空结果 */
             setDeferredArrayLen(c,replylen,0);
             return;
         }
+        /* 只遍历特定槽位的字典（集群模式优化） */
         kvs_di = kvstoreGetDictSafeIterator(c->db->keys, pslot);
     } else {
+        /* 遍历所有槽位的字典 */
         kvs_it = kvstoreIteratorInit(c->db->keys);
     }
     robj keyobj;
@@ -904,18 +909,20 @@ void keysCommand(client *c) {
     setDeferredArrayLen(c,replylen,numkeys);
 }
 
-/* Data used by the dict scan callback. */
+/* 字典扫描回调函数使用的数据结构。
+ * 用于在 SCAN/SSCAN/HSCAN/ZSCAN 命令中收集扫描结果。 */
 typedef struct {
-    list *keys;   /* elements that collect from dict */
-    robj *o;      /* o must be a hash/set/zset object, NULL means current db */
-    long long type; /* the particular type when scan the db */
-    sds pattern;  /* pattern string, NULL means no pattern */
-    long sampled; /* cumulative number of keys sampled */
-    int no_values; /* set to 1 means to return keys only */
-    size_t (*strlen)(char *s); /* (o->type == OBJ_HASH) ? hfieldlen : sdslen */
+    list *keys;              /* 从字典中收集的元素列表 */
+    robj *o;                 /* 必须是 hash/set/zset 对象，NULL 表示扫描当前数据库 */
+    long long type;          /* 扫描数据库时的特定类型过滤（LLONG_MAX 表示不过滤） */
+    sds pattern;             /* 模式字符串，NULL 表示无模式匹配 */
+    long sampled;            /* 累计采样的 key 数量（用于限制扫描量） */
+    int no_values;           /* 设为 1 表示仅返回 key，不返回 value */
+    size_t (*strlen)(char *s); /* 字符串长度函数：(o->type == OBJ_HASH) ? hfieldlen : sdslen */
 } scanData;
 
-/* Helper function to compare key type in scan commands */
+/* 扫描命令中用于比较对象类型的辅助函数。
+ * 对于模块类型，使用特殊的一元负号标识进行比较。 */
 int objectTypeCompare(robj *o, long long target) {
     if (o->type != OBJ_MODULE) {
         if (o->type != target) 
@@ -930,8 +937,8 @@ int objectTypeCompare(robj *o, long long target) {
     else 
         return 1;
 }
-/* This callback is used by scanGenericCommand in order to collect elements
- * returned by the dictionary iterator into a list. */
+/* 此回调函数被 scanGenericCommand 使用，用于将字典迭代器返回的元素收集到列表中。
+ * 根据对象类型（数据库 key、SET、HASH、ZSET）以不同方式提取 key 和 value。 */
 void scanCallback(void *privdata, const dictEntry *de) {
     scanData *data = (scanData *)privdata;
     list *keys = data->keys;
@@ -983,10 +990,9 @@ void scanCallback(void *privdata, const dictEntry *de) {
     if (val && !data->no_values) listAddNodeTail(keys, val);
 }
 
-/* Try to parse a SCAN cursor stored at object 'o':
- * if the cursor is valid, store it as unsigned integer into *cursor and
- * returns C_OK. Otherwise return C_ERR and send an error to the
- * client. */
+/* 尝试解析存储在对象 'o' 中的 SCAN 游标：
+ * 如果游标有效，将其作为无符号整数存储到 *cursor 并返回 C_OK。
+ * 否则返回 C_ERR 并向客户端发送错误信息。 */
 int parseScanCursorOrReply(client *c, robj *o, unsigned long long *cursor) {
     if (!string2ull(o->ptr, cursor)) {
         addReplyError(c, "invalid cursor");
@@ -995,6 +1001,7 @@ int parseScanCursorOrReply(client *c, robj *o, unsigned long long *cursor) {
     return C_OK;
 }
 
+/* 对象类型名称数组，索引与 OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH/OBJ_STREAM 对应 */
 char *obj_type_name[OBJ_TYPE_MAX] = {
     "string", 
     "list", 
@@ -1005,7 +1012,8 @@ char *obj_type_name[OBJ_TYPE_MAX] = {
     "stream"
 };
 
-/* Helper function to get type from a string in scan commands */
+/* 扫描命令中用于从字符串获取对象类型的辅助函数。
+ * 返回类型索引（如 OBJ_STRING 等），模块类型返回负数标识，未找到返回 LLONG_MAX。 */
 long long getObjectTypeByName(char *name) {
 
     for (long long i = 0; i < OBJ_TYPE_MAX; i++) {
@@ -1020,6 +1028,7 @@ long long getObjectTypeByName(char *name) {
     return LLONG_MAX;
 }
 
+/* 获取对象的类型名称字符串。NULL 对象返回 "none"，模块类型返回模块注册的名称。 */
 char *getObjectTypeName(robj *o) {
     if (o == NULL) {
         return "none";
@@ -1035,17 +1044,20 @@ char *getObjectTypeName(robj *o) {
     }
 }
 
-/* This command implements SCAN, HSCAN and SSCAN commands.
- * If object 'o' is passed, then it must be a Hash, Set or Zset object, otherwise
- * if 'o' is NULL the command will operate on the dictionary associated with
- * the current database.
+/* 此函数实现了 SCAN、HSCAN、SSCAN 和 ZSCAN 命令的核心逻辑。
  *
- * When 'o' is not NULL the function assumes that the first argument in
- * the client arguments vector is a key so it skips it before iterating
- * in order to parse options.
+ * 参数说明：
+ *   o: 如果传入对象，则必须是 Hash、Set 或 Zset 对象；
+ *      如果为 NULL，命令将操作当前数据库的字典。
+ *   cursor: 游标值，用于迭代。
  *
- * In the case of a Hash object the function returns both the field and value
- * of every element on the Hash. */
+ * 当 'o' 不为 NULL 时，函数假设客户端参数向量中的第一个参数是 key，
+ * 因此在解析选项之前会跳过它。
+ *
+ * 对于 Hash 对象，函数返回每个元素的 field 和 value。
+ *
+ * SCAN 命令使用游标迭代方式，可以在不阻塞服务器的情况下增量遍历大型数据集。
+ * 返回的游标值用于下次迭代，返回 0 表示迭代完成。 */
 void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     int isKeysHfield = 0;
     int i, j;
@@ -1113,15 +1125,14 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         }
     }
 
-    /* Step 2: Iterate the collection.
+    /* 步骤 2：迭代集合。
      *
-     * Note that if the object is encoded with a listpack, intset, or any other
-     * representation that is not a hash table, we are sure that it is also
-     * composed of a small number of elements. So to avoid taking state we
-     * just return everything inside the object in a single call, setting the
-     * cursor to zero to signal the end of the iteration. */
+     * 注意：如果对象使用 listpack、intset 或其他非哈希表编码，
+     * 我们可以确定它只包含少量元素。因此为了避免维护状态，
+     * 我们在单次调用中返回对象中的所有元素，并将游标设为 0
+     * 以表示迭代结束。 */
 
-    /* Handle the case of a hash table. */
+    /* 处理哈希表编码的情况 */
     ht = NULL;
     if (o == NULL) {
         ht = NULL;
@@ -1136,39 +1147,30 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     }
 
     list *keys = listCreate();
-    /* Set a free callback for the contents of the collected keys list.
-     * For the main keyspace dict, and when we scan a key that's dict encoded
-     * (we have 'ht'), we don't need to define free method because the strings
-     * in the list are just a shallow copy from the pointer in the dictEntry.
-     * When scanning a key with other encodings (e.g. listpack), we need to
-     * free the temporary strings we add to that list.
-     * The exception to the above is ZSET, where we do allocate temporary
-     * strings even when scanning a dict. */
+    /* 为收集的 key 列表设置释放回调。
+     * 对于主键空间字典，以及扫描使用哈希表编码的 key 时（有 'ht'），
+     * 不需要定义释放方法，因为列表中的字符串只是 dictEntry 中指针的浅拷贝。
+     * 扫描使用其他编码（如 listpack）的 key 时，需要释放添加到列表的临时字符串。
+     * 上述规则的例外是 ZSET，即使扫描 dict 也会分配临时字符串。 */
     if (o && (!ht || o->type == OBJ_ZSET)) {
         listSetFreeMethod(keys, (void (*)(void*))sdsfree);
     }
 
-    /* For main dictionary scan or data structure using hashtable. */
+    /* 主字典扫描或使用哈希表的数据结构 */
     if (!o || ht) {
-        /* We set the max number of iterations to ten times the specified
-         * COUNT, so if the hash table is in a pathological state (very
-         * sparsely populated) we avoid to block too much time at the cost
-         * of returning no or very few elements. */
+        /* 将最大迭代次数设置为指定 COUNT 的 10 倍，
+         * 这样即使哈希表处于病态状态（非常稀疏），也能避免阻塞太久，
+         * 代价是可能返回很少或没有元素。 */
         long maxiterations = count*10;
 
-        /* We pass scanData which have three pointers to the callback:
-         * 1. data.keys: the list to which it will add new elements;
-         * 2. data.o: the object containing the dictionary so that
-         * it is possible to fetch more data in a type-dependent way;
-         * 3. data.type: the specified type scan in the db, LLONG_MAX means
-         * type matching is no needed;
-         * 4. data.pattern: the pattern string;
-         * 5. data.sampled: the maxiteration limit is there in case we're
-         * working on an empty dict, one with a lot of empty buckets, and
-         * for the buckets are not empty, we need to limit the spampled number
-         * to prevent a long hang time caused by filtering too many keys;
-         * 6. data.no_values: to control whether values will be returned or
-         * only keys are returned. */
+        /* 我们传递 scanData 结构给回调，它包含以下字段：
+         * 1. data.keys：用于添加新元素的列表；
+         * 2. data.o：包含字典的对象，以便以类型相关的方式获取更多数据；
+         * 3. data.type：数据库扫描时的指定类型过滤，LLONG_MAX 表示不需要类型匹配；
+         * 4. data.pattern：模式字符串；
+         * 5. data.sampled：最大迭代限制，用于处理空字典或大量空桶的情况，
+         *    对于非空桶，需要限制采样数量以防止因过滤太多 key 导致长时间阻塞；
+         * 6. data.no_values：控制是否返回 value，还是仅返回 key。 */
         scanData data = {
             .keys = keys,
             .o = o,
@@ -1179,14 +1181,14 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
             .strlen = (isKeysHfield) ? hfieldlen : sdslen,
         };
 
-        /* A pattern may restrict all matching keys to one cluster slot. */
+        /* 模式匹配可能将所有匹配的 key 限制在一个集群槽位中 */
         int onlydidx = -1;
         if (o == NULL && use_pattern && server.cluster_enabled) {
             onlydidx = patternHashSlot(pat, patlen);
         }
         do {
-            /* In cluster mode there is a separate dictionary for each slot.
-             * If cursor is empty, we should try exploring next non-empty slot. */
+            /* 集群模式下每个槽位有独立的字典。
+             * 如果游标为 0，应该尝试探索下一个非空槽位。 */
             if (o == NULL) {
                 cursor = kvstoreScan(c->db->keys, cursor, onlydidx, scanCallback, NULL, &data);
             } else {

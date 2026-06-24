@@ -1,9 +1,8 @@
-/* Hash Tables Implementation.
+/* 哈希表（Hash Table）实现。
  *
- * This file implements in memory hash tables with insert/del/replace/find/
- * get-random-element operations. Hash tables will auto resize if needed
- * tables of power of two in size are used, collisions are handled by
- * chaining. See the source code for more information... :)
+ * 本文件实现了内存中的哈希表，支持插入/删除/替换/查找/获取随机元素等操作。
+ * 哈希表在需要时会自动调整大小，使用2的幂次方大小的表，冲突通过链地址法处理。
+ * 渐进式 rehash 允许在不阻塞的情况下逐步迁移数据。
  *
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
@@ -27,51 +26,59 @@
 #include "redisassert.h"
 #include "monotonic.h"
 
-/* Using dictSetResizeEnabled() we make possible to disable
- * resizing and rehashing of the hash table as needed. This is very important
- * for Redis, as we use copy-on-write and don't want to move too much memory
- * around when there is a child performing saving operations.
+/* 通过 dictSetResizeEnabled() 可以根据需要禁用哈希表的调整大小和 rehash。
+ * 这对 Redis 非常重要，因为 Redis 使用 copy-on-write 机制，在子进程执行
+ * 保存操作时，我们不希望移动太多内存。
  *
- * Note that even when dict_can_resize is set to DICT_RESIZE_AVOID, not all
- * resizes are prevented:
- *  - A hash table is still allowed to expand if the ratio between the number
- *    of elements and the buckets >= dict_force_resize_ratio.
- *  - A hash table is still allowed to shrink if the ratio between the number
- *    of elements and the buckets <= 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio). */
+ * 注意：即使 dict_can_resize 设置为 DICT_RESIZE_AVOID，也不是所有调整都被阻止：
+ *  - 如果元素数量与桶数量的比值 >= dict_force_resize_ratio，仍允许扩展。
+ *  - 如果元素数量与桶数量的比值 <= 1/(HASHTABLE_MIN_FILL * dict_force_resize_ratio)，
+ *    仍允许收缩。 */
 static dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
-static unsigned int dict_force_resize_ratio = 4;
+static unsigned int dict_force_resize_ratio = 4; /* 强制调整大小的比值阈值 */
 
-/* -------------------------- types ----------------------------------------- */
+/* -------------------------- 类型定义 ----------------------------------------- */
+
+/* dictEntry 结构体：哈希表中的一个键值对条目。
+ * 使用联合体 v 存储值，支持指针、有符号/无符号整数和浮点数。
+ * next 指针用于链地址法处理冲突。 */
 struct dictEntry {
-    void *key;
-    union {
-        void *val;
-        uint64_t u64;
-        int64_t s64;
-        double d;
+    void *key;                  /* 键指针 */
+    union {                     /* 值（联合体，同一时间只使用一种类型） */
+        void *val;              /* 指针值 */
+        uint64_t u64;           /* 无符号 64 位整数值 */
+        int64_t s64;            /* 有符号 64 位整数值 */
+        double d;               /* 双精度浮点值 */
     } v;
-    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+    struct dictEntry *next;     /* 同一哈希桶中的下一个条目（链地址法） */
 };
 
+/* 无值的 dictEntry 精简版（用于 no_value 模式，dict 作为集合使用）。
+ * 比完整的 dictEntry 少一个 value 字段，节省内存。 */
 typedef struct {
-    void *key;
-    dictEntry *next;
+    void *key;                  /* 键指针 */
+    dictEntry *next;            /* 下一个条目 */
 } dictEntryNoValue;
 
-/* -------------------------- private prototypes ---------------------------- */
+/* -------------------------- 私有函数原型 ---------------------------- */
 
-static void _dictExpandIfNeeded(dict *d);
-static void _dictShrinkIfNeeded(dict *d);
-static signed char _dictNextExp(unsigned long size);
-static int _dictInit(dict *d, dictType *type);
-static dictEntry *dictGetNext(const dictEntry *de);
-static dictEntry **dictGetNextRef(dictEntry *de);
-static void dictSetNext(dictEntry *de, dictEntry *next);
-static int dictDefaultCompare(dict *d, const void *key1, const void *key2);
+static void _dictExpandIfNeeded(dict *d);       /* 检查是否需要扩展 */
+static void _dictShrinkIfNeeded(dict *d);       /* 检查是否需要收缩 */
+static signed char _dictNextExp(unsigned long size); /* 计算大于等于 size 的最小2的幂指数 */
+static int _dictInit(dict *d, dictType *type);  /* 初始化 dict 结构体 */
+static dictEntry *dictGetNext(const dictEntry *de);     /* 获取条目的 next 指针 */
+static dictEntry **dictGetNextRef(dictEntry *de);       /* 获取条目的 next 指针的引用 */
+static void dictSetNext(dictEntry *de, dictEntry *next); /* 设置条目的 next 指针 */
+static int dictDefaultCompare(dict *d, const void *key1, const void *key2); /* 默认键比较（指针比较） */
 
-/* -------------------------- misc inline functions -------------------------------- */
+/* -------------------------- 内联辅助函数 -------------------------------- */
 
+/* 键比较函数类型 */
 typedef int (*keyCmpFunc)(dict *d, const void *key1, const void *key2);
+
+/* 根据当前 dict 的配置选择合适的键比较函数。
+ * 如果启用了 storedKeyApi 且有 storedKeyCompare，使用它；
+ * 否则使用 keyCompare；都没有则使用默认的指针比较。 */
 static inline keyCmpFunc dictGetKeyCmpFunc(dict *d) {
     if (d->useStoredKeyApi && d->type->storedKeyCompare)
         return d->type->storedKeyCompare;
@@ -80,6 +87,7 @@ static inline keyCmpFunc dictGetKeyCmpFunc(dict *d) {
     return dictDefaultCompare;
 }
 
+/* 计算键的哈希值。如果 isStoredKey 为真且有 storedHashFunction，使用它。 */
 static inline uint64_t dictHashKey(dict *d, const void *key, int isStoredKey) {
     if (isStoredKey && d->type->storedHashFunction)
         return d->type->storedHashFunction(key);
@@ -87,61 +95,64 @@ static inline uint64_t dictHashKey(dict *d, const void *key, int isStoredKey) {
         return d->type->hashFunction(key);
 }
 
-/* -------------------------- hash functions -------------------------------- */
+/* -------------------------- 哈希函数 -------------------------------- */
 
+/* 哈希函数的种子，用于 SipHash 算法 */
 static uint8_t dict_hash_function_seed[16];
 
+/* 设置哈希函数种子 */
 void dictSetHashFunctionSeed(uint8_t *seed) {
     memcpy(dict_hash_function_seed,seed,sizeof(dict_hash_function_seed));
 }
 
+/* 获取哈希函数种子 */
 uint8_t *dictGetHashFunctionSeed(void) {
     return dict_hash_function_seed;
 }
 
-/* The default hashing function uses SipHash implementation
- * in siphash.c. */
-
+/* 默认哈希函数使用 siphash.c 中的 SipHash 实现。
+ * SipHash 是一种加密级别的哈希函数，能有效防止 HashDoS 攻击。 */
 uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k);
 uint64_t siphash_nocase(const uint8_t *in, const size_t inlen, const uint8_t *k);
 
+/* 生成哈希值（区分大小写） */
 uint64_t dictGenHashFunction(const void *key, size_t len) {
     return siphash(key,len,dict_hash_function_seed);
 }
 
+/* 生成不区分大小写的哈希值 */
 uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
     return siphash_nocase(buf,len,dict_hash_function_seed);
 }
 
-/* --------------------- dictEntry pointer bit tricks ----------------------  */
+/* --------------------- dictEntry 指针位操作技巧 ----------------------  */
 
-/* The 3 least significant bits in a pointer to a dictEntry determines what the
- * pointer actually points to. If the least bit is set, it's a key. Otherwise,
- * the bit pattern of the least 3 significant bits mark the kind of entry. */
+/* dictEntry 指针的最低 3 位用于编码指针类型，利用了内存对齐特性
+ * （分配的内存地址最低位总是0）。最低位为1表示这是直接存储的键指针，
+ * 否则最低3位的位模式标记条目的类型。 */
 
-#define ENTRY_PTR_MASK     7 /* 111 */
-#define ENTRY_PTR_NORMAL   0 /* 000 */
-#define ENTRY_PTR_NO_VALUE 2 /* 010 */
+#define ENTRY_PTR_MASK     7 /* 111 - 掩码，提取低3位 */
+#define ENTRY_PTR_NORMAL   0 /* 000 - 普通的 dictEntry（有键和值） */
+#define ENTRY_PTR_NO_VALUE 2 /* 010 - 无值的 dictEntryNoValue */
 
-/* Returns 1 if the entry pointer is a pointer to a key, rather than to an
- * allocated entry. Returns 0 otherwise. */
+/* 判断指针是否直接指向键（而非分配的 entry）。
+ * 当 keys_are_odd 启用且目标桶为空时，可以直接存储键指针以节省内存。 */
 static inline int entryIsKey(const dictEntry *de) {
     return (uintptr_t)(void *)de & 1;
 }
 
-/* Returns 1 if the pointer is actually a pointer to a dictEntry struct. Returns
- * 0 otherwise. */
+/* 判断指针是否指向普通的 dictEntry 结构体 */
 static inline int entryIsNormal(const dictEntry *de) {
     return ((uintptr_t)(void *)de & ENTRY_PTR_MASK) == ENTRY_PTR_NORMAL;
 }
 
-/* Returns 1 if the entry is a special entry with key and next, but without
- * value. Returns 0 otherwise. */
+/* 判断指针是否指向无值的 dictEntryNoValue 结构体 */
 static inline int entryIsNoValue(const dictEntry *de) {
     return ((uintptr_t)(void *)de & ENTRY_PTR_MASK) == ENTRY_PTR_NO_VALUE;
 }
 
-/* Creates an entry without a value field. */
+/* 创建一个无值的条目（用于 no_value 模式）。
+ * 在指针的低3位中设置 ENTRY_PTR_NO_VALUE 标记。 */
 static inline dictEntry *createEntryNoValue(void *key, dictEntry *next) {
     dictEntryNoValue *entry = zmalloc(sizeof(*entry));
     entry->key = key;
@@ -149,30 +160,31 @@ static inline dictEntry *createEntryNoValue(void *key, dictEntry *next) {
     return (dictEntry *)(void *)((uintptr_t)(void *)entry | ENTRY_PTR_NO_VALUE);
 }
 
+/* 将指针与位标记编码在一起 */
 static inline dictEntry *encodeMaskedPtr(const void *ptr, unsigned int bits) {
     assert(((uintptr_t)ptr & ENTRY_PTR_MASK) == 0);
     return (dictEntry *)(void *)((uintptr_t)ptr | bits);
 }
 
+/* 从带标记的指针中解码出原始指针（清除低3位标记） */
 static inline void *decodeMaskedPtr(const dictEntry *de) {
     assert(!entryIsKey(de));
     return (void *)((uintptr_t)(void *)de & ~ENTRY_PTR_MASK);
 }
 
-/* Decodes the pointer to an entry without value, when you know it is an entry
- * without value. Hint: Use entryIsNoValue to check. */
+/* 解码无值条目的指针。提示：使用 entryIsNoValue 检查后再调用。 */
 static inline dictEntryNoValue *decodeEntryNoValue(const dictEntry *de) {
     return decodeMaskedPtr(de);
 }
 
-/* Returns 1 if the entry has a value field and 0 otherwise. */
+/* 判断条目是否有值字段（即是否为普通的 dictEntry） */
 static inline int entryHasValue(const dictEntry *de) {
     return entryIsNormal(de);
 }
 
-/* ----------------------------- API implementation ------------------------- */
+/* ----------------------------- API 实现 ------------------------- */
 
-/* Reset hash table parameters already initialized with _dictInit()*/
+/* 重置哈希表参数（将指定哈希表初始化为空状态） */
 static void _dictReset(dict *d, int htidx)
 {
     d->ht_table[htidx] = NULL;
@@ -180,7 +192,9 @@ static void _dictReset(dict *d, int htidx)
     d->ht_used[htidx] = 0;
 }
 
-/* Create a new hash table */
+/* 创建一个新的 dict。
+ * 根据 dictType 中的 dictMetadataBytes 计算元数据大小，
+ * 分配足够的内存并初始化。 */
 dict *dictCreate(dictType *type)
 {
     size_t metasize = type->dictMetadataBytes ? type->dictMetadataBytes(NULL) : 0;
@@ -192,56 +206,56 @@ dict *dictCreate(dictType *type)
     return d;
 }
 
-/* Change dictType of dict to another one with metadata support
- * Rest of dictType's values must stay the same */
+/* 将 dict 的 dictType 更改为支持元数据的新类型。
+ * 除 dictMetadataBytes 和 onDictRelease 外，其余 dictType 字段必须保持不变。 */
 void dictTypeAddMeta(dict **d, dictType *typeWithMeta) {
-    /* Verify new dictType is compatible with the old one */
+    /* 验证新的 dictType 与旧的兼容 */
     dictType toCmp = *typeWithMeta;
-    toCmp.dictMetadataBytes = NULL;                            /* Expected old one not to have metadata */
-    toCmp.onDictRelease = (*d)->type->onDictRelease;           /* Ignore 'onDictRelease' in comparison */
-    assert(memcmp((*d)->type, &toCmp, sizeof(dictType)) == 0); /* The rest of the dictType fields must be the same */
+    toCmp.dictMetadataBytes = NULL;                            /* 期望旧的没有元数据 */
+    toCmp.onDictRelease = (*d)->type->onDictRelease;           /* 比较时忽略 onDictRelease */
+    assert(memcmp((*d)->type, &toCmp, sizeof(dictType)) == 0); /* 其余 dictType 字段必须相同 */
 
     *d = zrealloc(*d, sizeof(dict) + typeWithMeta->dictMetadataBytes(*d));
     (*d)->type = typeWithMeta;
 }
 
-/* Initialize the hash table */
+/* 初始化哈希表（将 dict 的所有字段设为初始值） */
 int _dictInit(dict *d, dictType *type)
 {
     _dictReset(d, 0);
     _dictReset(d, 1);
     d->type = type;
-    d->rehashidx = -1;
+    d->rehashidx = -1;          /* -1 表示没有进行 rehash */
     d->pauserehash = 0;
     d->pauseAutoResize = 0;
     d->useStoredKeyApi = 0;
     return DICT_OK;
 }
 
-/* Resize or create the hash table,
- * when malloc_failed is non-NULL, it'll avoid panic if malloc fails (in which case it'll be set to 1).
- * Returns DICT_OK if resize was performed, and DICT_ERR if skipped. */
+/* 调整哈希表大小（创建新的哈希表并准备渐进式 rehash）。
+ * 当 malloc_failed 非 NULL 时，malloc 失败不会 panic（设置为1表示失败）。
+ * 成功执行返回 DICT_OK，跳过则返回 DICT_ERR。 */
 int _dictResize(dict *d, unsigned long size, int* malloc_failed)
 {
     if (malloc_failed) *malloc_failed = 0;
 
-    /* We can't rehash twice if rehashing is ongoing. */
+    /* 不能在 rehash 进行中再次 rehash */
     assert(!dictIsRehashing(d));
 
-    /* the new hash table */
+    /* 计算新哈希表的大小（2的幂次方） */
     dictEntry **new_ht_table;
     unsigned long new_ht_used;
     signed char new_ht_size_exp = _dictNextExp(size);
 
-    /* Detect overflows */
+    /* 检测溢出 */
     size_t newsize = DICTHT_SIZE(new_ht_size_exp);
     if (newsize < size || newsize * sizeof(dictEntry*) < newsize)
         return DICT_ERR;
 
-    /* Rehashing to the same table size is not useful. */
+    /* rehash 到相同大小没有意义 */
     if (new_ht_size_exp == d->ht_size_exp[0]) return DICT_ERR;
 
-    /* Allocate the new hash table and initialize all pointers to NULL */
+    /* 分配新哈希表并初始化所有指针为 NULL */
     if (malloc_failed) {
         new_ht_table = ztrycalloc(newsize*sizeof(dictEntry*));
         *malloc_failed = new_ht_table == NULL;
@@ -252,9 +266,9 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
 
     new_ht_used = 0;
 
-    /* Prepare a second hash table for incremental rehashing.
-     * We do this even for the first initialization, so that we can trigger the
-     * rehashingStarted more conveniently, we will clean it up right after. */
+    /* 准备第二个哈希表用于渐进式 rehash。
+     * 即使是首次初始化也这样做，以便更方便地触发 rehashingStarted 回调，
+     * 之后会立即清理。 */
     d->ht_size_exp[1] = new_ht_size_exp;
     d->ht_used[1] = new_ht_used;
     d->ht_table[1] = new_ht_table;
@@ -263,9 +277,8 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
     if (d->type->bucketChanged)
         d->type->bucketChanged(d, DICTHT_SIZE(d->ht_size_exp[1]));
 
-    /* Is this the first initialization or is the first hash table empty? If so
-     * it's not really a rehashing, we can just set the first hash table so that
-     * it can accept keys. */
+    /* 如果是首次初始化或第一个哈希表为空，这不是真正的 rehash，
+     * 直接将第一个哈希表设置好以便接收键。 */
     if (d->ht_table[0] == NULL || d->ht_used[0] == 0) {
         if (d->type->rehashingCompleted) d->type->rehashingCompleted(d);
         if (d->type->bucketChanged)
@@ -282,37 +295,41 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
     return DICT_OK;
 }
 
+/* 内部扩展函数：检查扩展条件是否满足 */
 int _dictExpand(dict *d, unsigned long size, int* malloc_failed) {
-    /* the size is invalid if it is smaller than the size of the hash table 
-     * or smaller than the number of elements already inside the hash table */
+    /* 如果正在 rehash、新大小小于已使用数量或当前大小已经够大，则无效 */
     if (dictIsRehashing(d) || d->ht_used[0] > size || DICTHT_SIZE(d->ht_size_exp[0]) >= size)
         return DICT_ERR;
     return _dictResize(d, size, malloc_failed);
 }
 
-/* return DICT_ERR if expand was not performed */
+/* 扩展哈希表到指定大小。如果未执行扩展返回 DICT_ERR。 */
 int dictExpand(dict *d, unsigned long size) {
     return _dictExpand(d, size, NULL);
 }
 
-/* return DICT_ERR if expand failed due to memory allocation failure */
+/* 尝试扩展哈希表。如果因内存分配失败而未扩展返回 DICT_ERR。 */
 int dictTryExpand(dict *d, unsigned long size) {
     int malloc_failed = 0;
     _dictExpand(d, size, &malloc_failed);
     return malloc_failed? DICT_ERR : DICT_OK;
 }
 
-/* return DICT_ERR if shrink was not performed */
+/* 收缩哈希表到指定大小。如果未执行收缩返回 DICT_ERR。 */
 int dictShrink(dict *d, unsigned long size) {
-    /* the size is invalid if it is bigger than the size of the hash table
-     * or smaller than the number of elements already inside the hash table */
+    /* 如果正在 rehash、新大小小于已使用数量或当前大小已经够小，则无效 */
     if (dictIsRehashing(d) || d->ht_used[0] > size || DICTHT_SIZE(d->ht_size_exp[0]) <= size)
         return DICT_ERR;
     return _dictResize(d, size, NULL);
 }
 
-/* Helper function for `dictRehash` and `dictBucketRehash` which rehashes all the keys
- * in a bucket at index `idx` from the old to the new hash HT. */
+/* dictRehash 和 dictBucketRehash 的辅助函数：将索引 idx 处桶中的所有键
+ * 从旧哈希表 rehash 到新哈希表。
+ *
+ * 处理三种情况（针对 no_value 模式）：
+ * 1. 目标桶为空且键为奇数：直接存储键指针，无需分配 entry
+ * 2. 当前是键指针但需要分配 entry：创建无值 entry
+ * 3. 普通情况：移动现有 entry 并更新 next 指针 */
 static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     dictEntry *de = d->ht_table[0][idx];
     uint64_t h;
@@ -320,38 +337,34 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     while (de) {
         nextde = dictGetNext(de);
         void *key = dictGetKey(de);
-        /* Get the index in the new hash table */
+        /* 计算在新哈希表中的索引 */
         if (d->ht_size_exp[1] > d->ht_size_exp[0]) {
+            /* 扩展时：重新计算哈希值并取模 */
             h = dictHashKey(d, key, 1) & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
         } else {
-            /* We're shrinking the table. The tables sizes are powers of
-             * two, so we simply mask the bucket index in the larger table
-             * to get the bucket index in the smaller table. */
+            /* 收缩时：表大小是2的幂次方，直接用大表的桶索引与小表的掩码相与 */
             h = idx & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
         }
         if (d->type->no_value) {
             if (d->type->keys_are_odd && !d->ht_table[1][h]) {
-                /* Destination bucket is empty and we can store the key
-                 * directly without an allocated entry. Free the old entry
-                 * if it's an allocated entry.
+                /* 目标桶为空，可以直接存储键指针而无需分配 entry。
+                 * 如果旧的是分配的 entry 则释放它。
                  *
-                 * TODO: Add a flag 'keys_are_even' and if set, we can use
-                 * this optimization for these dicts too. We can set the LSB
-                 * bit when stored as a dict entry and clear it again when
-                 * we need the key back. */
+                 * TODO: 添加 'keys_are_even' 标志，设置时也可以使用此优化。
+                 * 可以在存储为 dict entry 时设置 LSB 位，需要键时再清除。 */
                 assert(entryIsKey(key));
                 if (!entryIsKey(de)) zfree(decodeMaskedPtr(de));
                 de = key;
             } else if (entryIsKey(de)) {
-                /* We don't have an allocated entry but we need one. */
+                /* 当前是键指针但需要分配 entry（目标桶非空） */
                 de = createEntryNoValue(key, d->ht_table[1][h]);
             } else {
-                /* Just move the existing entry to the destination table and
-                 * update the 'next' field. */
+                /* 直接移动现有 entry 到目标表并更新 next 字段 */
                 assert(entryIsNoValue(de));
                 dictSetNext(de, d->ht_table[1][h]);
             }
         } else {
+            /* 普通模式：设置 next 指针 */
             dictSetNext(de, d->ht_table[1][h]);
         }
         d->ht_table[1][h] = de;
@@ -362,20 +375,22 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     d->ht_table[0][idx] = NULL;
 }
 
-/* This checks if we already rehashed the whole table and if more rehashing is required */
+/* 检查是否已完成整个表的 rehash，如果完成则执行清理和切换。
+ * 返回 1 表示 rehash 已完成，0 表示还有数据需要迁移。 */
 static int dictCheckRehashingCompleted(dict *d) {
     if (d->ht_used[0] != 0) return 0;
-    
+
+    /* 旧表已清空，触发 rehashingCompleted 回调 */
     if (d->type->rehashingCompleted) d->type->rehashingCompleted(d);
     if (d->type->bucketChanged)
         d->type->bucketChanged(d, -(long long)DICTHT_SIZE(d->ht_size_exp[0]));
     zfree(d->ht_table[0]);
-    /* Copy the new ht onto the old one */
+    /* 将新表复制到旧表位置 */
     d->ht_table[0] = d->ht_table[1];
     d->ht_used[0] = d->ht_used[1];
     d->ht_size_exp[0] = d->ht_size_exp[1];
     _dictReset(d, 1);
-    d->rehashidx = -1;
+    d->rehashidx = -1;          /* 标记 rehash 完成 */
     return 1;
 }
 
