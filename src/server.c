@@ -1251,23 +1251,22 @@ void cronUpdateMemoryStats(void) {
     }
 }
 
-/* This is our timer interrupt, called server.hz times per second.
- * Here is where we do a number of things that need to be done asynchronously.
- * For instance:
+/* 这是我们的定时器中断，每秒被调用 server.hz 次。
+ * 在这里我们执行一些需要异步处理的工作。
+ * 例如：
  *
- * - Active expired keys collection (it is also performed in a lazy way on
- *   lookup).
- * - Software watchdog.
- * - Update some statistic.
- * - Incremental rehashing of the DBs hash tables.
- * - Triggering BGSAVE / AOF rewrite, and handling of terminated children.
- * - Clients timeout of different kinds.
- * - Replication reconnection.
- * - Many more...
+ * - 主动过期键收集（在查找时也会以惰性方式执行）。
+ * - 软件 watchdog。
+ * - 更新一些统计数据。
+ * - 对数据库哈希表进行增量 rehash。
+ * - 触发 BGSAVE / AOF 重写，以及处理已终止的子进程。
+ * - 不同类型的客户端超时。
+ * - Replication 重连。
+ * - 更多其他任务...
  *
- * Everything directly called here will be called server.hz times per second,
- * so in order to throttle execution of things we want to do less frequently
- * a macro is used: run_with_period(milliseconds) { .... }
+ * 这里直接调用的所有操作每秒都会被调用 server.hz 次，
+ * 因此为了控制那些不需要频繁执行的操作的执行频率，
+ * 使用了一个宏：run_with_period(毫秒数) { .... }
  */
 
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
@@ -1276,13 +1275,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(id);
     UNUSED(clientData);
 
-    /* Software watchdog: deliver the SIGALRM that will reach the signal
-     * handler if we don't return here fast enough. */
+    /* 软件 watchdog：如果我们没有足够快地返回，就发送 SIGALRM 信号给信号处理器。 */
     if (server.watchdog_period) watchdogScheduleSignal(server.watchdog_period);
 
     server.hz = server.config_hz;
-    /* Adapt the server.hz value to the number of configured clients. If we have
-     * many clients, we want to call serverCron() with an higher frequency. */
+    /* 根据已配置的客户端数量调整 server.hz 的值。如果客户端数量很多，
+     * 我们希望以更高的频率调用 serverCron()。 */
     if (server.dynamic_hz) {
         while (listLength(server.clients) / server.hz >
                MAX_CLIENTS_PER_CLOCK_TICK)
@@ -1295,7 +1293,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         }
     }
 
-    /* for debug purposes: skip actual cron work if pause_cron is on */
+    /* 用于调试目的：如果 pause_cron 开启则跳过实际的 cron 工作 */
     if (server.pause_cron) return 1000/server.hz;
 
     monotime cron_start = getMonotonicUs();
@@ -1324,23 +1322,21 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                                  server.duration_stats[EL_DURATION_TYPE_EL].cnt, 1);
     }
 
-    /* We have just LRU_BITS bits per object for LRU information.
-     * So we use an (eventually wrapping) LRU clock.
+    /* 每个对象只有 LRU_BITS 位用于 LRU 信息。
+     * 因此我们使用一个（可能回绕的）LRU 时钟。
      *
-     * Note that even if the counter wraps it's not a big problem,
-     * everything will still work but some object will appear younger
-     * to Redis. However for this to happen a given object should never be
-     * touched for all the time needed to the counter to wrap, which is
-     * not likely.
+     * 注意，即使计数器回绕也不是大问题，
+     * 一切仍然可以正常工作，只是某些对象在 Redis 看来会更年轻。
+     * 不过要发生这种情况，某个对象必须在计数器回绕所需的
+     * 整个时间段内都不被访问，这不太可能发生。
      *
-     * Note that you can change the resolution altering the
-     * LRU_CLOCK_RESOLUTION define. */
+     * 注意，你可以通过修改 LRU_CLOCK_RESOLUTION 定义来改变分辨率。 */
     server.lruclock = getLRUClock();
 
     cronUpdateMemoryStats();
 
-    /* We received a SIGTERM or SIGINT, shutting down here in a safe way, as it is
-     * not ok doing so inside the signal handler. */
+    /* 我们收到了 SIGTERM 或 SIGINT 信号，在这里以安全的方式执行关闭，
+     * 因为在信号处理器中执行关闭操作是不安全的。 */
     if (server.shutdown_asap && !isShutdownInitiated()) {
         int shutdownFlags = SHUTDOWN_NOFLAGS;
         if (server.last_sig_received == SIGINT && server.shutdown_on_sigint)
@@ -1352,11 +1348,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     } else if (isShutdownInitiated()) {
         if (server.mstime >= server.shutdown_mstime || isReadyToShutdown()) {
             if (finishShutdown() == C_OK) exit(0);
-            /* Shutdown failed. Continue running. An error has been logged. */
+            /* 关闭失败，继续运行。错误信息已被记录。 */
         }
     }
 
-    /* Show some info about non-empty databases */
+    /* 显示非空数据库的一些信息 */
     if (server.verbosity <= LL_VERBOSE) {
         run_with_period(5000) {
             for (j = 0; j < server.dbnum; j++) {
@@ -1372,7 +1368,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         }
     }
 
-    /* Show information about connected clients */
+    /* 显示已连接客户端的信息 */
     if (!server.sentinel_mode) {
         run_with_period(5000) {
             serverLog(LL_DEBUG,
@@ -1383,14 +1379,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         }
     }
 
-    /* We need to do a few operations on clients asynchronously. */
+    /* 我们需要异步地对客户端执行一些操作。 */
     clientsCron();
 
-    /* Handle background operations on Redis databases. */
+    /* 处理 Redis 数据库的后台操作。 */
     databasesCron();
 
-    /* Start a scheduled AOF rewrite if this was requested by the user while
-     * a BGSAVE was in progress. */
+    /* 如果用户在 BGSAVE 进行期间请求了 AOF 重写，现在启动已调度的 AOF 重写。 */
     if (!hasActiveChildProcess() &&
         server.aof_rewrite_scheduled &&
         !aofRewriteLimited())
@@ -1398,21 +1393,19 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         rewriteAppendOnlyFileBackground();
     }
 
-    /* Check if a background saving or AOF rewrite in progress terminated. */
+    /* 检查正在进行的后台保存或 AOF 重写是否已终止。 */
     if (hasActiveChildProcess() || ldbPendingChildren())
     {
         run_with_period(1000) receiveChildInfo();
         checkChildrenDone();
     } else {
-        /* If there is not a background saving/rewrite in progress check if
-         * we have to save/rewrite now. */
+        /* 如果没有正在进行的后台保存/重写，检查是否需要立即保存/重写。 */
         for (j = 0; j < server.saveparamslen; j++) {
             struct saveparam *sp = server.saveparams+j;
 
-            /* Save if we reached the given amount of changes,
-             * the given amount of seconds, and if the latest bgsave was
-             * successful or if, in case of an error, at least
-             * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
+            /* 如果达到了指定的修改次数、指定的秒数，
+             * 并且最近一次 BGSAVE 成功，或者在出错的情况下至少
+             * 已经过了 CONFIG_BGSAVE_RETRY_DELAY 秒，则执行保存。 */
             if (server.dirty >= sp->changes &&
                 server.unixtime-server.lastsave > sp->seconds &&
                 (server.unixtime-server.lastbgsave_try >
@@ -1428,7 +1421,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
         }
 
-        /* Trigger an AOF rewrite if needed. */
+        /* 如果需要，触发 AOF 重写。 */
         if (server.aof_state == AOF_ON &&
             !hasActiveChildProcess() &&
             server.aof_rewrite_perc &&
@@ -1443,22 +1436,19 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
         }
     }
-    /* Just for the sake of defensive programming, to avoid forgetting to
-     * call this function when needed. */
+    /* 出于防御性编程的考虑，避免忘记在需要时调用此函数。 */
     updateDictResizePolicy();
 
-    /* AOF postponed flush: Try at every cron cycle if the slow fsync
-     * completed. */
+    /* AOF 延迟刷写：在每个 cron 周期尝试检查慢速 fsync 是否已完成。 */
     if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
         server.aof_flush_postponed_start)
     {
         flushAppendOnlyFile(0);
     }
 
-    /* AOF write errors: in this case we have a buffer to flush as well and
-     * clear the AOF error in case of success to make the DB writable again,
-     * however to try every second is enough in case of 'hz' is set to
-     * a higher frequency. */
+    /* AOF 写入错误：在这种情况下我们也有一个缓冲区需要刷写，
+     * 如果成功则清除 AOF 错误以使数据库恢复可写状态，
+     * 但即使 hz 设置为更高频率，每秒尝试一次也足够了。 */
     run_with_period(1000) {
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
             server.aof_last_write_status == C_ERR) 
@@ -1467,49 +1457,47 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
     }
 
-    /* Clear the paused actions state if needed. */
+    /* 如果需要，清除暂停操作状态。 */
     updatePausedActions();
 
-    /* Replication cron function -- used to reconnect to master,
-     * detect transfer failures, start background RDB transfers and so forth. 
-     * 
-     * If Redis is trying to failover then run the replication cron faster so
-     * progress on the handshake happens more quickly. */
+    /* Replication cron 函数 —— 用于重新连接到 master、
+     * 检测传输失败、启动后台 RDB 传输等。
+     *
+     * 如果 Redis 正在尝试故障转移，则更快地运行 replication cron，
+     * 以便握手过程更快推进。 */
     if (server.failover_state != NO_FAILOVER) {
         run_with_period(100) replicationCron();
     } else {
         run_with_period(1000) replicationCron();
     }
 
-    /* Run the Redis Cluster cron. */
+    /* 运行 Redis Cluster cron。 */
     run_with_period(100) {
         if (server.cluster_enabled) clusterCron();
     }
 
-    /* Run the Sentinel timer if we are in sentinel mode. */
+    /* 如果处于 Sentinel 模式，运行 Sentinel 定时器。 */
     if (server.sentinel_mode) sentinelTimer();
 
-    /* Cleanup expired MIGRATE cached sockets. */
+    /* 清理过期的 MIGRATE 缓存套接字。 */
     run_with_period(1000) {
         migrateCloseTimedoutSockets();
     }
 
-    /* Stop the I/O threads if we don't have enough pending work. */
+    /* 如果没有足够的待处理工作，停止 I/O 线程。 */
     stopThreadedIOIfNeeded();
 
-    /* Resize tracking keys table if needed. This is also done at every
-     * command execution, but we want to be sure that if the last command
-     * executed changes the value via CONFIG SET, the server will perform
-     * the operation even if completely idle. */
+    /* 如果需要，调整 tracking 键表的大小。这在每次命令执行时也会做，
+     * 但我们要确保如果最后执行的命令通过 CONFIG SET 修改了值，
+     * 即使服务器完全空闲也会执行此操作。 */
     if (server.tracking_clients) trackingLimitUsedSlots();
 
-    /* Start a scheduled BGSAVE if the corresponding flag is set. This is
-     * useful when we are forced to postpone a BGSAVE because an AOF
-     * rewrite is in progress.
+    /* 如果相应标志已设置，启动已调度的 BGSAVE。当我们因为 AOF
+     * 重写正在进行而被迫推迟 BGSAVE 时，这很有用。
      *
-     * Note: this code must be after the replicationCron() call above so
-     * make sure when refactoring this file to keep this order. This is useful
-     * because we want to give priority to RDB savings for replication. */
+     * 注意：此代码必须在上面的 replicationCron() 调用之后，
+     * 重构此文件时请确保保持此顺序。这是有用的，
+     * 因为我们希望优先为 replication 执行 RDB 保存。 */
     if (!hasActiveChildProcess() &&
         server.rdb_bgsave_scheduled &&
         (server.unixtime-server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
@@ -1525,7 +1513,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         if (moduleCount()) modulesCron();
     }
 
-    /* Fire the cron loop modules event. */
+    /* 触发 cron 循环 module 事件。 */
     RedisModuleCronLoopV1 ei = {REDISMODULE_CRON_LOOP_VERSION,server.hz};
     moduleFireServerEvent(REDISMODULE_EVENT_CRON_LOOP,
                           0,
@@ -1552,33 +1540,28 @@ void blockingOperationEnds(void) {
     }
 }
 
-/* This function fills in the role of serverCron during RDB or AOF loading, and
- * also during blocked scripts.
- * It attempts to do its duties at a similar rate as the configured server.hz,
- * and updates cronloops variable so that similarly to serverCron, the
- * run_with_period can be used. */
+/* 此函数在 RDB 或 AOF 加载期间以及脚本阻塞期间充当 serverCron 的角色。
+ * 它尝试以与配置的 server.hz 相似的速率执行任务，
+ * 并更新 cronloops 变量，使得与 serverCron 类似地可以使用
+ * run_with_period 宏。 */
 void whileBlockedCron(void) {
-    /* Here we may want to perform some cron jobs (normally done server.hz times
-     * per second). */
+    /* 在这里我们可能需要执行一些 cron 任务（通常每秒执行 server.hz 次）。 */
 
-    /* Since this function depends on a call to blockingOperationStarts, let's
-     * make sure it was done. */
+    /* 由于此函数依赖于 blockingOperationStarts 的调用，请确保它已被调用。 */
     serverAssert(server.blocked_last_cron);
 
-    /* In case we were called too soon, leave right away. This way one time
-     * jobs after the loop below don't need an if. and we don't bother to start
-     * latency monitor if this function is called too often. */
+    /* 如果我们被调用得太早，直接返回。这样下面循环后面的一次性任务
+     * 就不需要加 if 判断，而且如果此函数调用过于频繁也不会启动延迟监控。 */
     if (server.blocked_last_cron >= server.mstime)
         return;
 
     mstime_t latency;
     latencyStartMonitor(latency);
 
-    /* In some cases we may be called with big intervals, so we may need to do
-     * extra work here. This is because some of the functions in serverCron rely
-     * on the fact that it is performed every 10 ms or so. For instance, if
-     * activeDefragCycle needs to utilize 25% cpu, it will utilize 2.5ms, so we
-     * need to call it multiple times. */
+    /* 在某些情况下我们可能被以较大的间隔调用，因此可能需要在此做额外的工作。
+     * 这是因为 serverCron 中的一些函数依赖于它大约每 10ms 执行一次的事实。
+     * 例如，如果 activeDefragCycle 需要使用 25% 的 CPU，它将使用 2.5ms，
+     * 所以我们需要多次调用它。 */
     long hz_ms = 1000/server.hz;
     while (server.blocked_last_cron < server.mstime) {
 
@@ -1587,21 +1570,21 @@ void whileBlockedCron(void) {
 
         server.blocked_last_cron += hz_ms;
 
-        /* Increment cronloop so that run_with_period works. */
+        /* 递增 cronloop 以使 run_with_period 正常工作。 */
         server.cronloops++;
     }
 
-    /* Other cron jobs do not need to be done in a loop. No need to check
-     * server.blocked_last_cron since we have an early exit at the top. */
+    /* 其他 cron 任务不需要在循环中执行。无需检查 server.blocked_last_cron，
+     * 因为我们已在函数开头有提前返回的检查。 */
 
-    /* Update memory stats during loading (excluding blocked scripts) */
+    /* 在加载期间更新内存统计（不包括被阻塞的脚本） */
     if (server.loading) cronUpdateMemoryStats();
 
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("while-blocked-cron",latency);
 
-    /* We received a SIGTERM during loading, shutting down here in a safe way,
-     * as it isn't ok doing so inside the signal handler. */
+    /* 我们在加载期间收到了 SIGTERM，在这里以安全的方式执行关闭，
+     * 因为在信号处理器中执行关闭操作是不安全的。 */
     if (server.shutdown_asap && server.loading) {
         if (prepareForShutdown(SHUTDOWN_NOSAVE) == C_OK) exit(0);
         serverLog(LL_WARNING,"SIGTERM received but errors trying to shut down the server, check the logs for more information");
@@ -1614,26 +1597,22 @@ static void sendGetackToReplicas(void) {
     robj *argv[3];
     argv[0] = shared.replconf;
     argv[1] = shared.getack;
-    argv[2] = shared.special_asterick; /* Not used argument. */
+    argv[2] = shared.special_asterick; /* 未使用的参数。 */
     replicationFeedSlaves(server.slaves, -1, argv, 3);
 }
 
 extern int ProcessingEventsWhileBlocked;
 
-/* This function gets called every time Redis is entering the
- * main loop of the event driven library, that is, before to sleep
- * for ready file descriptors.
+/* 每当 Redis 进入事件驱动库的主循环时调用此函数，即在等待就绪文件描述符之前。
  *
- * Note: This function is (currently) called from two functions:
- * 1. aeMain - The main server loop
- * 2. processEventsWhileBlocked - Process clients during RDB/AOF load
+ * 注意：此函数（目前）从两个函数中调用：
+ * 1. aeMain —— 主服务器循环
+ * 2. processEventsWhileBlocked —— 在 RDB/AOF 加载期间处理客户端
  *
- * If it was called from processEventsWhileBlocked we don't want
- * to perform all actions (For example, we don't want to expire
- * keys), but we do need to perform some actions.
+ * 如果是从 processEventsWhileBlocked 调用的，我们不想执行所有操作
+ * （例如，我们不想使键过期），但确实需要执行一些操作。
  *
- * The most important is freeClientsInAsyncFreeQueue but we also
- * call some other low-risk functions. */
+ * 最重要的是 freeClientsInAsyncFreeQueue，但我们也会调用一些其他低风险函数。 */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
@@ -1641,11 +1620,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (zmalloc_used > server.stat_peak_memory)
         server.stat_peak_memory = zmalloc_used;
 
-    /* Just call a subset of vital functions in case we are re-entering
-     * the event loop from processEventsWhileBlocked(). Note that in this
-     * case we keep track of the number of events we are processing, since
-     * processEventsWhileBlocked() wants to stop ASAP if there are no longer
-     * events to handle. */
+    /* 如果我们是从 processEventsWhileBlocked() 重新进入 event loop，
+     * 只调用一部分关键函数。注意，在这种情况下我们跟踪正在处理的事件数量，
+     * 因为 processEventsWhileBlocked() 希望在没有更多事件要处理时尽快停止。 */
     if (ProcessingEventsWhileBlocked) {
         uint64_t processed = 0;
         processed += handleClientsWithPendingReadsUsingThreads();
@@ -1658,33 +1635,32 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         return;
     }
 
-    /* We should handle pending reads clients ASAP after event loop. */
+    /* 我们应当在 event loop 之后尽快处理有待读取的客户端。 */
     handleClientsWithPendingReadsUsingThreads();
 
-    /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
+    /* 处理待处理数据（典型如 TLS）。必须在 flushAppendOnlyFile 之前完成。 */
     connTypeProcessPendingData();
 
-    /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
+    /* 如果任何连接类型（典型如 TLS）仍有未读的待处理数据，则完全不休眠。 */
     int dont_sleep = connTypeHasPendingData();
 
-    /* Call the Redis Cluster before sleep function. Note that this function
-     * may change the state of Redis Cluster (from ok to fail or vice versa),
-     * so it's a good idea to call it before serving the unblocked clients
-     * later in this function, must be done before blockedBeforeSleep. */
+    /* 调用 Redis Cluster 的 before sleep 函数。注意，此函数可能会
+     * 改变 Redis Cluster 的状态（从 ok 变为 fail 或反之），
+     * 因此最好在此函数后面处理未阻塞客户端之前调用它，
+     * 必须在 blockedBeforeSleep 之前完成。 */
     if (server.cluster_enabled) clusterBeforeSleep();
 
-    /* Handle blocked clients.
-     * must be done before flushAppendOnlyFile, in case of appendfsync=always,
-     * since the unblocked clients may write data. */
+    /* 处理被阻塞的客户端。
+     * 必须在 flushAppendOnlyFile 之前完成，在 appendfsync=always 的情况下，
+     * 因为解除阻塞的客户端可能会写入数据。 */
     blockedBeforeSleep();
 
-    /* Record cron time in beforeSleep, which is the sum of active-expire, active-defrag and all other
-     * tasks done by cron and beforeSleep, but excluding read, write and AOF, that are counted by other
-     * sets of metrics. */
+    /* 记录 beforeSleep 中的 cron 时间，包括 active-expire、active-defrag 和所有
+     * 由 cron 及 beforeSleep 完成的其他任务，但不包括由其他指标集统计的
+     * 读取、写入和 AOF 时间。 */
     monotime cron_start_time_before_aof = getMonotonicUs();
 
-    /* Run a fast expire cycle (the called function will return
-     * ASAP if a fast cycle is not needed). */
+    /* 运行快速过期周期（如果不需要快速周期，被调用函数将尽快返回）。 */
     if (server.active_expire_enabled && iAmMaster())
         activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
 
@@ -1694,86 +1670,81 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
                               NULL);
     }
 
-    /* Send all the slaves an ACK request if at least one client blocked
-     * during the previous event loop iteration. Note that we do this after
-     * processUnblockedClients(), so if there are multiple pipelined WAITs
-     * and the just unblocked WAIT gets blocked again, we don't have to wait
-     * a server cron cycle in absence of other event loop events. See #6623.
-     * 
-     * We also don't send the ACKs while clients are paused, since it can
-     * increment the replication backlog, they'll be sent after the pause
-     * if we are still the master. */
+    /* 如果在上一次 event loop 迭代中至少有一个客户端被阻塞，
+     * 向所有 slave 发送 ACK 请求。注意，我们在 processUnblockedClients() 之后
+     * 执行此操作，这样如果有多个流水线化的 WAIT 命令，并且刚解除阻塞的 WAIT
+     * 再次被阻塞，我们不需要在没有其他 event loop 事件的情况下等待一个
+     * server cron 周期。参见 #6623。
+     *
+     * 我们也不会在客户端暂停期间发送 ACK，因为这会增加 replication backlog，
+     * 它们将在暂停结束后发送（如果我们仍然是 master 的话）。 */
     if (server.get_ack_from_slaves && !isPausedActionsWithUpdate(PAUSE_ACTION_REPLICA)) {
         sendGetackToReplicas();
         server.get_ack_from_slaves = 0;
     }
 
-    /* We may have received updates from clients about their current offset. NOTE:
-     * this can't be done where the ACK is received since failover will disconnect 
-     * our clients. */
+    /* 我们可能已从客户端收到关于其当前偏移量的更新。注意：
+     * 这不能在收到 ACK 的地方完成，因为故障转移会断开我们的客户端。 */
     updateFailoverStatus();
 
-    /* Since we rely on current_client to send scheduled invalidation messages
-     * we have to flush them after each command, so when we get here, the list
-     * must be empty. */
+    /* 由于我们依赖 current_client 来发送计划中的失效消息，
+     * 必须在每条命令后刷写它们，所以到达此处时，列表必须为空。 */
     serverAssert(listLength(server.tracking_pending_keys) == 0);
     serverAssert(listLength(server.pending_push_messages) == 0);
 
-    /* Send the invalidation messages to clients participating to the
-     * client side caching protocol in broadcasting (BCAST) mode. */
+    /* 向参与客户端缓存协议的客户端以广播（BCAST）模式发送失效消息。 */
     trackingBroadcastInvalidationMessages();
 
-    /* Record time consumption of AOF writing. */
+    /* 记录 AOF 写入的时间消耗。 */
     monotime aof_start_time = getMonotonicUs();
-    /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing below. */
+    /* 记录 beforeSleep 中的 cron 时间。这不包括下方 AOF 写入和 IO 写入所消耗的时间。 */
     monotime duration_before_aof = aof_start_time - cron_start_time_before_aof;
-    /* Record the fsync'd offset before flushAppendOnly */
+    /* 在 flushAppendOnly 之前记录已 fsync 的偏移量 */
     long long prev_fsynced_reploff = server.fsynced_reploff;
 
-    /* Write the AOF buffer on disk,
-     * must be done before handleClientsWithPendingWritesUsingThreads,
-     * in case of appendfsync=always. */
+    /* 将 AOF 缓冲区写入磁盘，
+     * 必须在 handleClientsWithPendingWritesUsingThreads 之前完成，
+     * 在 appendfsync=always 的情况下。 */
     if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE)
         flushAppendOnlyFile(0);
 
-    /* Record time consumption of AOF writing. */
+    /* 记录 AOF 写入的时间消耗。 */
     durationAddSample(EL_DURATION_TYPE_AOF, getMonotonicUs() - aof_start_time);
 
-    /* Update the fsynced replica offset.
-     * If an initial rewrite is in progress then not all data is guaranteed to have actually been
-     * persisted to disk yet, so we cannot update the field. We will wait for the rewrite to complete. */
+    /* 更新已 fsync 的 replica 偏移量。
+     * 如果初始重写正在进行中，则不能保证所有数据都已实际持久化到磁盘，
+     * 因此我们不能更新该字段。我们将等待重写完成。 */
     if (server.aof_state == AOF_ON && server.fsynced_reploff != -1) {
         long long fsynced_reploff_pending;
         atomicGet(server.fsynced_reploff_pending, fsynced_reploff_pending);
         server.fsynced_reploff = fsynced_reploff_pending;
 
-        /* If we have blocked [WAIT]AOF clients, and fsynced_reploff changed, we want to try to
-         * wake them up ASAP. */
+        /* 如果有被阻塞的 [WAIT]AOF 客户端，且 fsynced_reploff 发生了变化，
+         * 我们希望尽快唤醒它们。 */
         if (listLength(server.clients_waiting_acks) && prev_fsynced_reploff != server.fsynced_reploff)
             dont_sleep = 1;
     }
 
-    /* Handle writes with pending output buffers. */
+    /* 处理有待写入输出缓冲区的客户端。 */
     handleClientsWithPendingWritesUsingThreads();
 
-    /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */
+    /* 记录 beforeSleep 中的 cron 时间。这不包括上方 AOF 写入和 IO 写入所消耗的时间。 */
     monotime cron_start_time_after_write = getMonotonicUs();
 
-    /* Close clients that need to be closed asynchronous */
+    /* 关闭需要异步关闭的客户端 */
     freeClientsInAsyncFreeQueue();
 
-    /* Incrementally trim replication backlog, 10 times the normal speed is
-     * to free replication backlog as much as possible. */
+    /* 增量修剪 replication backlog，10 倍于正常速度是为了尽可能释放 replication backlog。 */
     if (server.repl_backlog)
         incrementalTrimReplicationBacklog(10*REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
 
-    /* Disconnect some clients if they are consuming too much memory. */
+    /* 如果某些客户端消耗了过多内存，断开它们的连接。 */
     evictClients();
 
-    /* Record cron time in beforeSleep. */
+    /* 记录 beforeSleep 中的 cron 时间。 */
     monotime duration_after_write = getMonotonicUs() - cron_start_time_after_write;
 
-    /* Record eventloop latency. */
+    /* 记录 event loop 延迟。 */
     if (server.el_start > 0) {
         monotime el_duration = getMonotonicUs() - server.el_start;
         durationAddSample(EL_DURATION_TYPE_EL, el_duration);
@@ -1781,7 +1752,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     server.el_cron_duration += duration_before_aof + duration_after_write;
     durationAddSample(EL_DURATION_TYPE_CRON, server.el_cron_duration);
     server.el_cron_duration = 0;
-    /* Record max command count per cycle. */
+    /* 记录每个周期的最大命令数。 */
     if (server.stat_numcommands > server.el_cmd_cnt_start) {
         long long el_command_cnt = server.stat_numcommands - server.el_cmd_cnt_start;
         if (el_command_cnt > server.el_cmd_cnt_max) {
@@ -1789,29 +1760,26 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         }
     }
 
-    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
-     * connection has pending data) */
+    /* 如果需要，在下一次 beforeSleep() 之前完全不休眠（例如有连接有待处理数据） */
     aeSetDontWait(server.el, dont_sleep);
 
-    /* Before we are going to sleep, let the threads access the dataset by
-     * releasing the GIL. Redis main thread will not touch anything at this
-     * time. */
+    /* 在即将休眠之前，通过释放 GIL 让其他线程访问数据集。
+     * Redis 主线程在此期间不会触碰任何数据。 */
     if (moduleCount()) moduleReleaseGIL();
-    /********************* WARNING ********************
-     * Do NOT add anything below moduleReleaseGIL !!! *
+    /********************* 警告 ********************
+     * 不要在 moduleReleaseGIL 下方添加任何内容 !!! *
      ***************************** ********************/
 }
 
-/* This function is called immediately after the event loop multiplexing
- * API returned, and the control is going to soon return to Redis by invoking
- * the different events callbacks. */
+/* 此函数在 event loop 多路复用 API 返回后立即调用，
+ * 控制权即将通过调用不同的事件回调返回给 Redis。 */
 void afterSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
-    /********************* WARNING ********************
-     * Do NOT add anything above moduleAcquireGIL !!! *
+    /********************* 警告 ********************
+     * 不要在 moduleAcquireGIL 上方添加任何内容 !!! *
      ***************************** ********************/
     if (!ProcessingEventsWhileBlocked) {
-        /* Acquire the modules GIL so that their threads won't touch anything. */
+        /* 获取 module GIL，以使其线程不会触碰任何数据。 */
         if (moduleCount()) {
             mstime_t latency;
             latencyStartMonitor(latency);
@@ -1825,18 +1793,18 @@ void afterSleep(struct aeEventLoop *eventLoop) {
             latencyEndMonitor(latency);
             latencyAddSampleIfNeeded("module-acquire-GIL",latency);
         }
-        /* Set the eventloop start time. */
+        /* 设置 event loop 的起始时间。 */
         server.el_start = getMonotonicUs();
-        /* Set the eventloop command count at start. */
+        /* 设置 event loop 开始时的命令计数。 */
         server.el_cmd_cnt_start = server.stat_numcommands;
     }
 
-    /* Update the time cache. */
+    /* 更新时间缓存。 */
     updateCachedTime(1);
 
-    /* Update command time snapshot in case it'll be required without a command
-     * e.g. somehow used by module timers. Don't update it while yielding to a
-     * blocked command, call() will handle that and restore the original time. */
+    /* 更新命令时间快照，以防在没有命令时也需要它
+     * 例如被 module 定时器以某种方式使用。在让步给被阻塞的命令时不要更新它，
+     * call() 会处理并恢复原始时间。 */
     if (!ProcessingEventsWhileBlocked) {
         server.cmd_time_snapshot = server.mstime;
     }
@@ -2997,8 +2965,8 @@ void commandAddSubcommand(struct redisCommand *parent, struct redisCommand *subc
     if (!parent->subcommands_dict)
         parent->subcommands_dict = dictCreate(&commandTableDictType);
 
-    subcommand->parent = parent; /* Assign the parent command */
-    subcommand->id = ACLGetCommandID(subcommand->fullname); /* Assign the ID used for ACL. */
+    subcommand->parent = parent; /* 分配父命令 */
+    subcommand->id = ACLGetCommandID(subcommand->fullname); /* 分配用于 ACL 的 ID。 */
 
     serverAssert(dictAdd(parent->subcommands_dict, sdsnew(declared_name), subcommand) == DICT_OK);
 }
@@ -3008,7 +2976,7 @@ void commandAddSubcommand(struct redisCommand *parent, struct redisCommand *subc
 void setImplicitACLCategories(struct redisCommand *c) {
     if (c->flags & CMD_WRITE)
         c->acl_categories |= ACL_CATEGORY_WRITE;
-    /* Exclude scripting commands from the RO category. */
+    /* 将脚本命令排除在 RO（只读）类别之外。 */
     if (c->flags & CMD_READONLY && !(c->acl_categories & ACL_CATEGORY_SCRIPTING))
         c->acl_categories |= ACL_CATEGORY_READ;
     if (c->flags & CMD_ADMIN)
@@ -3020,39 +2988,36 @@ void setImplicitACLCategories(struct redisCommand *c) {
     if (c->flags & CMD_BLOCKING)
         c->acl_categories |= ACL_CATEGORY_BLOCKING;
 
-    /* If it's not @fast is @slow in this binary world. */
+    /* 如果不是 @fast，在这个二值世界中就是 @slow。 */
     if (!(c->acl_categories & ACL_CATEGORY_FAST))
         c->acl_categories |= ACL_CATEGORY_SLOW;
 }
 
-/* Recursively populate the command structure.
+/* 递归填充命令结构。
  *
- * On success, the function return C_OK. Otherwise C_ERR is returned and we won't
- * add this command in the commands dict. */
+ * 成功时函数返回 C_OK。否则返回 C_ERR，且不会将该命令添加到命令字典中。 */
 int populateCommandStructure(struct redisCommand *c) {
-    /* If the command marks with CMD_SENTINEL, it exists in sentinel. */
+    /* 如果命令标记了 CMD_SENTINEL，则该命令存在于 Sentinel 中。 */
     if (!(c->flags & CMD_SENTINEL) && server.sentinel_mode)
         return C_ERR;
 
-    /* If the command marks with CMD_ONLY_SENTINEL, it only exists in sentinel. */
+    /* 如果命令标记了 CMD_ONLY_SENTINEL，则该命令仅在 Sentinel 中存在。 */
     if (c->flags & CMD_ONLY_SENTINEL && !server.sentinel_mode)
         return C_ERR;
 
-    /* Translate the command string flags description into an actual
-     * set of flags. */
+    /* 将命令字符串标志描述转换为实际的标志集合。 */
     setImplicitACLCategories(c);
 
-    /* We start with an unallocated histogram and only allocate memory when a command
-     * has been issued for the first time */
+    /* 我们开始时使用未分配的直方图，仅在命令第一次被调用时才分配内存 */
     c->latency_histogram = NULL;
 
-    /* Handle the legacy range spec and the "movablekeys" flag (must be done after populating all key specs). */
+    /* 处理遗留的范围规范和 "movablekeys" 标志（必须在填充所有键规范之后完成）。 */
     populateCommandLegacyRangeSpec(c);
 
-    /* Assign the ID used for ACL. */
+    /* 分配用于 ACL 的 ID。 */
     c->id = ACLGetCommandID(c->fullname);
 
-    /* Handle subcommands */
+    /* 处理子命令 */
     if (c->subcommands) {
         for (int j = 0; c->subcommands[j].declared_name; j++) {
             struct redisCommand *sub = c->subcommands+j;
@@ -3070,8 +3035,8 @@ int populateCommandStructure(struct redisCommand *c) {
 
 extern struct redisCommand redisCommandTable[];
 
-/* Populates the Redis Command Table dict from the static table in commands.c
- * which is auto generated from the json files in the commands folder. */
+/* 从 commands.c 中的静态表填充 Redis 命令表字典，
+ * 该静态表由 commands 文件夹中的 json 文件自动生成。 */
 void populateCommandTable(void) {
     int j;
     struct redisCommand *c;
@@ -3088,8 +3053,7 @@ void populateCommandTable(void) {
             continue;
 
         retval1 = dictAdd(server.commands, sdsdup(c->fullname), c);
-        /* Populate an additional dictionary that will be unaffected
-         * by rename-command statements in redis.conf. */
+        /* 填充一个额外的字典，该字典不受 redis.conf 中 rename-command 语句的影响。 */
         retval2 = dictAdd(server.orig_commands, sdsdup(c->fullname), c);
         serverAssert(retval1 == DICT_OK && retval2 == DICT_OK);
     }
@@ -3123,7 +3087,7 @@ void resetErrorTableStats(void) {
     server.errors_enabled = 1;
 }
 
-/* ========================== Redis OP Array API ============================ */
+/* ========================== Redis 操作数组 API ============================ */
 
 int redisOpArrayAppend(redisOpArray *oa, int dbid, robj **argv, int argc, int target) {
     redisOp *op;
@@ -3157,11 +3121,11 @@ void redisOpArrayFree(redisOpArray *oa) {
             decrRefCount(op->argv[j]);
         zfree(op->argv);
     }
-    /* no need to free the actual op array, we reuse the memory for future commands */
+    /* 无需释放实际的操作数组，我们为将来的命令复用该内存 */
     serverAssert(!oa->numops);
 }
 
-/* ====================== Commands lookup and execution ===================== */
+/* ====================== 命令查找与执行 ===================== */
 
 int isContainerCommandBySds(sds s) {
     struct redisCommand *base_cmd = dictFetchValue(server.commands, s);
@@ -3173,26 +3137,25 @@ struct redisCommand *lookupSubcommand(struct redisCommand *container, sds sub_na
     return dictFetchValue(container->subcommands_dict, sub_name);
 }
 
-/* Look up a command by argv and argc
+/* 通过 argv 和 argc 查找命令
  *
- * If `strict` is not 0 we expect argc to be exact (i.e. argc==2
- * for a subcommand and argc==1 for a top-level command)
- * `strict` should be used every time we want to look up a command
- * name (e.g. in COMMAND INFO) rather than to find the command
- * a user requested to execute (in processCommand).
- */
+ * 如果 `strict` 不为 0，我们期望 argc 是精确的（即子命令 argc==2，
+ * 顶层命令 argc==1）
+ * 每当我们想查找命令名称（例如在 COMMAND INFO 中）而不是
+ * 查找用户请求执行的命令（在 processCommand 中）时，
+ * 都应使用 `strict`。 */
 struct redisCommand *lookupCommandLogic(dict *commands, robj **argv, int argc, int strict) {
     struct redisCommand *base_cmd = dictFetchValue(commands, argv[0]->ptr);
     int has_subcommands = base_cmd && base_cmd->subcommands_dict;
     if (argc == 1 || !has_subcommands) {
         if (strict && argc != 1)
             return NULL;
-        /* Note: It is possible that base_cmd->proc==NULL (e.g. CONFIG) */
+        /* 注意：base_cmd->proc 可能为 NULL（例如 CONFIG） */
         return base_cmd;
     } else { /* argc > 1 && has_subcommands */
         if (strict && argc != 2)
             return NULL;
-        /* Note: Currently we support just one level of subcommands */
+        /* 注意：目前仅支持一级子命令 */
         return lookupSubcommand(base_cmd, argv[1]->ptr);
     }
 }
@@ -3207,12 +3170,12 @@ struct redisCommand *lookupCommandBySdsLogic(dict *commands, sds s) {
     if (strings == NULL)
         return NULL;
     if (argc < 1 || argc > 2) {
-        /* Currently we support just one level of subcommands */
+        /* 目前仅支持一级子命令 */
         sdsfreesplitres(strings,argc);
         return NULL;
     }
 
-    serverAssert(argc > 0); /* Avoid warning `-Wmaybe-uninitialized` in lookupCommandLogic() */
+    serverAssert(argc > 0); /* 避免在 lookupCommandLogic() 中产生 `-Wmaybe-uninitialized` 警告 */
     robj objects[argc];
     robj *argv[argc];
     for (j = 0; j < argc; j++) {
@@ -3242,13 +3205,11 @@ struct redisCommand *lookupCommandByCString(const char *s) {
     return lookupCommandByCStringLogic(server.commands,s);
 }
 
-/* Lookup the command in the current table, if not found also check in
- * the original table containing the original command names unaffected by
- * redis.conf rename-command statement.
+/* 在当前表中查找命令，如果未找到则在原始表中检查，
+ * 原始表包含不受 redis.conf rename-command 语句影响的原始命令名。
  *
- * This is used by functions rewriting the argument vector such as
- * rewriteClientCommandVector() in order to set client->cmd pointer
- * correctly even if the command was renamed. */
+ * 这被重写参数向量的函数（如 rewriteClientCommandVector()）所使用，
+ * 以便在命令被重命名时也能正确设置 client->cmd 指针。 */
 struct redisCommand *lookupCommandOrOriginal(robj **argv ,int argc) {
     struct redisCommand *cmd = lookupCommandLogic(server.commands, argv, argc, 0);
 
@@ -3256,7 +3217,7 @@ struct redisCommand *lookupCommandOrOriginal(robj **argv ,int argc) {
     return cmd;
 }
 
-/* Commands arriving from the master client or AOF client, should never be rejected. */
+/* 来自主节点客户端或 AOF 客户端的命令不应被拒绝。 */
 int mustObeyClient(client *c) {
     return c->id == CLIENT_ID_AOF || c->flags & CLIENT_MASTER;
 }
@@ -3277,27 +3238,26 @@ static int shouldPropagate(int target) {
     return 0;
 }
 
-/* Propagate the specified command (in the context of the specified database id)
- * to AOF and Slaves.
+/* 将指定命令（在指定数据库 id 的上下文中）传播到 AOF 和从节点。
  *
- * flags are an xor between:
- * + PROPAGATE_NONE (no propagation of command at all)
- * + PROPAGATE_AOF (propagate into the AOF file if is enabled)
- * + PROPAGATE_REPL (propagate into the replication link)
+ * flags 是以下值的异或：
+ * + PROPAGATE_NONE（完全不传播命令）
+ * + PROPAGATE_AOF（如果启用则传播到 AOF 文件）
+ * + PROPAGATE_REPL（传播到复制链路）
  *
- * This is an internal low-level function and should not be called!
+ * 这是一个内部低级函数，不应直接调用！
  *
- * The API for propagating commands is alsoPropagate().
+ * 传播命令的 API 是 alsoPropagate()。
  *
- * dbid value of -1 is saved to indicate that the called do not want
- * to replicate SELECT for this command (used for database neutral commands).
+ * dbid 值为 -1 用于表示调用者不希望为此命令复制 SELECT
+ *（用于数据库无关的命令）。
  */
 static void propagateNow(int dbid, robj **argv, int argc, int target) {
     if (!shouldPropagate(target))
         return;
 
-    /* This needs to be unreachable since the dataset should be fixed during
-     * replica pause (otherwise data may be lost during a failover) */
+    /* 此代码应不可达，因为在副本暂停期间数据集应该是固定的
+     *（否则在故障转移期间可能丢失数据） */
     serverAssert(!(isPausedActions(PAUSE_ACTION_REPLICA) &&
                    (!server.client_pause_in_transaction)));
 
@@ -3307,17 +3267,15 @@ static void propagateNow(int dbid, robj **argv, int argc, int target) {
         replicationFeedSlaves(server.slaves,dbid,argv,argc);
 }
 
-/* Used inside commands to schedule the propagation of additional commands
- * after the current command is propagated to AOF / Replication.
+/* 在命令内部使用，用于在当前命令传播到 AOF/复制之后，
+ * 调度额外命令的传播。
  *
- * dbid is the database ID the command should be propagated into.
- * Arguments of the command to propagate are passed as an array of redis
- * objects pointers of len 'argc', using the 'argv' vector.
+ * dbid 是命令应传播到的数据库 ID。
+ * 要传播的命令参数通过长度为 'argc' 的 redis 对象指针数组 'argv' 传递。
  *
- * The function does not take a reference to the passed 'argv' vector,
- * so it is up to the caller to release the passed argv (but it is usually
- * stack allocated).  The function automatically increments ref count of
- * passed objects, so the caller does not need to. */
+ * 该函数不会获取传入 'argv' 向量的引用，
+ * 因此由调用者负责释放传入的 argv（但通常是栈分配的）。
+ * 该函数会自动增加传入对象的引用计数，因此调用者无需这样做。 */
 void alsoPropagate(int dbid, robj **argv, int argc, int target) {
     robj **argvcopy;
     int j;
@@ -3333,48 +3291,45 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target) {
     redisOpArrayAppend(&server.also_propagate,dbid,argvcopy,argc,target);
 }
 
-/* It is possible to call the function forceCommandPropagation() inside a
- * Redis command implementation in order to to force the propagation of a
- * specific command execution into AOF / Replication. */
+/* 可以在 Redis 命令实现中调用 forceCommandPropagation() 函数，
+ * 以强制将特定命令执行传播到 AOF / 复制。 */
 void forceCommandPropagation(client *c, int flags) {
     serverAssert(c->cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE));
     if (flags & PROPAGATE_REPL) c->flags |= CLIENT_FORCE_REPL;
     if (flags & PROPAGATE_AOF) c->flags |= CLIENT_FORCE_AOF;
 }
 
-/* Avoid that the executed command is propagated at all. This way we
- * are free to just propagate what we want using the alsoPropagate()
- * API. */
+/* 避免已执行的命令被传播。这样我们可以自由地使用 alsoPropagate() API
+ * 只传播我们想要的内容。 */
 void preventCommandPropagation(client *c) {
     c->flags |= CLIENT_PREVENT_PROP;
 }
 
-/* AOF specific version of preventCommandPropagation(). */
+/* preventCommandPropagation() 的 AOF 专用版本。 */
 void preventCommandAOF(client *c) {
     c->flags |= CLIENT_PREVENT_AOF_PROP;
 }
 
-/* Replication specific version of preventCommandPropagation(). */
+/* preventCommandPropagation() 的复制专用版本。 */
 void preventCommandReplication(client *c) {
     c->flags |= CLIENT_PREVENT_REPL_PROP;
 }
 
-/* Log the last command a client executed into the slowlog. */
+/* 将客户端执行的最后一条命令记录到慢日志。 */
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration) {
-    /* Some commands may contain sensitive data that should not be available in the slowlog. */
+    /* 某些命令可能包含敏感数据，不应在慢日志中可见。 */
     if (cmd->flags & CMD_SKIP_SLOWLOG)
         return;
 
-    /* If command argument vector was rewritten, use the original
-     * arguments. */
+    /* 如果命令参数向量被重写了，使用原始参数。 */
     robj **argv = c->original_argv ? c->original_argv : c->argv;
     int argc = c->original_argv ? c->original_argc : c->argc;
     slowlogPushEntryIfNeeded(c,argv,argc,duration);
 }
 
-/* This function is called in order to update the total command histogram duration.
- * The latency unit is nano-seconds.
- * If needed it will allocate the histogram memory and trim the duration to the upper/lower tracking limits*/
+/* 调用此函数以更新总命令直方图持续时间。
+ * 延迟单位为纳秒。
+ * 如果需要，它将分配直方图内存并将持续时间裁剪到跟踪上限/下限 */
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist){
     if (duration_hist < LATENCY_HISTOGRAM_MIN_VALUE)
         duration_hist=LATENCY_HISTOGRAM_MIN_VALUE;
@@ -3385,9 +3340,8 @@ void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int
     hdr_record_value(*latency_histogram,duration_hist);
 }
 
-/* Handle the alsoPropagate() API to handle commands that want to propagate
- * multiple separated commands. Note that alsoPropagate() is not affected
- * by CLIENT_PREVENT_PROP flag. */
+/* 处理 alsoPropagate() API 以处理想要传播多个独立命令的情况。
+ * 注意 alsoPropagate() 不受 CLIENT_PREVENT_PROP 标志影响。 */
 static void propagatePendingCommands(void) {
     if (server.also_propagate.numops == 0)
         return;
@@ -3395,14 +3349,13 @@ static void propagatePendingCommands(void) {
     int j;
     redisOp *rop;
 
-    /* If we got here it means we have finished an execution-unit.
-     * If that unit has caused propagation of multiple commands, they
-     * should be propagated as a transaction */
+    /* 如果执行到此，说明我们已经完成了一个执行单元。
+     * 如果该单元导致了多个命令的传播，它们应作为一个事务传播 */
     int transaction = server.also_propagate.numops > 1;
 
-    /* In case a command that may modify random keys was run *directly*
-     * (i.e. not from within a script, MULTI/EXEC, RM_Call, etc.) we want
-     * to avoid using a transaction (much like active-expire) */
+    /* 如果可能修改随机键的命令是*直接*运行的
+     *（即不是从脚本、MULTI/EXEC、RM_Call 等内部），我们想要
+     * 避免使用事务（类似于主动过期） */
     if (server.current_client &&
         server.current_client->cmd &&
         server.current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS)
@@ -3411,8 +3364,8 @@ static void propagatePendingCommands(void) {
     }
 
     if (transaction) {
-        /* We use dbid=-1 to indicate we do not want to replicate SELECT.
-         * It'll be inserted together with the next command (inside the MULTI) */
+        /* 我们使用 dbid=-1 表示不希望复制 SELECT。
+         * 它将与下一个命令一起插入（在 MULTI 内部） */
         propagateNow(-1,&shared.multi,1,PROPAGATE_AOF|PROPAGATE_REPL);
     }
 
@@ -3423,52 +3376,51 @@ static void propagatePendingCommands(void) {
     }
 
     if (transaction) {
-        /* We use dbid=-1 to indicate we do not want to replicate select */
+        /* 我们使用 dbid=-1 表示不希望复制 SELECT */
         propagateNow(-1,&shared.exec,1,PROPAGATE_AOF|PROPAGATE_REPL);
     }
 
     redisOpArrayFree(&server.also_propagate);
 }
 
-/* Performs operations that should be performed after an execution unit ends.
- * Execution unit is a code that should be done atomically.
- * Execution units can be nested and are not necessarily starts with Redis command.
+/* 执行在执行单元结束后应执行的操作。
+ * 执行单元是应原子性完成的代码段。
+ * 执行单元可以嵌套，且不一定以 Redis 命令开始。
  *
- * For example the following is a logical unit:
- *   active expire ->
- *      trigger del notification of some module ->
- *          accessing a key ->
- *              trigger key miss notification of some other module
+ * 例如以下是一个逻辑单元：
+ *   主动过期 ->
+ *      触发某个模块的 del 通知 ->
+ *          访问一个键 ->
+ *              触发另一个模块的键未命中通知
  *
- * What we want to achieve is that the entire execution unit will be done atomically,
- * currently with respect to replication and post jobs, but in the future there might
- * be other considerations. So we basically want the `postUnitOperations` to trigger
- * after the entire chain finished. */
+ * 我们想要实现的是整个执行单元原子性地完成，
+ * 目前是针对复制和后处理任务，但未来可能还有其他考虑。
+ * 所以我们基本上希望 `postUnitOperations` 在整个链完成后触发。 */
 void postExecutionUnitOperations(void) {
     if (server.execution_nesting)
         return;
 
     firePostExecutionUnitJobs();
 
-    /* If we are at the top-most call() and not inside a an active module
-     * context (e.g. within a module timer) we can propagate what we accumulated. */
+    /* 如果我们在最外层的 call() 中且不在活跃的模块上下文中
+     *（例如模块定时器内），我们可以传播我们累积的内容。 */
     propagatePendingCommands();
 
-    /* Module subsystem post-execution-unit logic */
+    /* 模块子系统执行单元后逻辑 */
     modulePostExecutionUnitOperations();
 }
 
-/* Increment the command failure counters (either rejected_calls or failed_calls).
- * The decision which counter to increment is done using the flags argument, options are:
- * * ERROR_COMMAND_REJECTED - update rejected_calls
- * * ERROR_COMMAND_FAILED - update failed_calls
+/* 递增命令失败计数器（rejected_calls 或 failed_calls）。
+ * 决定递增哪个计数器使用 flags 参数，选项为：
+ * * ERROR_COMMAND_REJECTED - 更新 rejected_calls
+ * * ERROR_COMMAND_FAILED - 更新 failed_calls
  *
- * The function also reset the prev_err_count to make sure we will not count the same error
- * twice, its possible to pass a NULL cmd value to indicate that the error was counted elsewhere.
+ * 该函数还会重置 prev_err_count 以确保不会重复计算同一错误，
+ * 可以传入 NULL cmd 值表示错误已在其他地方计数。
  *
- * The function returns true if stats was updated and false if not. */
+ * 如果统计信息被更新则返回 true，否则返回 false。 */
 int incrCommandStatsOnError(struct redisCommand *cmd, int flags) {
-    /* hold the prev error count captured on the last command execution */
+    /* 保存在上一次命令执行时捕获的先前错误计数 */
     static long long prev_err_count = 0;
     int res = 0;
     if (cmd) {
@@ -5439,7 +5391,7 @@ sds genRedisInfoStringCommandStats(sds info, dict *commands) {
     return info;
 }
 
-/* Writes the ACL metrics to the info */
+/* 将 ACL 指标写入 info 信息 */
 sds genRedisInfoStringACLStats(sds info) {
     info = sdscatprintf(info,
          "acl_access_denied_auth:%lld\r\n"
@@ -5476,7 +5428,7 @@ sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
     return info;
 }
 
-/* Takes a null terminated sections list, and adds them to the dict. */
+/* 接受一个以 null 结尾的 section 列表，并将它们添加到字典中。 */
 void addInfoSectionsToDict(dict *section_dict, char **sections) {
     while (*sections) {
         sds section = sdsnew(*sections);
@@ -5486,7 +5438,7 @@ void addInfoSectionsToDict(dict *section_dict, char **sections) {
     }
 }
 
-/* Cached copy of the default sections, as an optimization. */
+/* 默认 section 的缓存副本，作为优化手段。 */
 static dict *cached_default_info_sections = NULL;
 
 void releaseInfoSectionDict(dict *sec) {
@@ -5494,11 +5446,11 @@ void releaseInfoSectionDict(dict *sec) {
         dictRelease(sec);
 }
 
-/* Create a dictionary with unique section names to be used by genRedisInfoString.
- * 'argv' and 'argc' are list of arguments for INFO.
- * 'defaults' is an optional null terminated list of default sections.
- * 'out_all' and 'out_everything' are optional.
- * The resulting dictionary should be released with releaseInfoSectionDict. */
+/* 创建一个包含唯一 section 名称的字典，供 genRedisInfoString 使用。
+ * 'argv' 和 'argc' 是 INFO 命令的参数列表。
+ * 'defaults' 是可选的以 null 结尾的默认 section 列表。
+ * 'out_all' 和 'out_everything' 是可选的输出参数。
+ * 返回的字典应使用 releaseInfoSectionDict 释放。 */
 dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, int *out_everything) {
     char *default_sections[] = {
         "server", "clients", "memory", "persistence", "stats", "replication",
@@ -5507,8 +5459,8 @@ dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, i
         defaults = default_sections;
 
     if (argc == 0) {
-        /* In this case we know the dict is not gonna be modified, so we cache
-         * it as an optimization for a common case. */
+        /* 在这种情况下，我们知道字典不会被修改，因此将其缓存
+         * 作为常见情况的优化手段。 */
         if (cached_default_info_sections)
             return cached_default_info_sections;
         cached_default_info_sections = dictCreate(&stringSetDictType);
@@ -5536,10 +5488,9 @@ dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, i
     return section_dict;
 }
 
-/* sets blocking_keys to the total number of keys which has at least one client blocked on them.
- * sets blocking_keys_on_nokey to the total number of keys which has at least one client
- * blocked on them to be written or deleted.
- * sets watched_keys to the total number of keys which has at least on client watching on them. */
+/* 将 blocking_keys 设置为至少有一个客户端阻塞在其上的键的总数。
+ * 将 blocking_keys_on_nokey 设置为至少有一个客户端因等待写入或删除而阻塞在其上的键的总数。
+ * 将 watched_keys 设置为至少有一个客户端正在监视的键的总数。 */
 void totalNumberOfStatefulKeys(unsigned long *blocking_keys, unsigned long *blocking_keys_on_nokey, unsigned long *watched_keys) {
     unsigned long bkeys=0, bkeys_on_nokey=0, wkeys=0;
     for (int j = 0; j < server.dbnum; j++) {
@@ -5555,9 +5506,8 @@ void totalNumberOfStatefulKeys(unsigned long *blocking_keys, unsigned long *bloc
         *watched_keys = wkeys;
 }
 
-/* Create the string returned by the INFO command. This is decoupled
- * by the INFO command itself as we need to report the same information
- * on memory corruption problems. */
+/* 创建 INFO 命令返回的字符串。此函数与 INFO 命令本身解耦，
+ * 因为在内存损坏问题中我们也需要报告相同的信息。 */
 sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
     sds info = sdsempty();
     time_t uptime = server.unixtime-server.stat_starttime;
@@ -5587,7 +5537,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info,"\r\n");
 
         if (call_uname) {
-            /* Uname can be slow and is always the same output. Cache it. */
+            /* Uname 调用可能较慢，且输出总是相同的。对其进行缓存。 */
             uname(&name);
             call_uname = 0;
         }
@@ -5819,15 +5769,14 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             } else if(server.loading_rdb_used_mem) {
                 perc = ((double)server.loading_loaded_bytes / server.loading_rdb_used_mem) * 100;
                 remaining_bytes = server.loading_rdb_used_mem - server.loading_loaded_bytes;
-                /* used mem is only a (bad) estimation of the rdb file size, avoid going over 100% */
+                /* used mem 只是 RDB 文件大小的一个（较差的）估算，避免超过 100% */
                 if (perc > 99.99) perc = 99.99;
                 if (remaining_bytes < 1) remaining_bytes = 1;
             }
 
             elapsed = time(NULL)-server.loading_start_time;
             if (elapsed == 0) {
-                eta = 1; /* A fake 1 second figure if we don't have
-                            enough info */
+                eta = 1; /* 如果没有足够的信息，使用一个假的 1 秒数值 */
             } else {
                 eta = (elapsed*remaining_bytes)/(server.loading_loaded_bytes+1);
             }
@@ -5842,7 +5791,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         }
     }
 
-    /* Stats */
+    /* 统计 */
     if (all_sections  || (dictFind(section_dict,"stats") != NULL)) {
         long long stat_total_reads_processed, stat_total_writes_processed;
         long long stat_net_input_bytes, stat_net_output_bytes;
@@ -5924,7 +5873,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         info = genRedisInfoStringACLStats(info);
     }
 
-    /* Replication */
+    /* 复制 */
     if (all_sections || (dictFind(section_dict,"replication") != NULL)) {
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info,
@@ -5981,8 +5930,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "connected_slaves:%lu\r\n",
             listLength(server.slaves));
 
-        /* If min-slaves-to-write is active, write the number of slaves
-         * currently considered 'good'. */
+        /* 如果 min-slaves-to-write 处于活跃状态，输出当前被认为是'良好'的从节点数量。 */
         if (server.repl_min_slaves_to_write &&
             server.repl_min_slaves_max_lag) {
             info = sdscatprintf(info,
@@ -6398,14 +6346,14 @@ static void sigShutdownHandler(int sig) {
         msg = "Received shutdown signal, scheduling shutdown...";
     };
 
-    /* SIGINT is often delivered via Ctrl+C in an interactive session.
-     * If we receive the signal the second time, we interpret this as
-     * the user really wanting to quit ASAP without waiting to persist
-     * on disk and without waiting for lagging replicas. */
+    /* SIGINT 通常在交互式会话中通过 Ctrl+C 发送。
+     * 如果我们第二次收到该信号，则将其解释为
+     * 用户确实希望立即退出，无需等待持久化到磁盘，
+     * 也无需等待滞后的副本节点。 */
     if (server.shutdown_asap && sig == SIGINT) {
         serverLogRawFromHandler(LL_WARNING, "You insist... exiting now.");
         rdbRemoveTempFile(getpid(), 1);
-        exit(1); /* Exit with an error since this was not a clean shutdown. */
+        exit(1); /* 以错误退出，因为这不是一次干净关闭。 */
     } else if (server.loading) {
         msg = "Received shutdown signal during loading, scheduling shutdown.";
     }
