@@ -10,41 +10,43 @@
 #include "ebuckets.h"
 #include <math.h>
 
-/* Threshold for HEXPIRE and HPERSIST to be considered whether it is worth to
- * update the expiration time of the hash object in global HFE DS. */
+/* HEXPIRE 和 HPERSIST 的阈值：判断是否值得更新全局 HFE 数据结构中
+ * 哈希对象的过期时间。 */
 #define HASH_NEW_EXPIRE_DIFF_THRESHOLD max(4000, 1<<EB_BUCKET_KEY_PRECISION)
 
-/* Reserve 2 bits out of hash-field expiration time for possible future lightweight
- * indexing/categorizing of fields. It can be achieved by hacking HFE as follows:
+/* 从哈希字段的过期时间中预留 2 位，以便将来可能实现的轻量级
+ * 索引/字段分类。可以通过如下方式 hack HFE 实现：
  *
  *    HPEXPIREAT key [ 2^47 + USER_INDEX ] FIELDS numfields field [field …]
  *
- * Redis will also need to expose kind of HEXPIRESCAN and HEXPIRECOUNT for this
- * idea. Yet to be better defined.
+ * Redis 还需要暴露类似 HEXPIRESCAN 和 HEXPIRECOUNT 的命令以支持该想法。
+ * 仍有待进一步明确定义。
  *
- * HFE_MAX_ABS_TIME_MSEC constraint must be enforced only at API level. Internally,
- * the expiration time can be up to EB_EXPIRE_TIME_MAX for future readiness.
+ * HFE_MAX_ABS_TIME_MSEC 约束只能在 API 层强制执行。在内部，为了将来
+ * 做好准备，过期时间最大可到 EB_EXPIRE_TIME_MAX。
  */
 #define HFE_MAX_ABS_TIME_MSEC (EB_EXPIRE_TIME_MAX >> 2)
 
+/* GetFieldRes 枚举：hashTypeGet* 值族函数返回的结果状态。 */
 typedef enum GetFieldRes {
     /* common (Used by hashTypeGet* value family) */
-    GETF_OK = 0,            /* The field was found. */
-    GETF_NOT_FOUND,         /* The field was not found. */
-    GETF_EXPIRED,           /* Logically expired (Might be lazy deleted or not) */
-    GETF_EXPIRED_HASH,      /* Delete hash since retrieved field was expired and
-                             * it was the last field in the hash. */
+    GETF_OK = 0,            /* 字段已找到。 */
+    GETF_NOT_FOUND,         /* 字段未找到。 */
+    GETF_EXPIRED,           /* 逻辑上已过期（可能尚未惰性删除） */
+    GETF_EXPIRED_HASH,      /* 由于获取的字段已过期且该字段是哈希中的
+                             * 最后一个字段，因此删除该哈希。 */
 } GetFieldRes;
 
-/* ActiveExpireCtx passed to hashTypeActiveExpire() */
+/* ActiveExpireCtx 传递给 hashTypeActiveExpire() 的上下文。 */
 typedef struct ExpireCtx {
-    uint32_t fieldsToExpireQuota;
-    redisDb *db;
+    uint32_t fieldsToExpireQuota;  /* 本次过期配额（最多过期多少个字段） */
+    redisDb *db;                   /* 所属数据库 */
 } ExpireCtx;
 
+/* 将 listpackEntry 别名为 CommonEntry，使其可在 listpack 之外复用。 */
 typedef listpackEntry CommonEntry; /* extend usage beyond lp */
 
-/* hash field expiration (HFE) funcs */
+/* 哈希字段过期（HFE）相关函数声明 */
 static ExpireAction onFieldExpire(eItem item, void *ctx);
 static ExpireMeta* hfieldGetExpireMeta(const eItem field);
 static ExpireMeta *hashGetExpireMeta(const eItem hash);
@@ -54,7 +56,7 @@ static uint64_t hashTypeExpire(robj *o, ExpireCtx *expireCtx, int updateGlobalHF
 static void hfieldPersist(robj *hashObj, hfield field);
 static void propagateHashFieldDeletion(redisDb *db, sds key, char *field, size_t fieldLen);
 
-/* hash dictType funcs */
+/* 哈希 dictType 相关函数声明 */
 static int dictHfieldKeyCompare(dict *d, const void *key1, const void *key2);
 static uint64_t dictMstrHash(const void *key);
 static void dictHfieldDestructor(dict *d, void *field);
@@ -63,161 +65,158 @@ static void hashDictWithExpireOnRelease(dict *d);
 static robj* hashTypeLookupWriteOrCreate(client *c, robj *key);
 
 /*-----------------------------------------------------------------------------
- * Define dictType of hash
+ * 定义哈希的 dictType
  *
- * - Stores fields as mstr strings with optional metadata to attach TTL
- * - Note that small hashes are represented with listpacks
- * - Once expiration is set for a field, the dict instance and corresponding
- *   dictType are replaced with a dict containing metadata for Hash Field
- *   Expiration (HFE) and using dictType `mstrHashDictTypeWithHFE`
+ * - 将字段存储为 mstr 字符串，可选择附加元数据以挂接 TTL
+ * - 注意：小型哈希使用 listpack 表示
+ * - 一旦为字段设置了过期时间，对应的 dict 实例和 dictType 将被替换为
+ *   包含哈希字段过期（HFE）元数据的 dict，并使用 dictType
+ *   `mstrHashDictTypeWithHFE`
  *----------------------------------------------------------------------------*/
 dictType mstrHashDictType = {
-    dictSdsHash,                                /* lookup hash function */
+    dictSdsHash,                                /* 查找哈希函数 */
     NULL,                                       /* key dup */
     NULL,                                       /* val dup */
-    dictSdsMstrKeyCompare,                      /* lookup key compare */
-    dictHfieldDestructor,                       /* key destructor */
-    dictSdsDestructor,                          /* val destructor */
-    .storedHashFunction = dictMstrHash,         /* stored hash function */
-    .storedKeyCompare = dictHfieldKeyCompare,   /* stored key compare */
+    dictSdsMstrKeyCompare,                      /* 查找 key compare */
+    dictHfieldDestructor,                       /* 键析构函数 */
+    dictSdsDestructor,                          /* 值析构函数 */
+    .storedHashFunction = dictMstrHash,         /* 存储哈希函数 */
+    .storedKeyCompare = dictHfieldKeyCompare,   /* 存储键比较函数 */
 };
 
-/* Define alternative dictType of hash with hash-field expiration (HFE) support */
+/* 定义支持哈希字段过期（HFE）的替代哈希 dictType */
 dictType mstrHashDictTypeWithHFE = {
-    dictSdsHash,                                /* lookup hash function */
+    dictSdsHash,                                /* 查找哈希函数 */
     NULL,                                       /* key dup */
     NULL,                                       /* val dup */
-    dictSdsMstrKeyCompare,                      /* lookup key compare */
-    dictHfieldDestructor,                       /* key destructor */
-    dictSdsDestructor,                          /* val destructor */
-    .storedHashFunction = dictMstrHash,         /* stored hash function */
-    .storedKeyCompare = dictHfieldKeyCompare,   /* stored key compare */
+    dictSdsMstrKeyCompare,                      /* 查找 key compare */
+    dictHfieldDestructor,                       /* 键析构函数 */
+    dictSdsDestructor,                          /* 值析构函数 */
+    .storedHashFunction = dictMstrHash,         /* 存储哈希函数 */
+    .storedKeyCompare = dictHfieldKeyCompare,   /* 存储键比较函数 */
     .dictMetadataBytes = hashDictWithExpireMetadataBytes,
     .onDictRelease = hashDictWithExpireOnRelease,
 };
 
 /*-----------------------------------------------------------------------------
- * Hash Field Expiration (HFE) Feature
+ * 哈希字段过期（HFE）特性
  *
- * Each hash instance maintains its own set of hash field expiration within its
- * private ebuckets DS. In order to support HFE active expire cycle across hash
- * instances, hashes with associated HFE will be also registered in a global
- * ebuckets DS with expiration time value that reflects their next minimum
- * time to expire. The global HFE Active expiration will be triggered from
- * activeExpireCycle() function and will invoke "local" HFE Active expiration
- * for each hash instance that has expired fields.
+ * 每个哈希实例都在其私有的 ebuckets 数据结构中维护自己的哈希字段过期集合。
+ * 为了支持跨哈希实例的 HFE 主动过期循环，具有 HFE 的哈希还会被注册到
+ * 全局 ebuckets 数据结构中，并使用反映其下一个最早过期时间的值作为
+ * 过期时间。全局 HFE 主动过期将由 activeExpireCycle() 函数触发，
+ * 并为每个具有已过期字段的哈希实例调用“局部” HFE 主动过期。
  *
- * hashExpireBucketsType - ebuckets-type to be used at the global space
- * (db->hexpires) to register hashes that have one or more fields with time-Expiration.
- * The hashes will be registered in with the expiration time of the earliest field
- * in the hash.
+ * hashExpireBucketsType - 在全局空间 (db->hexpires) 中使用的 ebuckets 类型，
+ * 用于注册具有一个或多个带时间过期字段的哈希。这些哈希将以哈希中最早
+ * 字段的过期时间进行注册。
  *----------------------------------------------------------------------------*/
 EbucketsType hashExpireBucketsType = {
     .onDeleteItem = NULL,
-    .getExpireMeta = hashGetExpireMeta,   /* get ExpireMeta attached to each hash */
-    .itemsAddrAreOdd = 0,                 /* Addresses of dict are even */
+    .getExpireMeta = hashGetExpireMeta,   /* 获取附加到每个哈希的 ExpireMeta */
+    .itemsAddrAreOdd = 0,                 /* dict 的地址是偶数 */
 };
 
-/* dictExpireMetadata - ebuckets-type for hash fields with time-Expiration. ebuckets
- * instance Will be attached to each hash that has at least one field with expiry
- * time. */
+/* dictExpireMetadata - 带有时间过期的哈希字段的 ebuckets 类型。
+ * ebuckets 实例将被附加到至少有一个字段具有过期时间的哈希。 */
 EbucketsType hashFieldExpireBucketsType = {
     .onDeleteItem = NULL,
-    .getExpireMeta = hfieldGetExpireMeta, /* get ExpireMeta attached to each field */
-    .itemsAddrAreOdd = 1,                 /* Addresses of hfield (mstr) are odd!! */
+    .getExpireMeta = hfieldGetExpireMeta, /* 获取附加到每个字段的 ExpireMeta */
+    .itemsAddrAreOdd = 1,                 /* hfield (mstr) 的地址是奇数！！ */
 };
 
-/* OnFieldExpireCtx passed to OnFieldExpire() */
+/* OnFieldExpireCtx：传递给 OnFieldExpire() 的上下文。 */
 typedef struct OnFieldExpireCtx {
-    robj *hashObj;
-    redisDb *db;
+    robj *hashObj;  /* 当前正在过期的哈希对象 */
+    redisDb *db;    /* 所属数据库 */
 } OnFieldExpireCtx;
 
-/* The implementation of hashes by dict was modified from storing fields as sds
- * strings to store "mstr" (Immutable string with metadata) in order to be able to
- * attach TTL (ExpireMeta) to the hash-field. This usage of mstr opens up the
- * opportunity for future features to attach additional metadata by need to the
- * fields.
+/* 哈希的 dict 实现已从将字段存储为 sds 字符串改为存储 "mstr"（带元数据的
+ * 不可变字符串），以便能够将 TTL (ExpireMeta) 附加到哈希字段。这种 mstr
+ * 的使用为将来根据需要为字段附加其他元数据的功能打开了大门。
  *
- * The following defines new hfield kind of mstr */
+ * 以下定义了新的 hfield 类型的 mstr */
 typedef enum HfieldMetaFlags {
-    HFIELD_META_EXPIRE = 0,
+    HFIELD_META_EXPIRE = 0,  /* 字段过期元数据标记位 */
 } HfieldMetaFlags;
 
+/* 哈希字段使用的 mstr 类型注册。
+ * 注意：所有 metaSize[*] 值都保证为偶数，确保所有 hfield 实例的地址为奇数。 */
 mstrKind mstrFieldKind = {
     .name = "hField",
 
-    /* Taking care that all metaSize[*] values are even ensures that all
-     * addresses of hfield instances will be odd. */
+    /* 注意：保证所有 metaSize[*] 值为偶数，
+     * 以确保所有 hfield 实例的地址为奇数。 */
     .metaSize[HFIELD_META_EXPIRE] = sizeof(ExpireMeta),
 };
+/* 编译期断言：ExpireMeta 大小必须为偶数，保证 hfield 地址为奇数。 */
 static_assert(sizeof(struct ExpireMeta ) % 2 == 0, "must be even!");
 
-/* Used by hpersistCommand() */
+/* hpersistCommand() 命令的返回值。 */
 typedef enum SetPersistRes {
-    HFE_PERSIST_NO_FIELD =     -2,   /* No such hash-field */
-    HFE_PERSIST_NO_TTL =       -1,   /* No TTL attached to the field */
-    HFE_PERSIST_OK =            1
+    HFE_PERSIST_NO_FIELD =     -2,   /* 不存在对应的哈希字段 */
+    HFE_PERSIST_NO_TTL =       -1,   /* 字段未挂接 TTL */
+    HFE_PERSIST_OK =            1    /* 成功清除字段的过期时间 */
 } SetPersistRes;
 
+/* 判断 dict 是否是带有 HFE 元数据的哈希字典。 */
 static inline int isDictWithMetaHFE(dict *d) {
     return d->type == &mstrHashDictTypeWithHFE;
 }
 
 /*-----------------------------------------------------------------------------
- * setex* - Set field's expiration
+ * setex* - 设置字段的过期时间
  *
- * Setting expiration time to fields might be time-consuming and complex since
- * each update of expiration time, not only updates `ebuckets` of corresponding
- * hash, but also might update `ebuckets` of global HFE DS. It is required to opt
- * sequence of field updates with expirartion for a given hash, such that only
- * once done, the global HFE DS will get updated.
+ * 设置字段的过期时间可能既耗时又复杂，因为每次更新过期时间不仅要更新
+ * 对应哈希的 `ebuckets`，还可能要更新全局 HFE 数据结构的 `ebuckets`。
+ * 需要为给定的哈希组织一系列字段过期更新操作，使得只有全部完成后，
+ * 全局 HFE 数据结构才会被更新。
  *
- * To do so, follow the scheme:
- * 1. Call hashTypeSetExInit() to initialize the HashTypeSetEx struct.
- * 2. Call hashTypeSetEx() one time or more, for each field/expiration update.
- * 3. Call hashTypeSetExDone() for notification and update of global HFE.
+ * 具体步骤如下：
+ * 1. 调用 hashTypeSetExInit() 初始化 HashTypeSetEx 结构体。
+ * 2. 对每个字段/过期更新调用一次或多次 hashTypeSetEx()。
+ * 3. 调用 hashTypeSetExDone() 进行通知并更新全局 HFE。
  *----------------------------------------------------------------------------*/
 
-/* Returned value of hashTypeSetEx() */
+/* hashTypeSetEx() 的返回值枚举。 */
 typedef enum SetExRes {
-    HSETEX_OK =                1,   /* Expiration time set/updated as expected */
-    HSETEX_NO_FIELD =         -2,   /* No such hash-field */
-    HSETEX_NO_CONDITION_MET =  0,   /* Specified NX | XX | GT | LT condition not met */
-    HSETEX_DELETED =           2,   /* Field deleted because the specified time is in the past */
+    HSETEX_OK =                1,   /* 过期时间按预期设置/更新 */
+    HSETEX_NO_FIELD =         -2,   /* 不存在对应的哈希字段 */
+    HSETEX_NO_CONDITION_MET =  0,   /* 指定的 NX | XX | GT | LT 条件不满足 */
+    HSETEX_DELETED =           2,   /* 由于指定的时间已过期，字段被删除 */
 } SetExRes;
 
-/* Used by httlGenericCommand() */
+/* httlGenericCommand() 使用的返回值枚举。 */
 typedef enum GetExpireTimeRes {
-    HFE_GET_NO_FIELD =          -2, /* No such hash-field */
-    HFE_GET_NO_TTL =            -1, /* No TTL attached to the field */
+    HFE_GET_NO_FIELD =          -2, /* 不存在对应的哈希字段 */
+    HFE_GET_NO_TTL =            -1, /* 字段未挂接 TTL */
 } GetExpireTimeRes;
 
+/* 设置过期时间的条件枚举（NX/XX/GT/LT 位标志）。 */
 typedef enum ExpireSetCond {
-    HFE_NX = 1<<0,
-    HFE_XX = 1<<1,
-    HFE_GT = 1<<2,
-    HFE_LT = 1<<3
+    HFE_NX = 1<<0,  /* 仅当字段没有过期时间时设置 */
+    HFE_XX = 1<<1,  /* 仅当字段已有过期时间时设置 */
+    HFE_GT = 1<<2,  /* 仅当新过期时间大于当前过期时间时设置 */
+    HFE_LT = 1<<3   /* 仅当新过期时间小于当前过期时间时设置 */
 } ExpireSetCond;
 
-/* Used by hashTypeSetEx() for setting fields or their expiry  */
+/* hashTypeSetEx() 设置字段或过期时间所用的结构体。 */
 typedef struct HashTypeSetEx {
 
-    /*** config ***/
-    ExpireSetCond expireSetCond;        /* [XX | NX | GT | LT] */
+    /*** 配置 ***/
+    ExpireSetCond expireSetCond;        /* [XX | NX | GT | LT] 条件 */
 
-    /*** metadata ***/
-    uint64_t minExpire;                 /* if uninit EB_EXPIRE_TIME_INVALID */
-    redisDb *db;
-    robj *key, *hashObj;
-    uint64_t minExpireFields;           /* Trace updated fields and their previous/new
-                                         * minimum expiration time. If minimum recorded
-                                         * is above minExpire of the hash, then we don't
-                                         * have to update global HFE DS */
-    int fieldDeleted;                   /* Number of fields deleted */
-    int fieldUpdated;                   /* Number of fields updated */
+    /*** 元数据 ***/
+    uint64_t minExpire;                 /* 未初始化时为 EB_EXPIRE_TIME_INVALID */
+    redisDb *db;                        /* 所属数据库 */
+    robj *key, *hashObj;                /* 对应的 key 与哈希对象 */
+    uint64_t minExpireFields;           /* 追踪已更新字段的旧/新最小过期时间。
+                                         * 如果记录的最小值大于哈希的
+                                         * minExpire，则无需更新全局 HFE DS */
+    int fieldDeleted;                   /* 已删除的字段数 */
+    int fieldUpdated;                   /* 已更新的字段数 */
 
-    /* Optionally provide client for notification */
+    /* 可选：提供客户端以触发通知 */
     client *c;
     const char *cmd;
 } HashTypeSetEx;
@@ -230,98 +229,109 @@ SetExRes hashTypeSetEx(robj *o, sds field, uint64_t expireAt, HashTypeSetEx *exI
 void hashTypeSetExDone(HashTypeSetEx *e);
 
 /*-----------------------------------------------------------------------------
- * Accessor functions for dictType of hash
+ * 哈希 dictType 的访问器函数
  *----------------------------------------------------------------------------*/
 
+/* 比较两个 hfield 键（基于存储键的 mstr 表示）是否相等。
+ * 时间复杂度：O(L)，L 为字段长度。 */
 static int dictHfieldKeyCompare(dict *d, const void *key1, const void *key2)
 {
     int l1,l2;
     UNUSED(d);
 
+    /* 先比较长度，再逐字节比较 */
     l1 = hfieldlen((hfield)key1);
     l2 = hfieldlen((hfield)key2);
     if (l1 != l2) return 0;
     return memcmp(key1, key2, l1) == 0;
 }
 
+/* 计算 mstr 字段的哈希值（用于 dict 内部存储）。 */
 static uint64_t dictMstrHash(const void *key) {
     return dictGenHashFunction((unsigned char*)key, mstrlen((char*)key));
 }
 
+/* 哈希字段键的析构函数。当 dict 中删除 hfield 时由 dict 调用。 */
 static void dictHfieldDestructor(dict *d, void *field) {
 
-    /* If attached TTL to the field, then remove it from hash's private ebuckets. */
+    /* 如果该字段挂接了 TTL，则需要从哈希的私有 ebuckets 中移除。 */
     if (hfieldGetExpireTime(field) != EB_EXPIRE_TIME_INVALID) {
         dictExpireMetadata *dictExpireMeta = (dictExpireMetadata *) dictMetadata(d);
         ebRemove(&dictExpireMeta->hfe, &hashFieldExpireBucketsType, field);
     }
 
+    /* 释放 hfield 自身 */
     hfieldFree(field);
 
-    /* Don't have to update global HFE DS. It's unnecessary. Implementing this
-     * would introduce significant complexity and overhead for an operation that
-     * isn't critical. In the worst case scenario, the hash will be efficiently
-     * updated later by an active-expire operation, or it will be removed by the
-     * hash's dbGenericDelete() function. */
+    /* 无需更新全局 HFE DS。这是不必要的。
+     * 实现该功能会引入显著的复杂性和开销，而该操作并非关键。
+     * 在最坏的情况下，哈希稍后会被主动过期操作高效地更新，
+     * 或者由哈希的 dbGenericDelete() 函数删除。 */
 }
 
+/* 返回带有过期元数据的哈希 dict 所需分配的元数据大小。 */
 static size_t hashDictWithExpireMetadataBytes(dict *d) {
     UNUSED(d);
-    /* expireMeta of the hash, ref to ebuckets and pointer to hash's key */
+    /* 哈希的 expireMeta、对 ebuckets 的引用以及指向哈希 key 的指针 */
     return sizeof(dictExpireMetadata);
 }
 
+/* dict 释放时调用的回调，销毁哈希的私有 ebuckets。
+ * 注：此函数只有在 dict 分配了元数据时才会被注册。 */
 static void hashDictWithExpireOnRelease(dict *d) {
-    /* for sure allocated with metadata. Otherwise, this func won't be registered */
+    /* 必然已分配了元数据。否则此函数不会被注册。 */
     dictExpireMetadata *dictExpireMeta = (dictExpireMetadata *) dictMetadata(d);
     ebDestroy(&dictExpireMeta->hfe, &hashFieldExpireBucketsType, NULL);
 }
 
 /*-----------------------------------------------------------------------------
- * listpackEx functions
+ * listpackEx 函数
  *----------------------------------------------------------------------------*/
 /*
- * If any of hash field expiration command is called on a listpack hash object
- * for the first time, we convert it to OBJ_ENCODING_LISTPACK_EX encoding.
- * We allocate "struct listpackEx" which holds listpack pointer and metadata to
- * register key to the global DS. In the listpack, we append another TTL entry
- * for each field-value pair. From now on, listpack will have triplets in it:
- * field-value-ttl. If TTL is not set for a field, we store 'zero' as the TTL
- * value. 'zero' is encoded as two bytes in the listpack. Memory overhead of a
- * non-existing TTL will be two bytes per field.
+ * 如果首次对 listpack 编码的哈希对象调用任意哈希字段过期命令，
+ * 我们会将其转换为 OBJ_ENCODING_LISTPACK_EX 编码。
+ * 我们分配 "struct listpackEx"，它持有 listpack 指针和元数据，
+ * 用于将 key 注册到全局数据结构中。
+ * 在 listpack 中，我们为每个 field-value 对再追加一个 TTL 条目。
+ * 从此，listpack 中将包含三元组：field-value-ttl。
+ * 如果某个字段没有设置 TTL，则将 'zero' 作为 TTL 值存储。
+ * 'zero' 在 listpack 中编码为两个字节。因此不存在的 TTL
+ * 每个字段的内存开销为两个字节。
  *
- * Fields in the listpack will be ordered by TTL. Field with the smallest expiry
- * time will be the first item. Fields without TTL will be at the end of the
- * listpack. This way, it is easier/faster to find expired items.
+ * listpack 中的字段将按 TTL 排序。最早过期的字段将位于第一项。
+ * 没有 TTL 的字段将位于 listpack 的末尾。这样更容易/更快地
+ * 找到过期的项。
  */
 
 #define HASH_LP_NO_TTL 0
 
+/* 创建一个 listpackEx 结构。返回值为新分配并初始化后的 listpackEx。 */
 struct listpackEx *listpackExCreate(void) {
     listpackEx *lpt = zcalloc(sizeof(*lpt));
-    lpt->meta.trash = 1;
+    lpt->meta.trash = 1;  /* 初始时标记为 trash */
     lpt->lp = NULL;
     lpt->key = NULL;
     return lpt;
 }
 
+/* 释放 listpackEx 及其内部 listpack。 */
 static void listpackExFree(listpackEx *lpt) {
     lpFree(lpt->lp);
     zfree(lpt);
 }
 
+/* lpFindCb() 回调函数所用的参数结构。 */
 struct lpFingArgs {
-    uint64_t max_to_search; /* [in] Max number of tuples to search */
-    uint64_t expire_time;   /* [in] Find the tuple that has a TTL larger than expire_time */
-    unsigned char *p;       /* [out] First item of the tuple that has a TTL larger than expire_time */
-    int expired;            /* [out] Number of tuples that have TTLs less than expire_time */
-    int index;              /* Internally used */
-    unsigned char *fptr;    /* Internally used, temp ptr */
+    uint64_t max_to_search; /* [in] 最多搜索的元组数 */
+    uint64_t expire_time;   /* [in] 查找 TTL 大于该值的元组 */
+    unsigned char *p;       /* [out] TTL 大于 expire_time 的元组的首项 */
+    int expired;            /* [out] TTL 小于 expire_time 的元组数量 */
+    int index;              /* 内部使用 */
+    unsigned char *fptr;    /* 内部使用的临时指针 */
 };
 
-/* Callback for lpFindCb(). Used to find number of expired fields as part of
- * active expiry or when trying to find the position for the new field according
- * to its expiry time.*/
+/* lpFindCb() 的回调。用于统计已过期字段数量（主动过期时），
+ * 或在根据新字段的过期时间查找插入位置时使用。 */
 static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
                             void *user, unsigned char *s, long long slen)
 {
@@ -331,17 +341,18 @@ static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
     r->index++;
 
     if (r->max_to_search == 0)
-        return 0; /* Break the loop and return */
+        return 0; /* 中断循环并返回 */
 
     if (r->index % 3 == 1) {
+        /* 元组的第 1 项：字段名 */
         r->fptr = p;  /* First item of the tuple. */
     } else if (r->index % 3 == 0) {
         serverAssert(!s);
 
-        /* Third item of a tuple is expiry time */
+        /* 元组的第 3 项是过期时间 */
         if (slen == HASH_LP_NO_TTL || (uint64_t) slen >= r->expire_time) {
             r->p = r->fptr;
-            return 0; /* Break the loop and return */
+            return 0; /* 中断循环并返回 */
         }
         r->expired++;
         r->max_to_search--;
@@ -350,7 +361,7 @@ static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
     return 1;
 }
 
-/* Returns number of expired fields. */
+/* 返回已过期字段的数量（仅做扫描，不实际删除）。 */
 static uint64_t listpackExExpireDryRun(const robj *o) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK_EX);
 
@@ -365,7 +376,8 @@ static uint64_t listpackExExpireDryRun(const robj *o) {
     return r.expired;
 }
 
-/* Returns the expiration time of the item with the nearest expiration. */
+/* 返回最早过期项的过期时间。
+ * 若无带 TTL 的字段则返回 EB_EXPIRE_TIME_INVALID。 */
 static uint64_t listpackExGetMinExpire(robj *o) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK_EX);
 
@@ -373,13 +385,13 @@ static uint64_t listpackExGetMinExpire(robj *o) {
     unsigned char *fptr;
     listpackEx *lpt = o->ptr;
 
-    /* As fields are ordered by expire time, first field will have the smallest
-     * expiry time. Third element is the expiry time of the first field */
+    /* 由于字段按过期时间排序，第一个字段的过期时间最小。
+     * 第 3 个元素是第一个字段的过期时间。 */
     fptr = lpSeek(lpt->lp, 2);
     if (fptr != NULL) {
         serverAssert(lpGetIntegerValue(fptr, &expireAt));
 
-        /* Check if this is a non-volatile field. */
+        /* 检查是否为不带 TTL 的字段。 */
         if (expireAt != HASH_LP_NO_TTL)
             return expireAt;
     }
@@ -387,7 +399,8 @@ static uint64_t listpackExGetMinExpire(robj *o) {
     return EB_EXPIRE_TIME_INVALID;
 }
 
-/* Walk over fields and delete the expired ones. */
+/* 遍历字段并删除已过期的字段。
+ * 时间复杂度：O(N)，N 为过期字段数量（受 info->maxToExpire 限制）。 */
 void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK_EX);
     uint64_t expired = 0, min = EB_EXPIRE_TIME_INVALID;
@@ -408,8 +421,8 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
         ptr = lpNext(lpt->lp, ptr);
         serverAssert(ptr && lpGetIntegerValue(ptr, &val));
 
-        /* Fields are ordered by expiry time. If we reached to a non-expired
-         * or a non-volatile field, we know rest is not yet expired. */
+        /* 字段按过期时间排序。当遇到未过期或无 TTL 的字段时，
+         * 说明后续的字段也尚未过期，可以提前终止遍历。 */
         if (val == HASH_LP_NO_TTL || (uint64_t) val > info->now)
             break;
 
@@ -422,6 +435,7 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
         expired++;
     }
 
+    /* 一次性删除所有已过期的元组 */
     if (expired)
         lpt->lp = lpDeleteRange(lpt->lp, 0, expired * 3);
 
@@ -429,10 +443,11 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
     info->nextExpireTime = min;
 }
 
+/* 在 listpackEx 中插入一个三元组。 */
 static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
     listpackEx *lpt = o->ptr;
 
-    /* Shortcut, just append at the end if this is a non-volatile field. */
+    /* 优化：如果是非易失字段（无 TTL），直接追加到末尾。 */
     if (ent[2].lval == HASH_LP_NO_TTL) {
         lpt->lp = lpBatchAppend(lpt->lp, ent, 3);
         return;
@@ -443,18 +458,18 @@ static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
             .expire_time = ent[2].lval,
     };
 
-    /* Check if there is a field with a larger TTL. */
+    /* 查找是否存在比该 TTL 更大的字段。 */
     lpFindCb(lpt->lp, NULL, &r, cbFindInListpack, 0);
 
-    /* If list is empty or there is no field with a larger TTL, result will be
-     * NULL. Otherwise, just insert before the found item.*/
+    /* 如果列表为空或没有比该 TTL 更大的字段，结果将为 NULL。
+     * 否则，就在找到的项之前插入。*/
     if (r.p)
         lpt->lp = lpBatchInsert(lpt->lp, r.p, LP_BEFORE, ent, 3, NULL);
     else
         lpt->lp = lpBatchAppend(lpt->lp, ent, 3);
 }
 
-/* Add new field ordered by expire time. */
+/* 按过期时间顺序添加新字段。 */
 void listpackExAddNew(robj *o, char *field, size_t flen,
                       char *value, size_t vlen, uint64_t expireAt) {
     listpackEntry ent[3] = {
@@ -466,9 +481,8 @@ void listpackExAddNew(robj *o, char *field, size_t flen,
     listpackExAddInternal(o, ent);
 }
 
-/* If expiry time is changed, this function will place field into the correct
- * position. First, it deletes the field and re-inserts to the listpack ordered
- * by expiry time. */
+/* 如果过期时间发生变化，本函数将字段重新放置到正确位置。
+ * 首先删除原字段，然后按过期时间顺序重新插入到 listpack 中。 */
 static void listpackExUpdateExpiry(robj *o, sds field,
                                    unsigned char *fptr,
                                    unsigned char *vptr,
@@ -480,19 +494,18 @@ static void listpackExUpdateExpiry(robj *o, sds field,
     sds tmpval = NULL;
     listpackEx *lpt = o->ptr;
 
-    /* Copy value */
+    /* 复制 value */
     valstr = lpGetValue(vptr, &slen, &val);
     if (valstr) {
-        /* Normally, item length in the listpack is limited by
-         * 'hash-max-listpack-value' config. It is unlikely, but it might be
-         * larger than sizeof(tmp). */
+        /* 通常 listpack 中的项长度受 'hash-max-listpack-value' 配置限制。
+         * 但少数情况下可能超过 sizeof(tmp)。 */
         if (slen > sizeof(tmp))
             tmpval = sdsnewlen(valstr, slen);
         else
             memcpy(tmp, valstr, slen);
     }
 
-    /* Delete field name, value and expiry time */
+    /* 删除字段名、值和过期时间三元组 */
     lpt->lp = lpDeleteRangeWithEntry(lpt->lp, &fptr, 3);
 
     listpackEntry ent[3] = {{0}};
@@ -512,7 +525,7 @@ static void listpackExUpdateExpiry(robj *o, sds field,
     sdsfree(tmpval);
 }
 
-/* Update field expire time. */
+/* 更新字段的过期时间（listpack 编码版本）。 */
 SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
                                    unsigned char *fptr, unsigned char *vptr,
                                    unsigned char *tptr, uint64_t expireAt)
@@ -527,7 +540,7 @@ SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
     }
 
     if (prevExpire == EB_EXPIRE_TIME_INVALID) {
-        /* For fields without expiry, LT condition is considered valid */
+        /* 对于没有过期的字段，LT 条件视为满足 */
         if (ex->expireSetCond & (HFE_XX | HFE_GT))
             return HSETEX_NO_CONDITION_MET;
     } else {
@@ -536,13 +549,13 @@ SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
             (ex->expireSetCond == HFE_NX) )
             return HSETEX_NO_CONDITION_MET;
 
-        /* Track of minimum expiration time (only later update global HFE DS) */
+        /* 跟踪最小过期时间（仅稍后更新全局 HFE DS） */
         if (ex->minExpireFields > prevExpire)
             ex->minExpireFields = prevExpire;
     }
 
-    /* If expired, then delete the field and propagate the deletion.
-     * If replica, continue like the field is valid */
+    /* 如果已过期，则删除该字段并传播删除操作。
+     * 如果是从节点（replica），则按字段有效继续处理。 */
     if (unlikely(checkAlreadyExpired(expireAt))) {
         propagateHashFieldDeletion(ex->db, ex->key->ptr, field, sdslen(field));
         hashTypeDelete(ex->hashObj, field, 1);
@@ -559,7 +572,7 @@ SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
     return HSETEX_OK;
 }
 
-/* Returns 1 if expired */
+/* 如果已过期则返回 1，否则返回 0。 */
 int hashTypeIsExpired(const robj *o, uint64_t expireAt) {
     if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         if (expireAt == HASH_LP_NO_TTL)
@@ -574,7 +587,7 @@ int hashTypeIsExpired(const robj *o, uint64_t expireAt) {
     return (mstime_t) expireAt < commandTimeSnapshot();
 }
 
-/* Returns listpack pointer of the object. */
+/* 返回对象的 listpack 指针（无论是 LISTPACK 还是 LISTPACK_EX 编码）。 */
 unsigned char *hashTypeListpackGetLp(robj *o) {
     if (o->encoding == OBJ_ENCODING_LISTPACK)
         return o->ptr;
@@ -585,12 +598,11 @@ unsigned char *hashTypeListpackGetLp(robj *o) {
 }
 
 /*-----------------------------------------------------------------------------
- * Hash type API
+ * 哈希类型 API
  *----------------------------------------------------------------------------*/
 
-/* Check the length of a number of objects to see if we need to convert a
- * listpack to a real hash. Note that we only check string encoded objects
- * as their string length can be queried in constant time. */
+/* 检查多个对象的长度，以判断是否需要将 listpack 转换为真正的哈希。
+ * 注意：我们只检查字符串编码的对象，因为它们的长度可以在 O(1) 时间内获得。 */
 void hashTypeTryConversion(redisDb *db, robj *o, robj **argv, int start, int end) {
     int i;
     size_t sum = 0;
@@ -598,9 +610,8 @@ void hashTypeTryConversion(redisDb *db, robj *o, robj **argv, int start, int end
     if (o->encoding != OBJ_ENCODING_LISTPACK && o->encoding != OBJ_ENCODING_LISTPACK_EX)
         return;
 
-    /* We guess that most of the values in the input are unique, so
-     * if there are enough arguments we create a pre-sized hash, which
-     * might over allocate memory if there are duplicates. */
+    /* 我们假设输入中的字段大部分是唯一的，因此如果有足够多的参数，
+     * 就创建一个预分配大小的哈希，这样如果有重复可能会过度分配内存。 */
     size_t new_fields = (end - start + 1) / 2;
     if (new_fields > server.hash_max_listpack_entries) {
         hashTypeConvert(o, OBJ_ENCODING_HT, &db->hexpires);
@@ -622,7 +633,8 @@ void hashTypeTryConversion(redisDb *db, robj *o, robj **argv, int start, int end
         hashTypeConvert(o, OBJ_ENCODING_HT, &db->hexpires);
 }
 
-/* Get the value from a listpack encoded hash, identified by field. */
+/* 从 listpack 编码的哈希中按字段获取值。
+ * 时间复杂度：O(N)，N 为字段数量。 */
 GetFieldRes hashTypeGetFromListpack(robj *o, sds field,
                             unsigned char **vstr,
                             unsigned int *vlen,
@@ -638,7 +650,7 @@ GetFieldRes hashTypeGetFromListpack(robj *o, sds field,
         if (fptr != NULL) {
             fptr = lpFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
             if (fptr != NULL) {
-                /* Grab pointer to the value (fptr points to the field) */
+                /* 获取指向 value 的指针（fptr 指向 field） */
                 vptr = lpNext(zl, fptr);
                 serverAssert(vptr != NULL);
             }
@@ -652,6 +664,7 @@ GetFieldRes hashTypeGetFromListpack(robj *o, sds field,
         if (fptr != NULL) {
             fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, sdslen(field), 2);
             if (fptr != NULL) {
+                /* 获取指向 value 的指针（fptr 指向 field） */
                 vptr = lpNext(lpt->lp, fptr);
                 serverAssert(vptr != NULL);
 
@@ -673,9 +686,9 @@ GetFieldRes hashTypeGetFromListpack(robj *o, sds field,
     return GETF_NOT_FOUND;
 }
 
-/* Get the value from a hash table encoded hash, identified by field.
- * Returns NULL when the field cannot be found, otherwise the SDS value
- * is returned. */
+/* 从哈希表（HT）编码的哈希中按字段获取值。
+ * 如果未找到字段返回 NULL，否则返回 SDS 值。
+ * 时间复杂度：O(1)。 */
 GetFieldRes hashTypeGetFromHashTable(robj *o, sds field, sds *value, uint64_t *expiredAt) {
     dictEntry *de;
 
@@ -693,20 +706,18 @@ GetFieldRes hashTypeGetFromHashTable(robj *o, sds field, sds *value, uint64_t *e
     return GETF_OK;
 }
 
-/* Higher level function of hashTypeGet*() that returns the hash value
- * associated with the specified field.
- * Arguments:
- * hfeFlags      - Lookup for HFE_LAZY_* flags
+/* hashTypeGet*() 的更高级版本，返回指定字段关联的哈希值。
  *
- * Returned:
- * GetFieldRes  - Result of get operation
- * vstr, vlen   - if string, ref in either *vstr and *vlen if it's
- *                returned in string form,
- * vll          - or stored in *vll if it's returned as a number.
- *                If *vll is populated *vstr is set to NULL, so the caller can
- *                always check the function return by checking the return value
- *                for GETF_OK and checking if vll (or vstr) is NULL.
+ * 参数：
+ * hfeFlags      - HFE_LAZY_* 标志位，控制惰性过期行为
  *
+ * 返回：
+ * GetFieldRes   - 获取操作的结果
+ * vstr, vlen    - 如果是字符串，则引用赋给 *vstr 和 *vlen
+ * vll           - 如果是数字则存储在 *vll 中。
+ *                如果 *vll 被赋值，则 *vstr 会被设为 NULL，
+ *                调用者可通过返回值是否为 GETF_OK 以及 vll（或 vstr）
+ *                是否为 NULL 来判断是否成功。
  */
 GetFieldRes hashTypeGetValue(redisDb *db, robj *o, sds field, unsigned char **vstr,
                              unsigned int *vlen, long long *vll, int hfeFlags) {
@@ -738,11 +749,11 @@ GetFieldRes hashTypeGetValue(redisDb *db, robj *o, sds field, unsigned char **vs
         return GETF_OK;
 
     if (server.masterhost) {
-        /* If CLIENT_MASTER, assume valid as long as it didn't get delete */
+        /* 如果当前客户端是主节点（CLIENT_MASTER），只要未被删除就视为有效。 */
         if (server.current_client && (server.current_client->flags & CLIENT_MASTER))
             return GETF_OK;
 
-        /* If user client, then act as if expired, but don't delete! */
+        /* 如果是用户客户端，则按已过期处理，但不删除！ */
         return GETF_EXPIRED;
     }
 
@@ -757,12 +768,12 @@ GetFieldRes hashTypeGetValue(redisDb *db, robj *o, sds field, unsigned char **vs
     else
         key = ((dictExpireMetadata *) dictMetadata((dict*)o->ptr))->key;
 
-    /* delete the field and propagate the deletion */
+    /* 删除字段并传播删除事件 */
     serverAssert(hashTypeDelete(o, field, 1) == 1);
     propagateHashFieldDeletion(db, key, field, sdslen(field));
     server.stat_expired_subkeys++;
 
-    /* If the field is the last one in the hash, then the hash will be deleted */
+    /* 如果该字段是哈希中的最后一个字段，则哈希也会被删除 */
     res = GETF_EXPIRED;
     robj *keyObj = createStringObject(key, sdslen(key));
     if (!(hfeFlags & HFE_LAZY_NO_NOTIFICATION))
@@ -778,15 +789,13 @@ GetFieldRes hashTypeGetValue(redisDb *db, robj *o, sds field, unsigned char **vs
     return res;
 }
 
-/* Like hashTypeGetValue() but returns a Redis object, which is useful for
- * interaction with the hash type outside t_hash.c.
- * The function returns NULL if the field is not found in the hash. Otherwise
- * a newly allocated string object with the value is returned.
+/* 与 hashTypeGetValue() 类似，但返回 Redis 对象，便于 t_hash.c 之外
+ * 与哈希类型交互使用。
+ * 如果哈希中未找到字段，函数返回 NULL。否则返回一个新分配的字符串对象。
  *
- * hfeFlags      - Lookup HFE_LAZY_* flags
- * isHashDeleted - If attempted to access expired field and it's the last field
- *                 in the hash, then the hash will as well be deleted. In this case,
- *                 isHashDeleted will be set to 1.
+ * hfeFlags      - HFE_LAZY_* 标志位
+ * isHashDeleted - 如果访问的是已过期字段且它是哈希中的最后一个字段，
+ *                 则哈希也会被删除，此时 *isHashDeleted 会被置为 1。
  */
 robj *hashTypeGetValueObject(redisDb *db, robj *o, sds field, int hfeFlags, int *isHashDeleted) {
     unsigned char *vstr;
@@ -808,15 +817,14 @@ robj *hashTypeGetValueObject(redisDb *db, robj *o, sds field, int hfeFlags, int 
     return NULL;
 }
 
-/* Test if the specified field exists in the given hash. If the field is
- * expired (HFE), then it will be lazy deleted
+/* 检查指定字段是否存在于给定哈希中。如果字段已过期（HFE），
+ * 则会进行惰性删除。
  *
- * hfeFlags      - Lookup HFE_LAZY_* flags
- * isHashDeleted - If attempted to access expired field and it is the last field
- *                 in the hash, then the hash will as well be deleted. In this case,
- *                 isHashDeleted will be set to 1.
+ * hfeFlags      - HFE_LAZY_* 标志位
+ * isHashDeleted - 如果访问的是已过期字段且它是哈希中的最后一个字段，
+ *                 则哈希也会被删除，此时 *isHashDeleted 会被置为 1。
  *
- * Returns 1 if the field exists, and 0 when it doesn't.
+ * 返回：1 表示字段存在，0 表示不存在。
  */
 int hashTypeExists(redisDb *db, robj *o, sds field, int hfeFlags, int *isHashDeleted) {
     unsigned char *vstr = NULL;
@@ -829,35 +837,32 @@ int hashTypeExists(redisDb *db, robj *o, sds field, int hfeFlags, int *isHashDel
     return (res == GETF_OK) ? 1 : 0;
 }
 
-/* Add a new field, overwrite the old with the new value if it already exists.
- * Return 0 on insert and 1 on update.
+/* 添加一个新字段，如果字段已存在则用新值覆盖旧值。
+ * 插入返回 0，更新返回 1。
  *
- * By default, the key and value SDS strings are copied if needed, so the
- * caller retains ownership of the strings passed. However this behavior
- * can be effected by passing appropriate flags (possibly bitwise OR-ed):
+ * 默认情况下，如果需要会对 key 和 value 的 SDS 字符串进行复制，
+ * 因此调用者保留所传入字符串的所有权。但可以通过传递适当的标志
+ * （可以按位或组合）来改变这一行为：
  *
- * HASH_SET_TAKE_FIELD  -- The SDS field ownership passes to the function.
- * HASH_SET_TAKE_VALUE  -- The SDS value ownership passes to the function.
- * HASH_SET_KEEP_TTL --  keep original TTL if field already exists
+ * HASH_SET_TAKE_FIELD  -- 将 SDS 字段的所有权移交给本函数
+ * HASH_SET_TAKE_VALUE  -- 将 SDS 值的所有权移交给本函数
+ * HASH_SET_KEEP_TTL    -- 如果字段已存在，保留其原有的 TTL
  *
- * When the flags are used the caller does not need to release the passed
- * SDS string(s). It's up to the function to use the string to create a new
- * entry or to free the SDS string before returning to the caller.
+ * 当使用上述标志时，调用者无需释放所传入的 SDS 字符串。
+ * 由本函数负责使用这些字符串创建新条目，或在返回前释放 SDS 字符串。
  *
- * HASH_SET_COPY corresponds to no flags passed, and means the default
- * semantics of copying the values if needed.
- *
+ * HASH_SET_COPY 对应于不传任何标志，表示默认的按需复制语义。
  */
-#define HASH_SET_TAKE_FIELD  (1<<0)
-#define HASH_SET_TAKE_VALUE  (1<<1)
-#define HASH_SET_KEEP_TTL (1<<2)
-#define HASH_SET_COPY 0
+#define HASH_SET_TAKE_FIELD  (1<<0)  /* 接管字段的所有权 */
+#define HASH_SET_TAKE_VALUE  (1<<1)  /* 接管值的所有权 */
+#define HASH_SET_KEEP_TTL (1<<2)     /* 保留原字段的 TTL */
+#define HASH_SET_COPY 0              /* 默认：按需复制 */
 int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
     int update = 0;
 
-    /* Check if the field is too long for listpack, and convert before adding the item.
-     * This is needed for HINCRBY* case since in other commands this is handled early by
-     * hashTypeTryConversion, so this check will be a NOP. */
+    /* 检查字段或值是否过长而不适合 listpack，若过长则先转换。
+     * 此检查主要用于 HINCRBY* 命令。其他命令通常在更早的
+     * hashTypeTryConversion 中已经处理，此处相当于空操作。 */
     if (o->encoding == OBJ_ENCODING_LISTPACK  ||
         o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         if (sdslen(field) > server.hash_max_listpack_value || sdslen(value) > server.hash_max_listpack_value)
@@ -872,24 +877,24 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
         if (fptr != NULL) {
             fptr = lpFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
             if (fptr != NULL) {
-                /* Grab pointer to the value (fptr points to the field) */
+                /* 获取指向 value 的指针（fptr 指向 field） */
                 vptr = lpNext(zl, fptr);
                 serverAssert(vptr != NULL);
 
-                /* Replace value */
+                /* 替换 value */
                 zl = lpReplace(zl, &vptr, (unsigned char*)value, sdslen(value));
                 update = 1;
             }
         }
 
         if (!update) {
-            /* Push new field/value pair onto the tail of the listpack */
+            /* 将新 field/value 对追加到 listpack 尾部 */
             zl = lpAppend(zl, (unsigned char*)field, sdslen(field));
             zl = lpAppend(zl, (unsigned char*)value, sdslen(value));
         }
         o->ptr = zl;
 
-        /* Check if the listpack needs to be converted to a hash table */
+        /* 检查是否需要将 listpack 转换为哈希表 */
         if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
             hashTypeConvert(o, OBJ_ENCODING_HT, &db->hexpires);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
@@ -901,11 +906,11 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
         if (fptr != NULL) {
             fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, sdslen(field), 2);
             if (fptr != NULL) {
-                /* Grab pointer to the value (fptr points to the field) */
+                /* 获取指向 value 的指针（fptr 指向 field） */
                 vptr = lpNext(lpt->lp, fptr);
                 serverAssert(vptr != NULL);
 
-                /* Replace value */
+                /* 替换 value */
                 lpt->lp = lpReplace(lpt->lp, &vptr, (unsigned char *) value, sdslen(value));
                 update = 1;
 
@@ -916,9 +921,9 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
                 serverAssert(tptr && lpGetIntegerValue(tptr, &expireTime));
 
                 if (flags & HASH_SET_KEEP_TTL) {
-                    /* keep old field along with TTL */
+                    /* 保留旧字段及其 TTL */
                 } else if (expireTime != HASH_LP_NO_TTL) {
-                    /* re-insert field and override TTL */
+                    /* 重新插入字段并覆盖 TTL */
                     listpackExUpdateExpiry(o, field, fptr, vptr, HASH_LP_NO_TTL);
                 }
             }
@@ -928,7 +933,7 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
             listpackExAddNew(o, field, sdslen(field), value, sdslen(value),
                              HASH_LP_NO_TTL);
 
-        /* Check if the listpack needs to be converted to a hash table */
+        /* 检查是否需要将 listpack 转换为哈希表 */
         if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
             hashTypeConvert(o, OBJ_ENCODING_HT, &db->hexpires);
 
@@ -937,18 +942,18 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
         dict *ht = o->ptr;
         dictEntry *de, *existing;
 
-        /* stored key is different than lookup key */
+        /* 存储键与查找键不同 */
         dictUseStoredKeyApi(ht, 1);
         de = dictAddRaw(ht, newField, &existing);
         dictUseStoredKeyApi(ht, 0);
 
-        /* If field already exists, then update "field". "Value" will be set afterward */
+        /* 如果字段已存在，则更新 "field"。"Value" 稍后设置 */
         if (de == NULL) {
             if (flags & HASH_SET_KEEP_TTL) {
-                /* keep old field along with TTL */
+                /* 保留旧字段及其 TTL */
                 hfieldFree(newField);
             } else {
-                /* If attached TTL to the old field, then remove it from hash's private ebuckets */
+                /* 如果旧字段挂接了 TTL，则从哈希的私有 ebuckets 中移除 */
                 hfield oldField = dictGetKey(existing);
                 hfieldPersist(o, oldField);
                 hfieldFree(oldField);
@@ -969,8 +974,7 @@ int hashTypeSet(redisDb *db, robj *o, sds field, sds value, int flags) {
         serverPanic("Unknown hash encoding");
     }
 
-    /* Free SDS strings we did not referenced elsewhere if the flags
-     * want this function to be responsible. */
+    /* 释放未被引用的 SDS 字符串，如果标志表明本函数应负责释放。 */
     if (flags & HASH_SET_TAKE_FIELD && field) sdsfree(field);
     if (flags & HASH_SET_TAKE_VALUE && value) sdsfree(value);
     return update;
@@ -980,7 +984,7 @@ SetExRes hashTypeSetExpiryHT(HashTypeSetEx *exInfo, sds field, uint64_t expireAt
     dict *ht = exInfo->hashObj->ptr;
     dictEntry *existingEntry = NULL;
 
-    /* New field with expiration metadata */
+    /* 使用过期元数据构造新字段 */
     hfield hfNew = hfieldNew(field, sdslen(field), 1 /*withExpireMeta*/);
 
     if ((existingEntry = dictFind(ht, field)) == NULL) {
@@ -990,59 +994,59 @@ SetExRes hashTypeSetExpiryHT(HashTypeSetEx *exInfo, sds field, uint64_t expireAt
 
     hfield hfOld = dictGetKey(existingEntry);
 
-    /* If field doesn't have expiry metadata attached */
+    /* 如果字段没有挂接过期元数据 */
     if (!hfieldIsExpireAttached(hfOld)) {
 
-        /* For fields without expiry, LT condition is considered valid */
+        /* 对于没有过期的字段，LT 条件视为满足 */
         if (exInfo->expireSetCond & (HFE_XX | HFE_GT)) {
             hfieldFree(hfNew);
             return HSETEX_NO_CONDITION_MET;
         }
 
-        /* Delete old field. Below goanna dictSetKey(..,hfNew) */
+        /* 删除旧字段。稍后将通过 dictSetKey(..,hfNew) 替换。 */
         hfieldFree(hfOld);
 
-    } else { /* field has ExpireMeta struct attached */
+    } else { /* 字段挂接了 ExpireMeta 结构 */
 
-        /* No need for hfNew (Just modify expire-time of existing field) */
+        /* 不再需要 hfNew（直接修改现有字段的过期时间） */
         hfieldFree(hfNew);
 
         uint64_t prevExpire = hfieldGetExpireTime(hfOld);
 
-        /* If field has valid expiration time, then check GT|LT|NX */
+        /* 如果字段具有有效的过期时间，则检查 GT|LT|NX */
         if (prevExpire != EB_EXPIRE_TIME_INVALID) {
             if (((exInfo->expireSetCond == HFE_GT) && (prevExpire >= expireAt)) ||
                 ((exInfo->expireSetCond == HFE_LT) && (prevExpire <= expireAt)) ||
                 (exInfo->expireSetCond == HFE_NX) )
                 return HSETEX_NO_CONDITION_MET;
 
-            /* remove old expiry time from hash's private ebuckets */
+            /* 从哈希的私有 ebuckets 中移除旧过期时间 */
             dictExpireMetadata *dm = (dictExpireMetadata *) dictMetadata(ht);
             ebRemove(&dm->hfe, &hashFieldExpireBucketsType, hfOld);
 
-            /* Track of minimum expiration time (only later update global HFE DS) */
+            /* 跟踪最小过期时间（仅稍后更新全局 HFE DS） */
             if (exInfo->minExpireFields > prevExpire)
                 exInfo->minExpireFields = prevExpire;
 
         } else {
-            /* field has invalid expiry. No need to ebRemove() */
+            /* 字段的过期时间无效。无需调用 ebRemove() */
 
-            /* Check XX|LT|GT */
+            /* 检查 XX|LT|GT */
             if (exInfo->expireSetCond & (HFE_XX | HFE_GT))
                 return HSETEX_NO_CONDITION_MET;
         }
 
-        /* Reuse hfOld as hfNew and rewrite its expiry with ebAdd() */
+        /* 复用 hfOld 作为 hfNew，并通过 ebAdd() 重写其过期时间 */
         hfNew = hfOld;
     }
 
     dictSetKey(ht, existingEntry, hfNew);
 
 
-    /* If expired, then delete the field and propagate the deletion.
-     * If replica, continue like the field is valid */
+    /* 如果已过期，则删除该字段并传播删除事件。
+     * 如果是从节点（replica），则按字段有效继续处理。 */
     if (unlikely(checkAlreadyExpired(expireAt))) {
-        /* replicas should not initiate deletion of fields */
+        /* 从节点不应主动删除字段 */
         propagateHashFieldDeletion(exInfo->db, exInfo->key->ptr, field, sdslen(field));
         hashTypeDelete(exInfo->hashObj, field, 1);
         server.stat_expired_subkeys++;
@@ -1060,10 +1064,10 @@ SetExRes hashTypeSetExpiryHT(HashTypeSetEx *exInfo, sds field, uint64_t expireAt
 }
 
 /*
- * Set field expiration
+ * 设置字段过期时间。
  *
- * Take care to call first hashTypeSetExInit() and then call this function.
- * Finally, call hashTypeSetExDone() to notify and update global HFE DS.
+ * 注意必须先调用 hashTypeSetExInit()，然后再调用本函数。
+ * 最后调用 hashTypeSetExDone() 进行通知和更新全局 HFE DS。
  */
 SetExRes hashTypeSetEx(robj *o, sds field, uint64_t expireAt, HashTypeSetEx *exInfo)
 {
@@ -1082,35 +1086,36 @@ SetExRes hashTypeSetEx(robj *o, sds field, uint64_t expireAt, HashTypeSetEx *exI
         if (!fptr)
             return HSETEX_NO_FIELD;
 
-        /* Grab pointer to the value (fptr points to the field) */
+        /* 获取指向 value 的指针（fptr 指向 field） */
         vptr = lpNext(lpt->lp, fptr);
         serverAssert(vptr != NULL);
 
         tptr = lpNext(lpt->lp, vptr);
         serverAssert(tptr && lpGetIntegerValue(tptr, &expireTime));
 
-        /* update TTL */
+        /* 更新 TTL */
         return hashTypeSetExpiryListpack(exInfo, field, fptr, vptr, tptr, expireAt);
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        /* If needed to set the field along with expiry */
+        /* 如果需要在设置字段的同时设置过期时间 */
         return hashTypeSetExpiryHT(exInfo, field, expireAt);
     } else {
         serverPanic("Unknown hash encoding");
     }
 
-    return HSETEX_OK; /* never reach here */
+    return HSETEX_OK; /* 不可达 */
 }
 
+/* 初始化哈希字典的过期元数据。 */
 void initDictExpireMetadata(sds key, robj *o) {
     dict *ht = o->ptr;
 
     dictExpireMetadata *m = (dictExpireMetadata *) dictMetadata(ht);
     m->key = key;
-    m->hfe = ebCreate();     /* Allocate HFE DS */
-    m->expireMeta.trash = 1; /* mark as trash (as long it wasn't ebAdd()) */
+    m->hfe = ebCreate();     /* 分配 HFE DS */
+    m->expireMeta.trash = 1; /* 标记为 trash（只要尚未 ebAdd()） */
 }
 
-/* Init HashTypeSetEx struct before calling hashTypeSetEx() */
+/* 在调用 hashTypeSetEx() 之前初始化 HashTypeSetEx 结构。 */
 int hashTypeSetExInit(robj *key, robj *o, client *c, redisDb *db, const char *cmd,
                       ExpireSetCond expireSetCond, HashTypeSetEx *ex)
 {
@@ -1126,7 +1131,7 @@ int hashTypeSetExInit(robj *key, robj *o, client *c, redisDb *db, const char *cm
     ex->fieldUpdated = 0;
     ex->minExpireFields = EB_EXPIRE_TIME_INVALID;
 
-    /* Take care that HASH support expiration */
+    /* 确保 HASH 支持过期功能 */
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
         hashTypeConvert(o, OBJ_ENCODING_LISTPACK_EX, &c->db->hexpires);
 
@@ -1137,60 +1142,59 @@ int hashTypeSetExInit(robj *key, robj *o, client *c, redisDb *db, const char *cm
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         listpackEx *lpt = o->ptr;
 
-        /* If the hash previously had HFEs but later no longer does, the key ref
-         * (lpt->key) in the hash might become outdated after a MOVE/COPY/RENAME/RESTORE
-         * operation. These commands maintain the key ref only if HFEs are present.
-         * That is, we can only be sure that key ref is valid as long as it is not
-         * "trash". (TODO: dbFind() can be avoided. Instead need to extend the
-         * lookupKey*() to return dictEntry). */
+        /* 如果该哈希之前有 HFE 但之后没有了，在执行 MOVE/COPY/RENAME/RESTORE
+         * 操作后，哈希中的 key 引用（lpt->key）可能会过时。这些命令
+         * 仅在 HFE 存在时才维护 key 引用。也就是说，只有在 key 引用不是
+         * "trash" 时才能确保其有效。
+         * （TODO: 可以避免使用 dbFind()。需要扩展 lookupKey*() 使其
+         *  返回 dictEntry） */
         if (lpt->meta.trash) {
             dictEntry *de = dbFind(c->db, key->ptr);
             serverAssert(de != NULL);
             lpt->key = dictGetKey(de);
         }
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        /* Take care dict has HFE metadata */
+        /* 确保 dict 带有 HFE 元数据 */
         if (!isDictWithMetaHFE(ht)) {
-            /* Realloc (only header of dict) with metadata for hash-field expiration */
+            /* 重新分配（仅 dict 头部）以携带哈希字段过期元数据 */
             dictTypeAddMeta(&ht, &mstrHashDictTypeWithHFE);
             dictExpireMetadata *m = (dictExpireMetadata *) dictMetadata(ht);
             o->ptr = ht;
 
-            /* Find the key in the keyspace. Need to keep reference to the key for
-             * notifications or even removal of the hash */
+            /* 在键空间中查找该 key。需要保留对该 key 的引用，
+             * 以便进行通知或删除哈希。 */
             dictEntry *de = dbFind(db, key->ptr);
             serverAssert(de != NULL);
 
-            /* Fillup dict HFE metadata */
-            m->key = dictGetKey(de); /* reference key in keyspace */
-            m->hfe = ebCreate();     /* Allocate HFE DS */
-            m->expireMeta.trash = 1; /* mark as trash (as long it wasn't ebAdd()) */
+            /* 填充 dict HFE 元数据 */
+            m->key = dictGetKey(de); /* 引用键空间中的 key */
+            m->hfe = ebCreate();     /* 分配 HFE DS */
+            m->expireMeta.trash = 1; /* 标记为 trash（只要尚未 ebAdd()） */
         } else {
             dictExpireMetadata *m = (dictExpireMetadata *) dictMetadata(ht);
-            /* If the hash previously had HFEs but later no longer does, the key ref
-             * (m->key) in the hash might become outdated after a MOVE/COPY/RENAME/RESTORE
-             * operation. These commands maintain the key ref only if HFEs are present.
-             * That is, we can only be sure that key ref is valid as long as it is not
-             * "trash". */
+            /* 如果该哈希之前有 HFE 但之后没有了，哈希中的 key 引用
+             * (m->key) 在 MOVE/COPY/RENAME/RESTORE 操作后可能已过时。
+             * 这些命令仅在 HFE 存在时才维护 key 引用。
+             * 也就是说，只有在 key 引用不是 "trash" 时才能确保其有效。 */
             if (m->expireMeta.trash) {
                 dictEntry *de = dbFind(db, key->ptr);
                 serverAssert(de != NULL);
-                m->key = dictGetKey(de); /* reference key in keyspace */
+                m->key = dictGetKey(de); /* 引用键空间中的 key */
             }
         }
     }
 
-    /* Read minExpire from attached ExpireMeta to the hash */
+    /* 从附加到哈希的 ExpireMeta 中读取 minExpire */
     ex->minExpire = hashTypeGetMinExpire(o, 0);
     return C_OK;
 }
 
 /*
- * After calling hashTypeSetEx() for setting fields or their expiry, call this
- * function to notify and update global HFE DS.
+ * 调用 hashTypeSetEx() 设置字段或过期时间后，调用本函数
+ * 进行通知和更新全局 HFE DS。
  */
 void hashTypeSetExDone(HashTypeSetEx *ex) {
-    /* Notify keyspace event, update dirty count and update global HFE DS */
+    /* 通知键空间事件，更新 dirty 计数，并更新全局 HFE DS */
     if (ex->fieldDeleted + ex->fieldUpdated > 0) {
 
         server.dirty += ex->fieldDeleted + ex->fieldUpdated;
@@ -1204,22 +1208,21 @@ void hashTypeSetExDone(HashTypeSetEx *ex) {
             notifyKeyspaceEvent(NOTIFY_HASH, ex->fieldDeleted ? "hdel" : "hexpire",
                                 ex->key, ex->db->id);
 
-            /* If minimum HFE of the hash is smaller than expiration time of the
-             * specified fields in the command as well as it is smaller or equal
-             * than expiration time provided in the command, then the minimum
-             * HFE of the hash won't change following this command. */
+            /* 如果哈希的最小 HFE 小于命令中指定字段的过期时间，
+             * 同时也小于等于命令中提供的过期时间，则该命令
+             * 不会改变哈希的最小 HFE。 */
             if ((ex->minExpire < ex->minExpireFields))
                 return;
 
-            /* Retrieve new expired time. It might have changed. */
+            /* 获取新的过期时间。可能会发生变化。 */
             uint64_t newMinExpire = hashTypeGetMinExpire(ex->hashObj, 1 /*accurate*/);
 
-            /* Calculate the diff between old minExpire and newMinExpire. If it is
-             * only few seconds, then don't have to update global HFE DS. At the worst
-             * case fields of hash will be active-expired up to few seconds later.
+            /* 计算旧 minExpire 和新 minExpire 之间的差值。
+             * 如果只相差几秒，则无需更新全局 HFE DS。
+             * 在最坏情况下，哈希中的字段也会在几秒后被主动过期。
              *
-             * In any case, active-expire operation will know to update global
-             * HFE DS more efficiently than here for a single item.
+             * 在任何情况下，主动过期操作都比在这里为单个项
+             * 更新全局 HFE DS 更高效。
              */
             uint64_t diff = (ex->minExpire > newMinExpire) ?
                                 (ex->minExpire - newMinExpire) : (newMinExpire - ex->minExpire);
@@ -1233,10 +1236,11 @@ void hashTypeSetExDone(HashTypeSetEx *ex) {
     }
 }
 
-/* Delete an element from a hash.
+/* 从哈希中删除一个元素。
  *
- * Return 1 on deleted and 0 on not found.
- * isSdsField - 1 if the field is sds, 0 if it is hfield */
+ * 返回 1 表示已删除，0 表示未找到。
+ * isSdsField - 1 表示字段是 sds，0 表示字段是 hfield。
+ * 时间复杂度：O(1)（哈希表）或 O(N)（listpack）。 */
 int hashTypeDelete(robj *o, void *field, int isSdsField) {
     int deleted = 0;
     int fieldLen = (isSdsField) ? sdslen((sds)field) : hfieldlen((hfield)field);
@@ -1249,7 +1253,7 @@ int hashTypeDelete(robj *o, void *field, int isSdsField) {
         if (fptr != NULL) {
             fptr = lpFind(zl, fptr, (unsigned char*)field, fieldLen, 1);
             if (fptr != NULL) {
-                /* Delete both of the key and the value. */
+                /* 同时删除 key 和 value。 */
                 zl = lpDeleteRangeWithEntry(zl,&fptr,2);
                 o->ptr = zl;
                 deleted = 1;
@@ -1263,13 +1267,13 @@ int hashTypeDelete(robj *o, void *field, int isSdsField) {
         if (fptr != NULL) {
             fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, fieldLen, 2);
             if (fptr != NULL) {
-                /* Delete field, value and ttl */
+                /* 删除 field、value 和 ttl */
                 lpt->lp = lpDeleteRangeWithEntry(lpt->lp, &fptr, 3);
                 deleted = 1;
             }
         }
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        /* dictDelete() will call dictHfieldDestructor() */
+        /* dictDelete() 会调用 dictHfieldDestructor() */
         dictUseStoredKeyApi((dict*)o->ptr, isSdsField ? 0 : 1);
         if (dictDelete((dict*)o->ptr, field) == C_OK) {
             deleted = 1;
@@ -1282,10 +1286,10 @@ int hashTypeDelete(robj *o, void *field, int isSdsField) {
     return deleted;
 }
 
-/* Return the number of elements in a hash.
+/* 返回哈希中的元素数量。
  *
- * Note, subtractExpiredFields=1 might be pricy in case there are many HFEs
- */
+ * 注意：当 HFE 较多时，subtractExpiredFields=1 可能会比较耗时。
+ * 时间复杂度：O(1) 或 O(已过期字段数)（当 subtractExpiredFields=1 时）。 */
 unsigned long hashTypeLength(const robj *o, int subtractExpiredFields) {
     unsigned long length = ULONG_MAX;
 
@@ -1302,7 +1306,7 @@ unsigned long hashTypeLength(const robj *o, int subtractExpiredFields) {
         dict *d = (dict*)o->ptr;
         if (subtractExpiredFields && isDictWithMetaHFE(d)) {
             dictExpireMetadata *meta = (dictExpireMetadata *) dictMetadata(d);
-            /* If dict registered in global HFE DS */
+            /* 如果 dict 已注册到全局 HFE DS */
             if (meta->expireMeta.trash == 0)
                 expiredItems = ebExpireDryRun(meta->hfe,
                                               &hashFieldExpireBucketsType,
@@ -1341,8 +1345,8 @@ void hashTypeReleaseIterator(hashTypeIterator *hi) {
     zfree(hi);
 }
 
-/* Move to the next entry in the hash. Return C_OK when the next entry
- * could be found and C_ERR when the iterator reaches the end. */
+/* 移动到哈希中的下一条目。当能找到下一条目时返回 C_OK，
+ * 当迭代器到达末尾时返回 C_ERR。 */
 int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
     hi->expire_time = EB_EXPIRE_TIME_INVALID;
     if (hi->encoding == OBJ_ENCODING_LISTPACK) {
@@ -1354,21 +1358,21 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         vptr = hi->vptr;
 
         if (fptr == NULL) {
-            /* Initialize cursor */
+            /* 初始化游标 */
             serverAssert(vptr == NULL);
             fptr = lpFirst(zl);
         } else {
-            /* Advance cursor */
+            /* 前进游标 */
             serverAssert(vptr != NULL);
             fptr = lpNext(zl, vptr);
         }
         if (fptr == NULL) return C_ERR;
 
-        /* Grab pointer to the value (fptr points to the field) */
+        /* 获取指向 value 的指针（fptr 指向 field） */
         vptr = lpNext(zl, fptr);
         serverAssert(vptr != NULL);
 
-        /* fptr, vptr now point to the first or next pair */
+        /* fptr, vptr 现在指向第一对或下一对 */
         hi->fptr = fptr;
         hi->vptr = vptr;
     } else if (hi->encoding == OBJ_ENCODING_LISTPACK_EX) {
@@ -1381,18 +1385,18 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         tptr = hi->tptr;
 
         if (fptr == NULL) {
-            /* Initialize cursor */
+            /* 初始化游标 */
             serverAssert(vptr == NULL);
             fptr = lpFirst(zl);
         } else {
-            /* Advance cursor */
+            /* 前进游标 */
             serverAssert(tptr != NULL);
             fptr = lpNext(zl, tptr);
         }
         if (fptr == NULL) return C_ERR;
 
         while (fptr != NULL) {
-            /* Grab pointer to the value (fptr points to the field) */
+            /* 获取指向 value 的指针（fptr 指向 field） */
             vptr = lpNext(zl, fptr);
             serverAssert(vptr != NULL);
 
@@ -1427,8 +1431,8 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
     return C_OK;
 }
 
-/* Get the field or value at iterator cursor, for an iterator on a hash value
- * encoded as a listpack. Prototype is similar to `hashTypeGetFromListpack`. */
+/* 在迭代器光标处获取字段或值，迭代的对象是 listpack 编码的哈希。
+ * 原型与 `hashTypeGetFromListpack` 类似。 */
 void hashTypeCurrentFromListpack(hashTypeIterator *hi, int what,
                                  unsigned char **vstr,
                                  unsigned int *vlen,
@@ -1448,12 +1452,11 @@ void hashTypeCurrentFromListpack(hashTypeIterator *hi, int what,
         *expireTime = hi->expire_time;
 }
 
-/* Get the field or value at iterator cursor, for an iterator on a hash value
- * encoded as a hash table. Prototype is similar to
- * `hashTypeGetFromHashTable`.
+/* 在迭代器光标处获取字段或值，迭代的对象是哈希表（HT）编码的哈希。
+ * 原型与 `hashTypeGetFromHashTable` 类似。
  *
- * expireTime - If parameter is not null, then the function will return the expire
- *              time of the field. If expiry not set, return EB_EXPIRE_TIME_INVALID
+ * expireTime - 如果参数非空，函数将返回该字段的过期时间。
+ *              如果未设置过期，则返回 EB_EXPIRE_TIME_INVALID。
  */
 void hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, char **str, size_t *len, uint64_t *expireTime) {
     serverAssert(hi->encoding == OBJ_ENCODING_HT);
@@ -1473,16 +1476,13 @@ void hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, char **str, si
         *expireTime = hi->expire_time;
 }
 
-/* Higher level function of hashTypeCurrent*() that returns the hash value
- * at current iterator position.
+/* hashTypeCurrent*() 的更高级版本，返回迭代器当前位置的哈希值。
  *
- * The returned element is returned by reference in either *vstr and *vlen if
- * it's returned in string form, or stored in *vll if it's returned as
- * a number.
+ * 返回的元素按引用方式返回：如果以字符串形式返回，则通过 *vstr 和 *vlen；
+ * 如果以数字形式返回，则通过 *vll 存储。
  *
- * If *vll is populated *vstr is set to NULL, so the caller
- * can always check the function return by checking the return value
- * type checking if vstr == NULL. */
+ * 如果 *vll 被赋值，则 *vstr 会被设为 NULL，
+ * 因此调用者始终可以通过检查返回值以及 vstr 是否为 NULL 来判断。 */
 void hashTypeCurrentObject(hashTypeIterator *hi,
                            int what,
                            unsigned char **vstr,
@@ -1506,8 +1506,7 @@ void hashTypeCurrentObject(hashTypeIterator *hi,
     }
 }
 
-/* Return the key or value at the current iterator position as a new
- * SDS string. */
+/* 将当前迭代器位置的 key 或 value 作为新的 SDS 字符串返回。 */
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
     unsigned char *vstr;
     unsigned int vlen;
@@ -1518,7 +1517,7 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
     return sdsfromlonglong(vll);
 }
 
-/* Return the key at the current iterator position as a new hfield string. */
+/* 将当前迭代器位置的 key 作为新的 hfield 字符串返回。 */
 hfield hashTypeCurrentObjectNewHfield(hashTypeIterator *hi) {
     char buf[LONG_STR_SIZE];
     unsigned char *vstr;
@@ -1550,16 +1549,17 @@ static robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
 }
 
 
+/* 将 listpack 编码的哈希转换为另一种编码。 */
 void hashTypeConvertListpack(robj *o, int enc) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK);
 
     if (enc == OBJ_ENCODING_LISTPACK) {
-        /* Nothing to do... */
+        /* 无需操作... */
 
     } else if (enc == OBJ_ENCODING_LISTPACK_EX) {
         unsigned char *p;
 
-        /* Append HASH_LP_NO_TTL to each field name - value pair. */
+        /* 为每个 field - value 对追加 HASH_LP_NO_TTL。 */
         p = lpFirst(o->ptr);
         while (p != NULL) {
             p = lpNext(o->ptr, p);
@@ -1581,7 +1581,7 @@ void hashTypeConvertListpack(robj *o, int enc) {
         hi = hashTypeInitIterator(o);
         dict = dictCreate(&mstrHashDictType);
 
-        /* Presize the dict to avoid rehashing */
+        /* 预分配 dict 大小以避免 rehash */
         dictExpand(dict,hashTypeLength(o, 0));
 
         while (hashTypeNext(hi, 0) != C_ERR) {
@@ -1592,8 +1592,8 @@ void hashTypeConvertListpack(robj *o, int enc) {
             ret = dictAdd(dict, key, value);
             dictUseStoredKeyApi(dict, 0);
             if (ret != DICT_OK) {
-                hfieldFree(key); sdsfree(value); /* Needed for gcc ASAN */
-                hashTypeReleaseIterator(hi);  /* Needed for gcc ASAN */
+                hfieldFree(key); sdsfree(value); /* gcc ASAN 需要 */
+                hashTypeReleaseIterator(hi);  /* gcc ASAN 需要 */
                 serverLogHexDump(LL_WARNING,"listpack with dup elements dump",
                     o->ptr,lpBytes(o->ptr));
                 serverPanic("Listpack corruption detected");
@@ -1628,10 +1628,10 @@ void hashTypeConvertListpackEx(robj *o, int enc, ebuckets *hexpires) {
         dictExpand(dict,hashTypeLength(o, 0));
         dictExpireMeta = (dictExpireMetadata *) dictMetadata(dict);
 
-        /* Fillup dict HFE metadata */
-        dictExpireMeta->key = lpt->key;       /* reference key in keyspace */
-        dictExpireMeta->hfe = ebCreate();     /* Allocate HFE DS */
-        dictExpireMeta->expireMeta.trash = 1; /* mark as trash (as long it wasn't ebAdd()) */
+        /* 填充 dict HFE 元数据 */
+        dictExpireMeta->key = lpt->key;       /* 引用键空间中的 key */
+        dictExpireMeta->hfe = ebCreate();     /* 分配 HFE DS */
+        dictExpireMeta->expireMeta.trash = 1; /* 标记为 trash（只要尚未 ebAdd()） */
 
         hi = hashTypeInitIterator(o);
 
@@ -1642,8 +1642,8 @@ void hashTypeConvertListpackEx(robj *o, int enc, ebuckets *hexpires) {
             ret = dictAdd(dict, key, value);
             dictUseStoredKeyApi(dict, 0);
             if (ret != DICT_OK) {
-                hfieldFree(key); sdsfree(value); /* Needed for gcc ASAN */
-                hashTypeReleaseIterator(hi);  /* Needed for gcc ASAN */
+                hfieldFree(key); sdsfree(value); /* gcc ASAN 需要 */
+                hashTypeReleaseIterator(hi);  /* gcc ASAN 需要 */
                 serverLogHexDump(LL_WARNING,"listpack with dup elements dump",
                                  lpt->lp,lpBytes(lpt->lp));
                 serverPanic("Listpack corruption detected");
@@ -1678,11 +1678,10 @@ void hashTypeConvert(robj *o, int enc, ebuckets *hexpires) {
     }
 }
 
-/* This is a helper function for the COPY command.
- * Duplicate a hash object, with the guarantee that the returned object
- * has the same encoding as the original one.
+/* 这是 COPY 命令的辅助函数。
+ * 复制一个哈希对象，并保证返回的对象与原始对象具有相同的编码。
  *
- * The resulting object always has refcount set to 1 */
+ * 结果对象的引用计数始终被设置为 1。 */
 robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire) {
     robj *hobj;
     hashTypeIterator *hi;
@@ -1715,20 +1714,20 @@ robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire) {
         dictExpireMetadata *dictExpireMetaSrc, *dictExpireMetaDst = NULL;
         dict *d;
 
-        /* If dict doesn't have HFE metadata, then create a new dict without it */
+        /* 如果 dict 没有 HFE 元数据，则创建一个没有 HFE 元数据的新 dict */
         if (!isDictWithMetaHFE(o->ptr)) {
             d = dictCreate(&mstrHashDictType);
         } else {
-            /* Create a new dict with HFE metadata */
+            /* 创建一个带有 HFE 元数据的新 dict */
             d = dictCreate(&mstrHashDictTypeWithHFE);
             dictExpireMetaSrc = (dictExpireMetadata *) dictMetadata((dict *) o->ptr);
             dictExpireMetaDst = (dictExpireMetadata *) dictMetadata(d);
-            dictExpireMetaDst->key = newkey;         /* reference key in keyspace */
-            dictExpireMetaDst->hfe = ebCreate();     /* Allocate HFE DS */
-            dictExpireMetaDst->expireMeta.trash = 1; /* mark as trash (as long it wasn't ebAdd()) */
+            dictExpireMetaDst->key = newkey;         /* 引用键空间中的 key */
+            dictExpireMetaDst->hfe = ebCreate();     /* 分配 HFE DS */
+            dictExpireMetaDst->expireMeta.trash = 1; /* 标记为 trash（只要尚未 ebAdd()） */
 
-            /* Extract the minimum expire time of the source hash (Will be used by caller
-             * to register the new hash in the global ebuckets, i.e db->hexpires) */
+            /* 提取源哈希的最小过期时间（调用者将使用此值
+             * 将新哈希注册到全局 ebuckets，即 db->hexpires） */
             if (dictExpireMetaSrc->expireMeta.trash == 0)
                 *minHashExpire = ebGetMetaExpTime(&dictExpireMetaSrc->expireMeta);
         }
@@ -1738,7 +1737,7 @@ robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire) {
         while (hashTypeNext(hi, 0) != C_ERR) {
             uint64_t expireTime;
             sds newfield, newvalue;
-            /* Extract a field-value pair from an original hash object.*/
+            /* 从原始哈希对象中提取一个 field-value 对。*/
             char *field, *value;
             size_t fieldLen, valueLen;
             hashTypeCurrentFromHashTable(hi, OBJ_HASH_KEY, &field, &fieldLen, &expireTime);
@@ -1752,7 +1751,7 @@ robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire) {
             hashTypeCurrentFromHashTable(hi, OBJ_HASH_VALUE, &value, &valueLen, NULL);
             newvalue = sdsnewlen(value, valueLen);
 
-            /* Add a field-value pair to a new hash object. */
+            /* 将 field-value 对添加到新哈希对象中。 */
             dictUseStoredKeyApi(d, 1);
             dictAdd(d,newfield,newvalue);
             dictUseStoredKeyApi(d, 0);
@@ -1767,12 +1766,12 @@ robj *hashTypeDup(robj *o, sds newkey, uint64_t *minHashExpire) {
     return hobj;
 }
 
-/* Create a new sds string from the listpack entry. */
+/* 从 listpack 条目创建一个新的 sds 字符串。 */
 sds hashSdsFromListpackEntry(listpackEntry *e) {
     return e->sval ? sdsnewlen(e->sval, e->slen) : sdsfromlonglong(e->lval);
 }
 
-/* Reply with bulk string from the listpack entry. */
+/* 从 listpack 条目以 bulk string 形式回复客户端。 */
 void hashReplyFromListpackEntry(client *c, listpackEntry *e) {
     if (e->sval)
         addReplyBulkCBuffer(c, e->sval, e->slen);
@@ -1780,10 +1779,10 @@ void hashReplyFromListpackEntry(client *c, listpackEntry *e) {
         addReplyBulkLongLong(c, e->lval);
 }
 
-/* Return random element from a non empty hash.
- * 'key' and 'val' will be set to hold the element.
- * The memory in them is not to be freed or modified by the caller.
- * 'val' can be NULL in which case it's not extracted. */
+/* 从非空哈希中返回一个随机元素。
+ * 'key' 和 'val' 会被设置为该元素。
+ * 它们指向的内存不应由调用者释放或修改。
+ * 'val' 可以为 NULL，此时不会提取值。 */
 void hashTypeRandomElement(robj *hashobj, unsigned long hashsize, CommonEntry *key, CommonEntry *val) {
     if (hashobj->encoding == OBJ_ENCODING_HT) {
         dictEntry *de = dictGetFairRandomKey(hashobj->ptr);
@@ -1806,49 +1805,48 @@ void hashTypeRandomElement(robj *hashobj, unsigned long hashsize, CommonEntry *k
 }
 
 /*
- * Active expiration of fields in hash
+ * 哈希字段的主动过期
  *
- * Called by hashTypeDbActiveExpire() for each hash registered in the HFE DB
- * (db->hexpires) with an expiration-time less than or equal current time.
+ * 由 hashTypeDbActiveExpire() 针对每个在 HFE DB (db->hexpires) 中注册，
+ * 且过期时间小于或等于当前时间的哈希调用。
  *
- * This callback performs the following actions for each hash:
- * - Delete expired fields as by calling ebExpire(hash)
- * - If afterward there are future fields to expire, it will update the hash in
- *   HFE DB with the next hash-field minimum expiration time by returning
- *   ACT_UPDATE_EXP_ITEM.
- * - If the hash has no more fields to expire, it is removed from the HFE DB
- *   by returning ACT_REMOVE_EXP_ITEM.
- * - If hash has no more fields afterward, it will remove the hash from keyspace.
+ * 此回调对每个哈希执行以下操作：
+ * - 通过调用 ebExpire(hash) 删除已过期字段
+ * - 之后如果还有待过期字段，则返回 ACT_UPDATE_EXP_ITEM 将该哈希
+ *   在 HFE DB 中的过期时间更新为下一个最早的字段过期时间
+ * - 如果哈希没有更多待过期字段，则通过返回 ACT_REMOVE_EXP_ITEM
+ *   将其从 HFE DB 中移除
+ * - 之后如果哈希已无任何字段，则会从键空间中删除该哈希。
  */
 static ExpireAction hashTypeActiveExpire(eItem item, void *ctx) {
     ExpireCtx *expireCtx = ctx;
 
-    /* If no more quota left for this callback, stop */
+    /* 如果此回调的配额已用尽，则停止 */
     if (expireCtx->fieldsToExpireQuota == 0)
         return ACT_STOP_ACTIVE_EXP;
 
     uint64_t nextExpTime = hashTypeExpire((robj *) item, expireCtx, 0);
 
-    /* If hash has no more fields to expire or got deleted, indicate
-     * to remove it from HFE DB to the caller ebExpire() */
+    /* 如果哈希没有更多字段可过期或已被删除，
+     * 通知调用方 ebExpire() 将其从 HFE DB 中移除。 */
     if (nextExpTime == EB_EXPIRE_TIME_INVALID || nextExpTime == 0) {
         return ACT_REMOVE_EXP_ITEM;
     } else {
-        /* Hash has more fields to expire. Update next expiration time of the hash
-         * and indicate to add it back to global HFE DS */
+        /* 哈希还有更多字段要过期。更新哈希的下一个过期时间，
+         * 并通知调用方将其重新添加到全局 HFE DS */
         ebSetMetaExpTime(hashGetExpireMeta(item), nextExpTime);
         return ACT_UPDATE_EXP_ITEM;
     }
 }
 
-/* Delete all expired fields from the hash and delete the hash if left empty.
+/* 删除哈希中所有已过期字段，并在哈希为空时删除该哈希。
  *
- * updateGlobalHFE - If the hash should be updated in the global HFE DS with new
- *                   expiration time in case expired fields were deleted.
+ * updateGlobalHFE - 如果在删除已过期字段后应当用新的过期时间
+ *                   更新全局 HFE DS 中的该哈希，则置 1。
  *
- * Return next Expire time of the hash
- * - 0 if hash got deleted
- * - EB_EXPIRE_TIME_INVALID if no more fields to expire
+ * 返回该哈希的下一个过期时间：
+ * - 0 表示哈希已被删除
+ * - EB_EXPIRE_TIME_INVALID 表示没有更多字段需要过期
  */
 static uint64_t hashTypeExpire(robj *o, ExpireCtx *expireCtx, int updateGlobalHFE) {
     uint64_t noExpireLeftRes = EB_EXPIRE_TIME_INVALID;
@@ -1883,12 +1881,12 @@ static uint64_t hashTypeExpire(robj *o, ExpireCtx *expireCtx, int updateGlobalHF
         keystr = dictExpireMeta->key;
     }
 
-    /* Update quota left */
+    /* 更新剩余配额 */
     expireCtx->fieldsToExpireQuota -= info.itemsExpired;
 
-    /* In some cases, a field might have been deleted without updating the global DS.
-     * As a result, active-expire might not expire any fields, in such cases,
-     * we don't need to send notifications or perform other operations for this key. */
+    /* 在某些情况下，字段可能在未更新全局 DS 的情况下被删除。
+     * 结果，主动过期可能不会过期任何字段，
+     * 在这种情况下，我们无需为该 key 发送通知或执行其他操作。 */
     if (info.itemsExpired) {
         robj *key = createStringObject(keystr, sdslen(keystr));
         notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", key, db->id);
@@ -1914,40 +1912,39 @@ static uint64_t hashTypeExpire(robj *o, ExpireCtx *expireCtx, int updateGlobalHF
     return (info.nextExpireTime == EB_EXPIRE_TIME_INVALID) ? noExpireLeftRes : info.nextExpireTime;
 }
 
-/* Delete all expired fields in hash if needed (Currently used only by HRANDFIELD)
+/* 如有必要，删除哈希中所有已过期字段（目前仅由 HRANDFIELD 使用）。
  *
- * Return 1 if the entire hash was deleted, 0 otherwise.
- * This function might be pricy in case there are many expired fields.
+ * 如果整个哈希被删除则返回 1，否则返回 0。
+ * 如果存在大量已过期字段，本函数可能比较耗时。
  */
 static int hashTypeExpireIfNeeded(redisDb *db, robj *o) {
     uint64_t nextExpireTime;
     uint64_t minExpire = hashTypeGetMinExpire(o, 1 /*accurate*/);
 
-    /* Nothing to expire */
+    /* 无需过期 */
     if ((mstime_t) minExpire >= commandTimeSnapshot())
         return 0;
 
-    /* Follow expireIfNeeded() conditions of when not lazy-expire */
+    /* 参照 expireIfNeeded() 中不进行惰性过期的条件 */
     if ( (server.loading) ||
          (server.lazy_expire_disabled) ||
-         (server.masterhost) ||  /* master-client or user-client, don't delete */
+         (server.masterhost) ||  /* 主节点客户端或用户客户端，不删除 */
          (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)))
         return 0;
 
-    /* Take care to expire all the fields */
+    /* 注意过期所有字段 */
     ExpireCtx expireCtx = { .db = db, .fieldsToExpireQuota = UINT32_MAX };
     nextExpireTime = hashTypeExpire(o, &expireCtx, 1);
     /* return 1 if the entire hash was deleted */
     return nextExpireTime == 0;
 }
 
-/* Return the next/minimum expiry time of the hash-field.
- * accurate=1 - Return the exact time by looking into the object DS.
- * accurate=0 - Return the minimum expiration time maintained in expireMeta
- *              (Verify it is not trash before using it) which might not be
- *              accurate due to optimization reasons.
+/* 返回哈希字段的下一个/最小过期时间。
+ * accurate=1 - 通过查找对象数据结构返回精确时间。
+ * accurate=0 - 返回 expireMeta 中维护的最小过期时间
+ *              （使用前需确认其不是 trash），由于优化原因可能并不精确。
  *
- * If not found, return EB_EXPIRE_TIME_INVALID
+ * 如果未找到，返回 EB_EXPIRE_TIME_INVALID。
  */
 uint64_t hashTypeGetMinExpire(robj *o, int accurate) {
     ExpireMeta *expireMeta = NULL;
@@ -1968,7 +1965,8 @@ uint64_t hashTypeGetMinExpire(robj *o, int accurate) {
             expireMeta = &((dictExpireMetadata *) dictMetadata(d))->expireMeta;
         }
 
-        /* Keep aside next hash-field expiry before updating HFE DS. Verify it is not trash */
+        /* 在更新 HFE DS 之前保留下一个哈希字段过期时间。
+         * 验证其不是 trash。 */
         if (expireMeta->trash == 1)
             return EB_EXPIRE_TIME_INVALID;
 
@@ -1997,14 +1995,14 @@ uint64_t hashTypeRemoveFromExpires(ebuckets *hexpires, robj *o) {
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
         return EB_EXPIRE_TIME_INVALID;
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        /* If dict doesn't holds HFE metadata */
+        /* 如果 dict 没有携带 HFE 元数据 */
         if (!isDictWithMetaHFE(o->ptr))
             return EB_EXPIRE_TIME_INVALID;
     }
 
     uint64_t expireTime = ebGetExpireTime(&hashExpireBucketsType, o);
 
-    /* If registered in global HFE DS then remove it (not trash) */
+    /* 如果已注册到全局 HFE DS，则移除（不是 trash） */
     if (expireTime != EB_EXPIRE_TIME_INVALID)
         ebRemove(hexpires, &hashExpireBucketsType, o);
 
@@ -2018,7 +2016,7 @@ int hashTypeIsFieldsWithExpire(robj *o) {
         return EB_EXPIRE_TIME_INVALID != listpackExGetMinExpire(o);
     } else { /* o->encoding == OBJ_ENCODING_HT */
         dict *d = o->ptr;
-        /* If dict doesn't holds HFE metadata */
+        /* 如果 dict 没有携带 HFE 元数据 */
         if (!isDictWithMetaHFE(d))
             return 0;
         dictExpireMetadata *meta = (dictExpireMetadata *) dictMetadata(d);
@@ -2026,16 +2024,15 @@ int hashTypeIsFieldsWithExpire(robj *o) {
     }
 }
 
-/* Add hash to global HFE DS and update key for notifications.
+/* 将哈希添加到全局 HFE DS，并更新通知所需的 key。
  *
- * key         - must be the same key instance that is persisted in db->dict
- * expireTime  - expiration in msec.
- *               If eq. 0 then the hash will be added to the global HFE DS with
- *               the minimum expiration time that is already written in advance
- *               to attached metadata (which considered as trash as long as it is
- *               not attached to global HFE DS).
+ * key         - 必须是持久化在 db->dict 中的同一个 key 实例。
+ * expireTime  - 过期时间（毫秒）。
+ *               如果为 0，则哈希将以已经预先写入附加元数据
+ *               （在未挂接到全局 HFE DS 之前被视为 trash）的最小过期时间
+ *               被添加到全局 HFE DS。
  *
- * Precondition: It is a hash of type listpackex or HT with HFE metadata.
+ * 前置条件：哈希是 listpackex 类型或带有 HFE 元数据的 HT 类型。
  */
 void hashTypeAddToExpires(redisDb *db, sds key, robj *hashObj, uint64_t expireTime) {
     if (expireTime > EB_EXPIRE_TIME_MAX)
@@ -2057,18 +2054,16 @@ void hashTypeAddToExpires(redisDb *db, sds key, robj *hashObj, uint64_t expireTi
     }
 }
 
-/* DB active expire and update hashes with time-expiration on fields.
+/* 数据库级主动过期，并更新字段上具有时间过期的哈希。
  *
- * The callback function hashTypeActiveExpire() is invoked for each hash registered
- * in the HFE DB (db->expires) with an expiration-time less than or equal to the
- * current time. This callback performs the following actions for each hash:
- * - If the hash has one or more fields to expire, it will delete those fields.
- * - If there are more fields to expire, it will update the hash with the next
- *   expiration time in HFE DB.
- * - If the hash has no more fields to expire, it is removed from the HFE DB.
- * - If the hash has no more fields, it is removed from the main DB.
+ * 对每个在 HFE DB (db->hexpires) 中注册且过期时间小于或等于当前时间的哈希，
+ * 都会调用回调函数 hashTypeActiveExpire()。该回调对每个哈希执行以下操作：
+ * - 如果哈希有一个或多个字段需要过期，则删除这些字段。
+ * - 如果还有更多字段需要过期，则在 HFE DB 中用下一个过期时间更新该哈希。
+ * - 如果哈希没有更多字段需要过期，则将其从 HFE DB 中移除。
+ * - 如果哈希已无任何字段，则将其从主 DB 中删除。
  *
- * Returns number of fields active-expired.
+ * 返回主动过期的字段数量。
  */
 uint64_t hashTypeDbActiveExpire(redisDb *db, uint32_t maxFieldsToExpire) {
     ExpireCtx ctx = { .db = db, .fieldsToExpireQuota = maxFieldsToExpire };
@@ -2081,14 +2076,14 @@ uint64_t hashTypeDbActiveExpire(redisDb *db, uint32_t maxFieldsToExpire) {
 
     ebExpire(&db->hexpires, &hashExpireBucketsType, &info);
 
-    /* Return number of fields active-expired */
+    /* 返回主动过期的字段数量 */
     return maxFieldsToExpire - ctx.fieldsToExpireQuota;
 }
 
 void hashTypeFree(robj *o) {
     switch (o->encoding) {
         case OBJ_ENCODING_HT:
-            /* Verify hash is not registered in global HFE ds */
+            /* 验证哈希未注册到全局 HFE DS */
             if (isDictWithMetaHFE((dict*)o->ptr)) {
                 dictExpireMetadata *m = (dictExpireMetadata *)dictMetadata((dict*)o->ptr);
                 serverAssert(m->expireMeta.trash == 1);
@@ -2099,7 +2094,7 @@ void hashTypeFree(robj *o) {
             lpFree(o->ptr);
             break;
         case OBJ_ENCODING_LISTPACK_EX:
-            /* Verify hash is not registered in global HFE ds */
+            /* 验证哈希未注册到全局 HFE DS */
             serverAssert(((listpackEx *) o->ptr)->meta.trash == 1);
             listpackExFree(o->ptr);
             break;
@@ -2109,7 +2104,7 @@ void hashTypeFree(robj *o) {
     }
 }
 
-/* Attempts to update the reference to the new key. Now it's only used in defrag. */
+/* 尝试更新对新 key 的引用。目前仅在 defrag 中使用。 */
 void hashTypeUpdateKeyRef(robj *o, sds newkey) {
     if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         listpackEx *lpt = o->ptr;
@@ -2118,7 +2113,7 @@ void hashTypeUpdateKeyRef(robj *o, sds newkey) {
         dictExpireMetadata *dictExpireMeta = (dictExpireMetadata *)dictMetadata((dict*)o->ptr);
         dictExpireMeta->key = newkey;
     } else {
-        /* Nothing to do. */
+        /* 无需操作。 */
     }
 }
 
@@ -2128,9 +2123,13 @@ ebuckets *hashTypeGetDictMetaHFE(dict *d) {
 }
 
 /*-----------------------------------------------------------------------------
- * Hash type commands
+ * 哈希类型命令
  *----------------------------------------------------------------------------*/
 
+/* HSETNX 命令实现。
+ * 仅当字段不存在时设置其值。
+ * 设置成功返回 1，字段已存在返回 0。
+ * 时间复杂度：O(1) */
 void hsetnxCommand(client *c) {
     int isHashDeleted;
     robj *o;
@@ -2141,7 +2140,7 @@ void hsetnxCommand(client *c) {
         return;
     }
 
-    /* Field expired and in turn hash deleted. Create new one! */
+    /* 字段已过期进而导致哈希被删除。创建新哈希！ */
     if (isHashDeleted) {
         o = createHashObject();
         dbAdd(c->db,c->argv[1],o);
@@ -2155,6 +2154,11 @@ void hsetnxCommand(client *c) {
     server.dirty++;
 }
 
+/* HSET 命令实现。
+ * 在哈希中设置一个或多个 field-value 对。
+ * 返回新添加的字段数量（HSET）。
+ * HMSET（已弃用）返回 OK 字符串。
+ * 时间复杂度：O(N)，N 为要设置的字段数。 */
 void hsetCommand(client *c) {
     int i, created = 0;
     robj *o;
@@ -2184,6 +2188,9 @@ void hsetCommand(client *c) {
     server.dirty += (c->argc - 2)/2;
 }
 
+/* HINCRBY 命令实现。
+ * 将哈希中指定字段的整数值增加指定增量。返回更新后的值。
+ * 时间复杂度：O(1) */
 void hincrbyCommand(client *c) {
     long long value, incr, oldvalue;
     robj *o;
@@ -2202,11 +2209,11 @@ void hincrbyCommand(client *c) {
                 addReplyError(c,"hash value is not an integer");
                 return;
             }
-        } /* Else hashTypeGetValue() already stored it into &value */
+        } /* 否则 hashTypeGetValue() 已经将其存储到 &value 中 */
     } else if ((res == GETF_NOT_FOUND) || (res == GETF_EXPIRED)) {
         value = 0;
     } else {
-        /* Field expired and in turn hash deleted. Create new one! */
+        /* 字段已过期进而导致哈希被删除。创建新哈希！ */
         o = createHashObject();
         dbAdd(c->db,c->argv[1],o);
         value = 0;
@@ -2227,6 +2234,9 @@ void hincrbyCommand(client *c) {
     server.dirty++;
 }
 
+/* HINCRBYFLOAT 命令实现。
+ * 将哈希中指定字段的浮点数值增加指定增量。返回更新后的值。
+ * 时间复杂度：O(1) */
 void hincrbyfloatCommand(client *c) {
     long double value, incr;
     long long ll;
@@ -2255,7 +2265,7 @@ void hincrbyfloatCommand(client *c) {
     } else if ((res == GETF_NOT_FOUND) || (res == GETF_EXPIRED)) {
         value = 0;
     } else {
-        /* Field expired and in turn hash deleted. Create new one! */
+        /* 字段已过期进而导致哈希被删除。创建新哈希！ */
         o = createHashObject();
         dbAdd(c->db,c->argv[1],o);
         value = 0;
@@ -2276,9 +2286,9 @@ void hincrbyfloatCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_HASH,"hincrbyfloat",c->argv[1],c->db->id);
     server.dirty++;
 
-    /* Always replicate HINCRBYFLOAT as an HSET command with the final value
-     * in order to make sure that differences in float precision or formatting
-     * will not create differences in replicas or after an AOF restart. */
+    /* 始终将 HINCRBYFLOAT 复制为带有最终值的 HSET 命令，
+     * 以确保浮点精度或格式上的差异不会在从节点上
+     * 或 AOF 重启后产生不一致。 */
     robj *newobj;
     newobj = createRawStringObject(buf,len);
     rewriteClientCommandArgument(c,0,shared.hset);
@@ -2309,6 +2319,9 @@ static GetFieldRes addHashFieldToReply(client *c, robj *o, sds field, int hfeFla
     return res;
 }
 
+/* HGET 命令实现。
+ * 返回指定字段的值；字段不存在返回 nil。
+ * 时间复杂度：O(1) */
 void hgetCommand(client *c) {
     robj *o;
 
@@ -2318,14 +2331,17 @@ void hgetCommand(client *c) {
     addHashFieldToReply(c, o, c->argv[2]->ptr, HFE_LAZY_EXPIRE);
 }
 
+/* HMGET 命令实现。
+ * 一次返回多个字段的值；不存在的字段返回 nil。
+ * 时间复杂度：O(N)，N 为要获取的字段数。 */
 void hmgetCommand(client *c) {
     GetFieldRes res = GETF_OK;
     robj *o;
     int i;
     int expired = 0, deleted = 0;
 
-    /* Don't abort when the key cannot be found. Non-existing keys are empty
-     * hashes, where HMGET should respond with a series of null bulks. */
+    /* 当 key 找不到时不要中止。不存在的 key 等价于空哈希，
+     * HMGET 应返回一系列 null bulk。 */
     o = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c,o,OBJ_HASH)) return;
 
@@ -2336,8 +2352,8 @@ void hmgetCommand(client *c) {
             expired += (res == GETF_EXPIRED);
             deleted += (res == GETF_EXPIRED_HASH);
         } else {
-            /* If hash got lazy expired since all fields are expired (o is invalid),
-             * then fill the rest with trivial nulls and return. */
+            /* 如果哈希因所有字段都过期而被惰性删除（o 已无效），
+             * 则用 null 填充剩余响应并返回。 */
             addReplyNull(c);
         }
     }
@@ -2349,6 +2365,9 @@ void hmgetCommand(client *c) {
     }
 }
 
+/* HDEL 命令实现。
+ * 从哈希中删除一个或多个指定字段。返回被成功删除的字段数量。
+ * 时间复杂度：O(N)，N 为要删除的字段数。 */
 void hdelCommand(client *c) {
     robj *o;
     int j, deleted = 0, keyremoved = 0;
@@ -2356,12 +2375,11 @@ void hdelCommand(client *c) {
     if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,o,OBJ_HASH)) return;
 
-    /* Hash field expiration is optimized to avoid frequent update global HFE DS for
-     * each field deletion. Eventually active-expiration will run and update or remove
-     * the hash from global HFE DS gracefully. Nevertheless, statistic "subexpiry"
-     * might reflect wrong number of hashes with HFE to the user if it is the last
-     * field with expiration. The following logic checks if this is indeed the last
-     * field with expiration and removes it from global HFE DS. */
+    /* 哈希字段过期经过优化，以避免在每次字段删除时频繁更新全局 HFE DS。
+     * 最终主动过期会运行并优雅地更新全局 HFE DS 或从中移除哈希。
+     * 但是，如果这是最后一个带过期的字段，则 "subexpiry" 统计信息
+     * 可能会向用户反映错误的 HFE 哈希数量。下面的逻辑检查这
+     * 是否确实是最后一个带过期的字段，并将其从全局 HFE DS 中移除。 */
     int isHFE = hashTypeIsFieldsWithExpire(o);
 
     for (j = 2; j < c->argc; j++) {
@@ -2389,6 +2407,9 @@ void hdelCommand(client *c) {
     addReplyLongLong(c,deleted);
 }
 
+/* HLEN 命令实现。
+ * 返回哈希中包含的字段数量。
+ * 时间复杂度：O(1) */
 void hlenCommand(client *c) {
     robj *o;
 
@@ -2398,6 +2419,9 @@ void hlenCommand(client *c) {
     addReplyLongLong(c,hashTypeLength(o, 0));
 }
 
+/* HSTRLEN 命令实现。
+ * 返回哈希中指定字段值的长度。字段不存在返回 0。
+ * 时间复杂度：O(1) */
 void hstrlenCommand(client *c) {
     robj *o;
     unsigned char *vstr = NULL;
@@ -2442,6 +2466,9 @@ static void addHashIteratorCursorToReply(client *c, hashTypeIterator *hi, int wh
     }
 }
 
+/* HGETALL/HKEYS/HVALS 命令的通用实现。
+ * 根据 flags 决定返回 key、value 或两者。
+ * 时间复杂度：O(N) */
 void genericHgetallCommand(client *c, int flags) {
     robj *o;
     hashTypeIterator *hi;
@@ -2452,8 +2479,8 @@ void genericHgetallCommand(client *c, int flags) {
     if ((o = lookupKeyReadOrReply(c,c->argv[1],emptyResp))
         == NULL || checkType(c,o,OBJ_HASH)) return;
 
-    /* We return a map if the user requested keys and values, like in the
-     * HGETALL case. Otherwise to use a flat array makes more sense. */
+    /* 如果用户同时请求 key 和 value（如 HGETALL 命令），
+     * 则以 map 形式返回；否则使用扁平数组更合适。 */
     length = hashTypeLength(o, 1 /*subtractExpiredFields*/);
     if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) {
         addReplyMapLen(c, length);
@@ -2463,8 +2490,8 @@ void genericHgetallCommand(client *c, int flags) {
 
     hi = hashTypeInitIterator(o);
 
-    /* Skip expired fields if the hash has an expire time set at global HFE DS. We could
-     * set it to constant 1, but then it will make another lookup for each field expiration */
+    /* 如果哈希在全局 HFE DS 中设置了过期时间，则跳过已过期字段。
+     * 这里也可以直接置为 1，但那样会为每个字段过期做一次额外查找。 */
     int skipExpiredFields = (EB_EXPIRE_TIME_INVALID == hashTypeGetMinExpire(o, 0)) ? 0 : 1;
 
     while (hashTypeNext(hi, skipExpiredFields) != C_ERR) {
@@ -2480,23 +2507,35 @@ void genericHgetallCommand(client *c, int flags) {
 
     hashTypeReleaseIterator(hi);
 
-    /* Make sure we returned the right number of elements. */
+    /* 确保返回的元素数量正确。 */
     if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) count /= 2;
     serverAssert(count == length);
 }
 
+/* HKEYS 命令实现。
+ * 返回哈希中所有字段名。
+ * 时间复杂度：O(N) */
 void hkeysCommand(client *c) {
     genericHgetallCommand(c,OBJ_HASH_KEY);
 }
 
+/* HVALS 命令实现。
+ * 返回哈希中所有字段的值。
+ * 时间复杂度：O(N) */
 void hvalsCommand(client *c) {
     genericHgetallCommand(c,OBJ_HASH_VALUE);
 }
 
+/* HGETALL 命令实现。
+ * 返回哈希中所有字段及其值。
+ * 时间复杂度：O(N) */
 void hgetallCommand(client *c) {
     genericHgetallCommand(c,OBJ_HASH_KEY|OBJ_HASH_VALUE);
 }
 
+/* HEXISTS 命令实现。
+ * 判断哈希中是否存在指定字段。存在返回 1，否则返回 0。
+ * 时间复杂度：O(1) */
 void hexistsCommand(client *c) {
     robj *o;
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
@@ -2506,6 +2545,9 @@ void hexistsCommand(client *c) {
                                 shared.cone : shared.czero);
 }
 
+/* HSCAN 命令实现。
+ * 增量迭代哈希中的 field-value 对。
+ * 时间复杂度：O(1) 每次调用（总体 O(N)）。 */
 void hscanCommand(client *c) {
     robj *o;
     unsigned long long cursor;
@@ -2534,16 +2576,16 @@ static void hrandfieldReplyWithListpack(client *c, unsigned int count, listpackE
     }
 }
 
-/* How many times bigger should be the hash compared to the requested size
- * for us to not use the "remove elements" strategy? Read later in the
- * implementation for more info. */
+/* 与请求大小相比，哈希需要多大才不会采用"删除元素"策略？
+ * 请参考后续实现中的说明。 */
 #define HRANDFIELD_SUB_STRATEGY_MUL 3
 
-/* If client is trying to ask for a very large number of random elements,
- * queuing may consume an unlimited amount of memory, so we want to limit
- * the number of randoms per time. */
+/* 如果客户端请求非常多的随机元素，队列可能会消耗无限多的内存，
+ * 因此我们需要限制每次随机的数量。 */
 #define HRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
 
+/* HRANDFIELD count [WITHVALUES] 命令的内部实现。
+ * 详见 hrandfieldCommand() 中的说明。 */
 void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
     unsigned long count, size;
     int uniq = 1;
@@ -2559,16 +2601,16 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
         uniq = 0;
     }
 
-    /* Delete all expired fields. If the entire hash got deleted then return empty array. */
+    /* 删除所有已过期字段。如果整个哈希都被删除则返回空数组。 */
     if (hashTypeExpireIfNeeded(c->db, hash)) {
         addReply(c, shared.emptyarray);
         return;
     }
 
-    /* Delete expired fields */
+    /* 删除已过期字段 */
     size = hashTypeLength(hash, 0);
 
-    /* If count is zero, serve it ASAP to avoid special cases later. */
+    /* 如果 count 为 0，立即响应以避免后续特殊处理。 */
     if (count == 0) {
         addReply(c,shared.emptyarray);
         return;
@@ -2623,7 +2665,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
         return;
     }
 
-    /* Initiate reply count, RESP3 responds with nested array, RESP2 with flat one. */
+    /* 初始化回复数量：RESP3 返回嵌套数组，RESP2 返回扁平数组。 */
     long reply_size = count < size ? count : size;
     if (withvalues && c->resp == 2)
         addReplyArrayLen(c, reply_size*2);
@@ -2680,32 +2722,32 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
      * a bit less than the number of elements in the hash, the natural approach
      * used into CASE 4 is highly inefficient. */
     if (count*HRANDFIELD_SUB_STRATEGY_MUL > size) {
-        /* Hashtable encoding (generic implementation) */
+        /* 哈希表编码（通用实现） */
         dict *ht = hash->ptr;
         dictIterator *di;
         dictEntry *de;
         unsigned long idx = 0;
 
-        /* Allocate a temporary array of pointers to stored key-values in dict and
-         * assist it to remove random elements to reach the right count. */
+        /* 分配一个临时数组，存储 dict 中键值对的指针，
+         * 并通过删除随机元素来达到所需数量。 */
         struct FieldValPair {
             hfield field;
             sds value;
         } *pairs = zmalloc(sizeof(struct FieldValPair) * size);
 
-        /* Add all the elements into the temporary array. */
+        /* 将所有元素加入临时数组。 */
         di = dictGetIterator(ht);
         while((de = dictNext(di)) != NULL)
               pairs[idx++] = (struct FieldValPair) {dictGetKey(de), dictGetVal(de)};
         dictReleaseIterator(di);
 
-        /* Remove random elements to reach the right count. */
+        /* 删除随机元素以达到所需数量。 */
         while (size > count) {
             unsigned long toDiscardIdx = rand() % size;
             pairs[toDiscardIdx] = pairs[--size];
         }
 
-        /* Reply with what's in the array */
+        /* 回复数组中的内容 */
         for (idx = 0; idx < size; idx++) {
             if (withvalues && c->resp > 2)
                 addReplyArrayLen(c,2);
@@ -2722,14 +2764,14 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
      * to the temporary hash, trying to eventually get enough unique elements
      * to reach the specified count. */
     else {
-        /* Allocate temporary dictUnique to find unique elements. Just keep ref
-         * to key-value from the original hash. This dict relaxes hash function
-         * to be based on field's pointer */
+        /* 分配临时 dictUnique 以查找唯一元素。
+         * 仅保留对原哈希中 key-value 的引用。
+         * 此 dict 放宽了哈希函数，使其基于字段指针。 */
         dictType uniqueDictType = { .hashFunction =  dictPtrHash };
         dict *dictUnique = dictCreate(&uniqueDictType);
         dictExpand(dictUnique, count);
 
-        /* Hashtable encoding (generic implementation) */
+        /* 哈希表编码（通用实现） */
         unsigned long added = 0;
 
         while(added < count) {
@@ -2738,15 +2780,14 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             hfield field = dictGetKey(de);
             sds value = dictGetVal(de);
 
-            /* Try to add the object to the dictionary. If it already exists
-            * free it, otherwise increment the number of objects we have
-            * in the result dictionary. */
+            /* 尝试将对象加入字典。如果已存在则跳过，
+            * 否则增加结果字典中的对象数量。 */
             if (dictAdd(dictUnique, field, value) != DICT_OK)
                 continue;
 
             added++;
 
-            /* We can reply right away, so that we don't need to store the value in the dict. */
+            /* 可以立即回复，这样就无需将值保存在 dict 中。 */
             if (withvalues && c->resp > 2)
                 addReplyArrayLen(c,2);
 
@@ -2755,7 +2796,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
                 addReplyBulkCBuffer(c, value, sdslen(value));
         }
 
-        /* Release memory */
+        /* 释放内存 */
         dictRelease(dictUnique);
     }
 }
@@ -2789,6 +2830,10 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
  *  command (particularly with HFEs) and the fact we have effective active-expiration
  *  behind for hash-fields, it is better to keep it simple and choose the option #1.
  */
+/* HRANDFIELD 命令实现。
+ * 不指定 count 时返回单个随机字段；指定 count 时返回多个
+ * 随机字段（带 WITHVALUES 时同时返回值）。
+ * 时间复杂度：O(N)，N 为返回的字段数量。 */
 void hrandfieldCommand(client *c) {
     long l;
     int withvalues = 0;
@@ -2811,13 +2856,13 @@ void hrandfieldCommand(client *c) {
         return;
     }
 
-    /* Handle variant without <count> argument. Reply with simple bulk string */
+    /* 处理不带 <count> 参数的变体。回复简单的 bulk string */
     if ((hash = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]))== NULL ||
         checkType(c,hash,OBJ_HASH)) {
         return;
     }
 
-    /* Delete all expired fields. If the entire hash got deleted then return null. */
+    /* 删除所有已过期字段。如果整个哈希都被删除则返回 null。 */
     if (hashTypeExpireIfNeeded(c->db, hash)) {
         addReply(c,shared.null[c->resp]);
         return;
@@ -2832,8 +2877,9 @@ void hrandfieldCommand(client *c) {
 }
 
 /*-----------------------------------------------------------------------------
- * Hash Field with optional expiry (based on mstr)
+ * 带有可选过期的哈希字段（基于 mstr）
  *----------------------------------------------------------------------------*/
+/* 内部实现：创建一个新的 hfield 字符串。 */
 static hfield _hfieldNew(const void *field, size_t fieldlen, int withExpireMeta,
                          int trymalloc)
 {
@@ -2852,7 +2898,7 @@ static hfield _hfieldNew(const void *field, size_t fieldlen, int withExpireMeta,
     return hf;
 }
 
-/* if expireAt is 0, then expireAt is ignored and no metadata is attached */
+/* 如果 expireAt 为 0，则忽略 expireAt，且不附加元数据。 */
 hfield hfieldNew(const void *field, size_t fieldlen, int withExpireMeta) {
     return _hfieldNew(field, fieldlen, withExpireMeta, 0);
 }
@@ -2870,7 +2916,7 @@ static ExpireMeta* hfieldGetExpireMeta(const eItem field) {
     return mstrMetaRef(field, &mstrFieldKind, (int) HFIELD_META_EXPIRE);
 }
 
-/* returned value is unix time in milliseconds */
+/* 返回值是 Unix 时间（毫秒）。 */
 uint64_t hfieldGetExpireTime(hfield field) {
     if (!hfieldIsExpireAttached(field))
         return EB_EXPIRE_TIME_INVALID;
@@ -2882,7 +2928,7 @@ uint64_t hfieldGetExpireTime(hfield field) {
     return ebGetMetaExpTime(expireMeta);
 }
 
-/* Remove TTL from the field. Assumed ExpireMeta is attached and has valid value */
+/* 从字段移除 TTL。假定 ExpireMeta 已挂接且具有有效值。 */
 static void hfieldPersist(robj *hashObj, hfield field) {
     uint64_t fieldExpireTime = hfieldGetExpireTime(field);
     if (fieldExpireTime == EB_EXPIRE_TIME_INVALID)
@@ -2892,29 +2938,28 @@ static void hfieldPersist(robj *hashObj, hfield field) {
     dict *d = hashObj->ptr;
     dictExpireMetadata *dictExpireMeta = (dictExpireMetadata *)dictMetadata(d);
 
-    /* If field has valid expiry then dict must have valid metadata as well */
+    /* 如果字段具有有效的过期时间，则 dict 必须也具有有效的元数据 */
     serverAssert(dictExpireMeta->expireMeta.trash == 0);
 
-    /* Remove field from private HFE DS */
+    /* 从私有 HFE DS 中移除该字段 */
     ebRemove(&dictExpireMeta->hfe, &hashFieldExpireBucketsType, field);
 
-    /* Don't have to update global HFE DS. It's unnecessary. Implementing this
-     * would introduce significant complexity and overhead for an operation that
-     * isn't critical. In the worst case scenario, the hash will be efficiently
-     * updated later by an active-expire operation, or it will be removed by the
-     * hash's dbGenericDelete() function. */
+    /* 无需更新全局 HFE DS。这是不必要的。
+     * 实现该功能会引入显著的复杂性和开销，而该操作并非关键。
+     * 在最坏的情况下，哈希稍后会被主动过期操作高效地更新，
+     * 或者由哈希的 dbGenericDelete() 函数删除。 */
 }
 
 int hfieldIsExpired(hfield field) {
-    /* Condition remains valid even if hfieldGetExpireTime() returns EB_EXPIRE_TIME_INVALID,
-     * as the constant is equivalent to (EB_EXPIRE_TIME_MAX + 1). */
+    /* 即便 hfieldGetExpireTime() 返回 EB_EXPIRE_TIME_INVALID，
+     * 该条件仍然有效，因为该常量等价于 (EB_EXPIRE_TIME_MAX + 1)。 */
     return ( (mstime_t)hfieldGetExpireTime(field) < commandTimeSnapshot());
 }
 
 /*-----------------------------------------------------------------------------
- * Hash Field Expiration (HFE)
+ * 哈希字段过期（HFE）
  *----------------------------------------------------------------------------*/
-/*  Can be called either by active-expire cron job or query from the client */
+/* 既可由主动过期 cron 任务调用，也可由客户端的查询调用。 */
 static void propagateHashFieldDeletion(redisDb *db, sds key, char *field, size_t fieldLen) {
     robj *argv[] = {
         shared.hdel,
@@ -2929,14 +2974,14 @@ static void propagateHashFieldDeletion(redisDb *db, sds key, char *field, size_t
     server.replication_allowed = prev_replication_allowed;
     exitExecutionUnit();
 
-    /* Propagate the HDEL command */
+    /* 传播 HDEL 命令 */
     postExecutionUnitOperations();
 
     decrRefCount(argv[1]);
     decrRefCount(argv[2]);
 }
 
-/* Called during active expiration of hash-fields. Propagate to replica & Delete. */
+/* 在哈希字段的主动过期过程中调用。向从节点传播删除事件并执行删除。 */
 static ExpireAction onFieldExpire(eItem item, void *ctx) {
     OnFieldExpireCtx *expCtx = ctx;
     hfield hf = item;
@@ -2948,8 +2993,8 @@ static ExpireAction onFieldExpire(eItem item, void *ctx) {
     return ACT_REMOVE_EXP_ITEM;
 }
 
-/* Retrieve the ExpireMeta associated with the hash.
- * The caller is responsible for ensuring that it is indeed attached. */
+/* 获取与哈希关联的 ExpireMeta。
+ * 调用者需负责确保 ExpireMeta 确实已挂接。 */
 static ExpireMeta *hashGetExpireMeta(const eItem hash) {
     robj *hashObj = (robj *)hash;
     if (hashObj->encoding == OBJ_ENCODING_LISTPACK_EX) {
@@ -2964,13 +3009,15 @@ static ExpireMeta *hashGetExpireMeta(const eItem hash) {
     }
 }
 
-/* HTTL key <FIELDS count field [field ...]>  */
+/* HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME 通用实现。
+ * 命令格式：HTTL key <FIELDS count field [field ...]>
+ * 返回每个指定字段的剩余 TTL。 */
 static void httlGenericCommand(client *c, const char *cmd, long long basetime, int unit) {
     UNUSED(cmd);
     robj *hashObj;
     long numFields = 0, numFieldsAt = 3;
 
-    /* Read the hash object */
+    /* 读取哈希对象 */
     hashObj = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c, hashObj, OBJ_HASH))
         return;
@@ -2980,19 +3027,19 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
         return;
     }
 
-    /* Read number of fields */
+    /* 读取字段数量 */
     if (getRangeLongFromObjectOrReply(c, c->argv[numFieldsAt], 1, LONG_MAX,
                                       &numFields, "Number of fields must be a positive integer") != C_OK)
         return;
 
-    /* Verify `numFields` is consistent with number of arguments */
+    /* 校验 numFields 与参数数量一致 */
     if (numFields != (c->argc - numFieldsAt - 1)) {
         addReplyError(c, "The `numfields` parameter must match the number of arguments");
         return;
     }
 
-    /* Non-existing keys and empty hashes are the same thing. It also means
-     * fields in the command don't exist in the hash key. */
+    /* 不存在的 key 与空哈希是等价的。这也意味着
+     * 命令中的字段在哈希 key 中不存在。 */
     if (!hashObj) {
         addReplyArrayLen(c, numFields);
         for (int i = 0; i < numFields; i++) {
@@ -3089,37 +3136,31 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
     }
 }
 
-/* This is the generic command implementation for HEXPIRE, HPEXPIRE, HEXPIREAT
- * and HPEXPIREAT. Because the command second argument may be relative or absolute
- * the "basetime" argument is used to signal what the base time is (either 0
- * for *AT variants of the command, or the current time for relative expires).
+/* 这是 HEXPIRE、HPEXPIRE、HEXPIREAT 和 HPEXPIREAT 的通用命令实现。
+ * 由于命令的第二个参数可能是相对时间或绝对时间，
+ * 因此使用 "basetime" 参数指明基准时间（对于 *AT 变体为 0，
+ * 对于相对过期则为当前时间）。
  *
- * unit is either UNIT_SECONDS or UNIT_MILLISECONDS, and is only used for
- * the argv[2] parameter. The basetime is always specified in milliseconds.
+ * unit 可以是 UNIT_SECONDS 或 UNIT_MILLISECONDS，仅用于 argv[2] 参数。
+ * basetime 始终以毫秒为单位。
  *
- * PROPAGATE TO REPLICA:
- *   The command will be translated into HPEXPIREAT and the expiration time will be
- *   converted to absolute time in milliseconds.
+ * 向从节点传播：
+ *   该命令会被翻译为 HPEXPIREAT，且过期时间会被转换为绝对时间（毫秒）。
  *
- *   As we need to propagate H(P)EXPIRE(AT) command to the replica, each field that
- *   is mentioned in the command should be categorized into one of the four options:
- *   1. Field’s expiration time updated successfully - Propagate it to replica as
- *      part of the HPEXPIREAT command.
- *   2. The field got deleted since the time is in the past - propagate also HDEL
- *      command to delete the field. Also remove the field from the propagated
- *      HPEXPIREAT command.
- *   3. Condition not met for the field - Remove the field from the propagated
- *      HPEXPIREAT command.
- *   4. Field doesn't exists - Remove the field from propagated HPEXPIREAT command.
+ *   由于需要将 H(P)EXPIRE(AT) 命令传播给从节点，命令中提到的每个
+ *   字段应归类为以下四种情况之一：
+ *   1. 字段的过期时间更新成功 —— 作为 HPEXPIREAT 命令的一部分传播给从节点。
+ *   2. 由于时间为过去，字段已被删除 —— 同时传播 HDEL 命令以删除该字段，
+ *      并从传播的 HPEXPIREAT 命令中移除该字段。
+ *   3. 字段不满足条件 —— 从传播的 HPEXPIREAT 命令中移除该字段。
+ *   4. 字段不存在 —— 从传播的 HPEXPIREAT 命令中移除该字段。
  *
- *   If none of the provided fields match option #1, that is provided time of the
- *   command is in the past, then avoid propagating the HPEXPIREAT command to the
- *   replica.
+ *   如果提供的字段没有匹配情况 #1，即命令提供的时间已是过去时，
+ *   则避免向从节点传播 HPEXPIREAT 命令。
  *
- *   This approach is aligned with existing EXPIRE command. If a given key has already
- *   expired, then DEL will be propagated instead of EXPIRE command. If condition
- *   not met, then command will be rejected. Otherwise, EXPIRE command will be
- *   propagated for given key.
+ *   此方法与现有 EXPIRE 命令一致。如果给定的 key 已过期，
+ *   则将传播 DEL 而不是 EXPIRE 命令。如果条件不满足，
+ *   命令将被拒绝。否则，将为给定的 key 传播 EXPIRE 命令。
  */
 static void hexpireGenericCommand(client *c, const char *cmd, long long basetime, int unit) {
     long numFields = 0, numFieldsAt = 4;
@@ -3127,12 +3168,12 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
     int fieldAt, fieldsNotSet = 0, expireSetCond = 0;
     robj *hashObj, *keyArg = c->argv[1], *expireArg = c->argv[2];
 
-    /* Read the hash object */
+    /* 读取哈希对象 */
     hashObj = lookupKeyWrite(c->db, keyArg);
     if (checkType(c, hashObj, OBJ_HASH))
         return;
 
-    /* Read the expiry time from command */
+    /* 从命令中读取过期时间 */
     if (getLongLongFromObjectOrReply(c, expireArg, &expire, NULL) != C_OK)
         return;
 
@@ -3149,14 +3190,14 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
         expire *= 1000;
     }
 
-    /* Ensure that the final absolute Unix timestamp does not exceed EB_EXPIRE_TIME_MAX. */
+    /* 确保最终的绝对 Unix 时间戳不超过 EB_EXPIRE_TIME_MAX。 */
     if (expire > (long long) HFE_MAX_ABS_TIME_MSEC - basetime) {
         addReplyErrorExpireTime(c);
         return;
     }
     expire += basetime;
 
-    /* Read optional expireSetCond [NX|XX|GT|LT] */
+    /* 读取可选的 expireSetCond [NX|XX|GT|LT] */
     char *optArg = c->argv[3]->ptr;
     if (!strcasecmp(optArg, "nx")) {
         expireSetCond = HFE_NX; ++numFieldsAt;
@@ -3173,19 +3214,19 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
         return;
     }
 
-    /* Read number of fields */
+    /* 读取字段数量 */
     if (getRangeLongFromObjectOrReply(c, c->argv[numFieldsAt], 1, LONG_MAX,
                                       &numFields, "Parameter `numFields` should be greater than 0") != C_OK)
         return;
 
-    /* Verify `numFields` is consistent with number of arguments */
+    /* 校验 numFields 与参数数量一致 */
     if (numFields != (c->argc - numFieldsAt - 1)) {
         addReplyError(c, "The `numfields` parameter must match the number of arguments");
         return;
     }
 
-    /* Non-existing keys and empty hashes are the same thing. It also means
-     * fields in the command don't exist in the hash key. */
+    /* 不存在的 key 与空哈希是等价的。这也意味着
+     * 命令中的字段在哈希 key 中不存在。 */
     if (!hashObj) {
         addReplyArrayLen(c, numFields);
         for (int i = 0; i < numFields; i++) {
@@ -3204,7 +3245,7 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
         SetExRes res = hashTypeSetEx(hashObj, field, expire, &exCtx);
 
         if (unlikely(res != HSETEX_OK)) {
-            /* If the field was not set, prevent field propagation */
+            /* 如果该字段未设置成功，则阻止该字段的传播 */
             rewriteClientCommandArgument(c, fieldAt, NULL);
             fieldsNotSet = 1;
         } else {
@@ -3216,27 +3257,27 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
 
     hashTypeSetExDone(&exCtx);
 
-    /* Avoid propagating command if not even one field was updated (Either because
-     * the time is in the past, and corresponding HDELs were sent, or conditions
-     * not met) then it is useless and invalid to propagate command with no fields */
+    /* 如果没有任何字段被更新（要么因为时间已是过去并已发送对应的 HDEL，
+     * 要么因为条件不满足），则不传播该命令；
+     * 此时传播一个没有字段的命令是无用且无效的。 */
     if (exCtx.fieldUpdated == 0) {
         preventCommandPropagation(c);
         return;
     }
 
-    /* If some fields were dropped, rewrite the number of fields */
+    /* 如果部分字段被丢弃，则重写字段数量 */
     if (fieldsNotSet) {
         robj *numFieldsObj = createStringObjectFromLongLong(exCtx.fieldUpdated);
         rewriteClientCommandArgument(c, numFieldsAt, numFieldsObj);
         decrRefCount(numFieldsObj);
     }
 
-    /* Propagate as HPEXPIREAT millisecond-timestamp. Rewrite only if not already */
+    /* 以 HPEXPIREAT 毫秒时间戳形式传播。仅当尚未是 HPEXPIREAT 时重写。 */
     if (c->cmd->proc != hpexpireatCommand) {
         rewriteClientCommandArgument(c,0,shared.hpexpireat);
     }
 
-    /* rewrite expiration time to unix time in msec  */
+    /* 将过期时间重写为 Unix 时间（毫秒） */
     if (basetime != 0 || unit == UNIT_SECONDS) {
         robj *expireObj = createStringObjectFromLongLong(expire);
         rewriteClientCommandArgument(c, 2, expireObj);
@@ -3244,54 +3285,63 @@ static void hexpireGenericCommand(client *c, const char *cmd, long long basetime
     }
 }
 
-/* HPEXPIRE key milliseconds [ NX | XX | GT | LT] numfields <field [field ...]> */
+/* HPEXPIRE key milliseconds [ NX | XX | GT | LT] numfields <field [field ...]>
+ * 设置哈希字段的过期时间（毫秒，相对时间）。 */
 void hpexpireCommand(client *c) {
     hexpireGenericCommand(c,"hpexpire", commandTimeSnapshot(),UNIT_MILLISECONDS);
 }
 
-/* HEXPIRE key seconds [NX | XX | GT | LT] numfields <field [field ...]> */
+/* HEXPIRE key seconds [NX | XX | GT | LT] numfields <field [field ...]>
+ * 设置哈希字段的过期时间（秒，相对时间）。 */
 void hexpireCommand(client *c) {
     hexpireGenericCommand(c,"hexpire", commandTimeSnapshot(),UNIT_SECONDS);
 }
 
-/* HEXPIREAT key unix-time-seconds [NX | XX | GT | LT] numfields <field [field ...]> */
+/* HEXPIREAT key unix-time-seconds [NX | XX | GT | LT] numfields <field [field ...]>
+ * 设置哈希字段的过期时间（绝对时间，秒）。 */
 void hexpireatCommand(client *c) {
     hexpireGenericCommand(c,"hexpireat", 0,UNIT_SECONDS);
 }
 
-/* HPEXPIREAT key unix-time-milliseconds [NX | XX | GT | LT] numfields <field [field ...]> */
+/* HPEXPIREAT key unix-time-milliseconds [NX | XX | GT | LT] numfields <field [field ...]>
+ * 设置哈希字段的过期时间（绝对时间，毫秒）。 */
 void hpexpireatCommand(client *c) {
     hexpireGenericCommand(c,"hpexpireat", 0,UNIT_MILLISECONDS);
 }
 
 /* for each specified field: get the remaining time to live in seconds*/
-/* HTTL key numfields <field [field ...]> */
+/* HTTL key numfields <field [field ...]>
+ * 获取指定字段的剩余 TTL（秒）。 */
 void httlCommand(client *c) {
     httlGenericCommand(c, "httl", commandTimeSnapshot(), UNIT_SECONDS);
 }
 
-/* HPTTL key numfields <field [field ...]> */
+/* HPTTL key numfields <field [field ...]>
+ * 获取指定字段的剩余 TTL（毫秒）。 */
 void hpttlCommand(client *c) {
     httlGenericCommand(c, "hpttl", commandTimeSnapshot(), UNIT_MILLISECONDS);
 }
 
-/* HEXPIRETIME key numFields <field [field ...]> */
+/* HEXPIRETIME key numFields <field [field ...]>
+ * 获取指定字段的绝对过期时间（秒）。 */
 void hexpiretimeCommand(client *c) {
     httlGenericCommand(c, "hexpiretime", 0, UNIT_SECONDS);
 }
 
-/* HPEXPIRETIME key numFields <field [field ...]> */
+/* HPEXPIRETIME key numFields <field [field ...]>
+ * 获取指定字段的绝对过期时间（毫秒）。 */
 void hpexpiretimeCommand(client *c) {
     httlGenericCommand(c, "hexpiretime", 0, UNIT_MILLISECONDS);
 }
 
-/* HPERSIST key <FIELDS count field [field ...]> */
+/* HPERSIST key <FIELDS count field [field ...]>
+ * 移除指定字段上的过期时间。 */
 void hpersistCommand(client *c) {
     robj *hashObj;
     long numFields = 0, numFieldsAt = 3;
     int changed = 0; /* Used to determine whether to send a notification. */
 
-    /* Read the hash object */
+    /* 读取哈希对象 */
     hashObj = lookupKeyWrite(c->db, c->argv[1]);
     if (checkType(c, hashObj, OBJ_HASH))
         return;
@@ -3301,19 +3351,19 @@ void hpersistCommand(client *c) {
         return;
     }
 
-    /* Read number of fields */
+    /* 读取字段数量 */
     if (getRangeLongFromObjectOrReply(c, c->argv[numFieldsAt], 1, LONG_MAX,
                                       &numFields, "Number of fields must be a positive integer") != C_OK)
         return;
 
-    /* Verify `numFields` is consistent with number of arguments */
+    /* 校验 numFields 与参数数量一致 */
     if (numFields != (c->argc - numFieldsAt - 1)) {
         addReplyError(c, "The `numfields` parameter must match the number of arguments");
         return;
     }
 
-    /* Non-existing keys and empty hashes are the same thing. It also means
-     * fields in the command don't exist in the hash key. */
+    /* 不存在的 key 与空哈希是等价的。这也意味着
+     * 命令中的字段在哈希 key 中不存在。 */
     if (!hashObj) {
         addReplyArrayLen(c, numFields);
         for (int i = 0; i < numFields; i++) {
@@ -3394,7 +3444,7 @@ void hpersistCommand(client *c) {
                 continue;
             }
 
-            /* Already expired. Pretend there is no such field */
+            /* 已过期。假装不存在该字段 */
             if ( (long long) expire < commandTimeSnapshot()) {
                 addReplyLongLong(c, HFE_PERSIST_NO_FIELD);
                 continue;
@@ -3408,8 +3458,7 @@ void hpersistCommand(client *c) {
         serverPanic("Unknown encoding: %d", hashObj->encoding);
     }
 
-    /* Generates a hpersist event if the expiry time associated with any field
-     * has been successfully deleted. */
+    /* 当任何字段上的过期时间被成功删除时，发出 hpersist 事件。 */
     if (changed) {
         notifyKeyspaceEvent(NOTIFY_HASH, "hpersist", c->argv[1], c->db->id);
         signalModifiedKey(c, c->db, c->argv[1]);

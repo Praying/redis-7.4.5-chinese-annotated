@@ -9,15 +9,16 @@
 #include "server.h"
 
 /*-----------------------------------------------------------------------------
- * List API
+ * List API（列表 API）
  *----------------------------------------------------------------------------*/
 
-/* Check the length and size of a number of objects that will be added to list to see
- * if we need to convert a listpack to a quicklist. Note that we only check string
- * encoded objects as their string length can be queried in constant time.
+/* 检查将要添加到列表中的一系列对象的长度和大小，
+ * 以判断是否需要将 listpack 转换为 quicklist。
+ * 注意：我们只检查字符串编码的对象，因为字符串长度可以在 O(1) 时间内查询。
  *
- * If callback is given the function is called in order for caller to do some work
- * before the list conversion. */
+ * 如果传入了回调函数，则在执行列表编码转换前先调用该回调，
+ * 以便调用者做一些前置工作。
+ */
 static void listTypeTryConvertListpack(robj *o, robj **argv, int start, int end,
                                        beforeConvertCB fn, void *data)
 {
@@ -38,12 +39,12 @@ static void listTypeTryConvertListpack(robj *o, robj **argv, int start, int end,
     if (quicklistNodeExceedsLimit(server.list_max_listpack_size,
             lpBytes(o->ptr) + add_bytes, lpLength(o->ptr) + add_length))
     {
-        /* Invoke callback before conversion. */
+        /* 在转换前调用回调函数 */
         if (fn) fn(data);
 
         quicklist *ql = quicklistNew(server.list_max_listpack_size, server.list_compress_depth);
 
-        /* Append listpack to quicklist if it's not empty, otherwise release it. */
+        /* 如果 listpack 非空则追加到 quicklist，否则直接释放 */
         if (lpLength(o->ptr))
             quicklistAppendListpack(ql, o->ptr);
         else
@@ -53,15 +54,15 @@ static void listTypeTryConvertListpack(robj *o, robj **argv, int start, int end,
     }
 }
 
-/* Check the length and size of a quicklist to see if we need to convert it to listpack.
+/* 检查 quicklist 的长度和大小，以判断是否需要将其转换为 listpack。
  *
- * 'shrinking' is 1 means that the conversion is due to a list shrinking, to avoid
- * frequent conversions of quicklist and listpack due to frequent insertion and
- * deletion, we don't convert quicklist to listpack until its length or size is
- * below half of the limit.
+ * 'shrinking' 为 1 表示此次转换是由列表收缩引起的。
+ * 为避免因频繁插入与删除而反复在 quicklist 和 listpack 之间转换，
+ * 只有当 quicklist 的长度或大小低于限制值一半时，才执行该转换。
  *
- * If callback is given the function is called in order for caller to do some work
- * before the list conversion. */
+ * 如果传入了回调函数，则在执行列表编码转换前先调用该回调，
+ * 以便调用者做一些前置工作。
+ */
 static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB fn, void *data) {
     serverAssert(o->encoding == OBJ_ENCODING_QUICKLIST);
 
@@ -69,11 +70,11 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
     unsigned int count_limit;
     quicklist *ql = o->ptr;
 
-    /* A quicklist can be converted to listpack only if it has only one packed node. */
+    /* 只有当 quicklist 仅包含一个 packed 节点时，才能转换为 listpack */
     if (ql->len != 1 || ql->head->container != QUICKLIST_NODE_CONTAINER_PACKED)
         return;
 
-    /* Check the length or size of the quicklist is below the limit. */
+    /* 检查 quicklist 的长度或大小是否低于限制 */
     quicklistNodeLimit(server.list_max_listpack_size, &sz_limit, &count_limit);
     if (shrinking) {
         sz_limit /= 2;
@@ -81,66 +82,63 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
     }
     if (ql->head->sz > sz_limit || ql->count > count_limit) return;
 
-    /* Invoke callback before conversion. */
+    /* 在转换前调用回调函数 */
     if (fn) fn(data);
 
-    /* Extract the listpack from the unique quicklist node,
-     * then reset it and release the quicklist. */
+    /* 取出唯一 quicklist 节点中的 listpack，然后重置节点并释放 quicklist */
     o->ptr = ql->head->entry;
     ql->head->entry = NULL;
     quicklistRelease(ql);
     o->encoding = OBJ_ENCODING_LISTPACK;
 }
 
-/* Check if the list needs to be converted to appropriate encoding due to
- * growing, shrinking or other cases.
+/* 检查列表是否因增长、收缩或其它情况需要转换为合适的编码。
  *
- * 'lct' can be one of the following values:
- * LIST_CONV_AUTO      - Used after we built a new list, and we want to let the
- *                       function decide on the best encoding for that list.
- * LIST_CONV_GROWING   - Used before or right after adding elements to the list,
- *                       in which case we are likely to only consider converting
- *                       from listpack to quicklist.
- *                       'argv' is only used in this case to calculate the size
- *                       of a number of objects that will be added to list.
- * LIST_CONV_SHRINKING - Used after removing an element from the list, in which case we
- *                       wanna consider converting from quicklist to listpack. When we
- *                       know we're shrinking, we use a lower (more strict) threshold in
- *                       order to avoid repeated conversions on every list change. */
+ * 'lct' 可以是以下取值之一：
+ * LIST_CONV_AUTO      - 在构建新列表后使用，希望函数自行决定最佳编码。
+ * LIST_CONV_GROWING   - 在向列表添加元素前或刚添加后使用，
+ *                       此时很可能只需要考虑从 listpack 转换为 quicklist。
+ *                       'argv' 仅在该情形下用于计算即将添加到列表的对象大小。
+ * LIST_CONV_SHRINKING - 在从列表中移除元素后使用，此时需要考虑
+ *                       从 quicklist 转换为 listpack。
+ *                       当确定是收缩场景时，会采用更低（更严格）的阈值，
+ *                       以避免每次列表变化都反复进行转换。
+ */
 static void listTypeTryConversionRaw(robj *o, list_conv_type lct,
                                      robj **argv, int start, int end,
                                      beforeConvertCB fn, void *data)
 {
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
-        if (lct == LIST_CONV_GROWING) return; /* Growing has nothing to do with quicklist */
+        if (lct == LIST_CONV_GROWING) return; /* 增长场景与 quicklist 无关 */
         listTypeTryConvertQuicklist(o, lct == LIST_CONV_SHRINKING, fn, data);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        if (lct == LIST_CONV_SHRINKING) return; /* Shrinking has nothing to do with listpack */
+        if (lct == LIST_CONV_SHRINKING) return; /* 收缩场景与 listpack 无关 */
         listTypeTryConvertListpack(o, argv, start, end, fn, data);
     } else {
         serverPanic("Unknown list encoding");
     }
 }
 
-/* This is just a wrapper for listTypeTryConversionRaw() that is
- * able to try conversion without passing 'argv'. */
+/* listTypeTryConversionRaw() 的简单包装，
+ * 允许在不需要传递 'argv' 的情况下尝试编码转换。 */
 void listTypeTryConversion(robj *o, list_conv_type lct, beforeConvertCB fn, void *data) {
     listTypeTryConversionRaw(o, lct, NULL, 0, 0, fn, data);
 }
 
-/* This is just a wrapper for listTypeTryConversionRaw() that is
- * able to try conversion before adding elements to the list. */
+/* listTypeTryConversionRaw() 的简单包装，
+ * 允许在向列表添加元素之前尝试编码转换。 */
 void listTypeTryConversionAppend(robj *o, robj **argv, int start, int end,
                                  beforeConvertCB fn, void *data)
 {
     listTypeTryConversionRaw(o, LIST_CONV_GROWING, argv, start, end, fn, data);
 }
 
-/* The function pushes an element to the specified list object 'subject',
- * at head or tail position as specified by 'where'.
+/* 将一个元素推入指定的列表对象 'subject' 的头部或尾部位置，
+ * 具体位置由 'where' 决定。
  *
- * There is no need for the caller to increment the refcount of 'value' as
- * the function takes care of it if needed. */
+ * 调用者无需为 'value' 增加引用计数，
+ * 函数会在需要时自行处理引用计数。
+ */
 void listTypePush(robj *subject, robj *value, int where) {
     if (subject->encoding == OBJ_ENCODING_QUICKLIST) {
         int pos = (where == LIST_HEAD) ? QUICKLIST_HEAD : QUICKLIST_TAIL;
@@ -166,10 +164,12 @@ void listTypePush(robj *subject, robj *value, int where) {
     }
 }
 
+/* quicklistPopCustom 的回调函数：将弹出的原始数据封装为字符串对象 */
 void *listPopSaver(unsigned char *data, size_t sz) {
     return createStringObject((char*)data,sz);
 }
 
+/* 从列表的指定端弹出一个元素并返回封装后的 robj 对象 */
 robj *listTypePop(robj *subject, int where) {
     robj *value = NULL;
 
@@ -199,6 +199,7 @@ robj *listTypePop(robj *subject, int where) {
     return value;
 }
 
+/* 返回列表对象中的元素数量 */
 unsigned long listTypeLength(const robj *subject) {
     if (subject->encoding == OBJ_ENCODING_QUICKLIST) {
         return quicklistCount(subject->ptr);
@@ -209,7 +210,7 @@ unsigned long listTypeLength(const robj *subject) {
     }
 }
 
-/* Initialize an iterator at the specified index. */
+/* 在指定索引位置初始化一个列表迭代器。 */
 listTypeIterator *listTypeInitIterator(robj *subject, long index,
                                        unsigned char direction) {
     listTypeIterator *li = zmalloc(sizeof(listTypeIterator));
@@ -217,8 +218,8 @@ listTypeIterator *listTypeInitIterator(robj *subject, long index,
     li->encoding = subject->encoding;
     li->direction = direction;
     li->iter = NULL;
-    /* LIST_HEAD means start at TAIL and move *towards* head.
-     * LIST_TAIL means start at HEAD and move *towards* tail. */
+    /* LIST_HEAD 表示从 TAIL 端开始并向 head 方向遍历。
+     * LIST_TAIL 表示从 HEAD 端开始并向 tail 方向遍历。 */
     if (li->encoding == OBJ_ENCODING_QUICKLIST) {
         int iter_direction = direction == LIST_HEAD ? AL_START_TAIL : AL_START_HEAD;
         li->iter = quicklistGetIteratorAtIdx(li->subject->ptr,
@@ -231,7 +232,7 @@ listTypeIterator *listTypeInitIterator(robj *subject, long index,
     return li;
 }
 
-/* Sets the direction of an iterator. */
+/* 设置迭代器的遍历方向。 */
 void listTypeSetIteratorDirection(listTypeIterator *li, listTypeEntry *entry, unsigned char direction) {
     if (li->direction == direction) return;
 
@@ -241,26 +242,26 @@ void listTypeSetIteratorDirection(listTypeIterator *li, listTypeEntry *entry, un
         quicklistSetDirection(li->iter, dir);
     } else if (li->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = li->subject->ptr;
-        /* Note that the iterator for listpack always points to the next of the current entry,
-         * so we need to update position of the iterator depending on the direction. */
+        /* 注意：listpack 的迭代器始终指向当前条目的下一个位置，
+         * 因此需要根据方向更新迭代器的位置。 */
         li->lpi = (direction == LIST_TAIL) ? lpNext(lp, entry->lpe) : lpPrev(lp, entry->lpe);
     } else {
         serverPanic("Unknown list encoding");
     }
 }
 
-/* Clean up the iterator. */
+/* 释放迭代器资源。 */
 void listTypeReleaseIterator(listTypeIterator *li) {
     if (li->encoding == OBJ_ENCODING_QUICKLIST)
         quicklistReleaseIterator(li->iter);
     zfree(li);
 }
 
-/* Stores pointer to current the entry in the provided entry structure
- * and advances the position of the iterator. Returns 1 when the current
- * entry is in fact an entry, 0 otherwise. */
+/* 将当前条目的指针保存到传入的 entry 结构中，
+ * 并推进迭代器的位置。
+ * 当当前位置确实是一个条目时返回 1，否则返回 0。 */
 int listTypeNext(listTypeIterator *li, listTypeEntry *entry) {
-    /* Protect from converting when iterating */
+    /* 迭代过程中禁止修改编码 */
     serverAssert(li->subject->encoding == li->encoding);
 
     entry->li = li;
@@ -279,10 +280,9 @@ int listTypeNext(listTypeIterator *li, listTypeEntry *entry) {
     return 0;
 }
 
-/* Get entry value at the current position of the iterator.
- * When the function returns NULL, it populates the integer value by
- * reference in 'lval'. Otherwise a pointer to the string is returned,
- * and 'vlen' is set to the length of the string. */
+/* 获取迭代器当前位置条目的值。
+ * 当函数返回 NULL 时，表示值是整数，并通过引用写入 'lval'；
+ * 否则返回字符串指针，并将字符串长度写入 'vlen'。 */
 unsigned char *listTypeGetValue(listTypeEntry *entry, size_t *vlen, long long *lval) {
     unsigned char *vstr = NULL;
     if (entry->li->encoding == OBJ_ENCODING_QUICKLIST) {
@@ -302,19 +302,20 @@ unsigned char *listTypeGetValue(listTypeEntry *entry, size_t *vlen, long long *l
     return vstr;
 }
 
-/* Return entry or NULL at the current position of the iterator. */
+/* 将迭代器当前位置的条目封装为 robj 对象并返回。 */
 robj *listTypeGet(listTypeEntry *entry) {
     unsigned char *vstr;
     size_t vlen;
     long long lval;
 
     vstr = listTypeGetValue(entry, &vlen, &lval);
-    if (vstr) 
+    if (vstr)
         return createStringObject((char *)vstr, vlen);
     else
         return createStringObjectFromLongLong(lval);
 }
 
+/* 在迭代器当前位置的前方或后方插入一个元素（由 where 决定）。 */
 void listTypeInsert(listTypeEntry *entry, robj *value, int where) {
     robj *subject = entry->li->subject;
     value = getDecodedObject(value);
@@ -337,7 +338,7 @@ void listTypeInsert(listTypeEntry *entry, robj *value, int where) {
     decrRefCount(value);
 }
 
-/* Replaces entry at the current position of the iterator. */
+/* 替换迭代器当前位置的条目。 */
 void listTypeReplace(listTypeEntry *entry, robj *value) {
     robj *subject = entry->li->subject;
     value = getDecodedObject(value);
@@ -355,10 +356,11 @@ void listTypeReplace(listTypeEntry *entry, robj *value) {
     decrRefCount(value);
 }
 
-/* Replace entry at offset 'index' by 'value'.
+/* 将偏移量 'index' 处的条目替换为 'value'。
  *
- * Returns 1 if replace happened.
- * Returns 0 if replace failed and no changes happened. */
+ * 替换成功返回 1。
+ * 替换失败且未发生任何修改时返回 0。
+ */
 int listTypeReplaceAtIndex(robj *o, int index, robj *value) {
     value = getDecodedObject(value);
     sds vstr = value->ptr;
@@ -382,7 +384,7 @@ int listTypeReplaceAtIndex(robj *o, int index, robj *value) {
     return replaced;
 }
 
-/* Compare the given object with the entry at the current position. */
+/* 比较给定对象与迭代器当前位置的条目是否相等。 */
 int listTypeEqual(listTypeEntry *entry, robj *o) {
     serverAssertWithInfo(NULL,o,sdsEncodedObject(o));
     if (entry->li->encoding == OBJ_ENCODING_QUICKLIST) {
@@ -394,7 +396,7 @@ int listTypeEqual(listTypeEntry *entry, robj *o) {
     }
 }
 
-/* Delete the element pointed to. */
+/* 删除迭代器当前指向的元素。 */
 void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry) {
     if (entry->li->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistDelEntry(iter->iter, &entry->entry);
@@ -402,15 +404,15 @@ void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry) {
         unsigned char *p = entry->lpe;
         iter->subject->ptr = lpDelete(iter->subject->ptr,p,&p);
 
-        /* Update position of the iterator depending on the direction */
+        /* 根据迭代方向更新迭代器位置 */
         if (iter->direction == LIST_TAIL)
             iter->lpi = p;
         else {
             if (p) {
                 iter->lpi = lpPrev(iter->subject->ptr,p);
             } else {
-                /* We deleted the last element, so we need to set the
-                 * iterator to the last element. */
+                /* 我们删除了最后一个元素，因此需要将
+                 * 迭代器指向最后一个元素。 */
                 iter->lpi = lpLast(iter->subject->ptr);
             }
         }
@@ -419,11 +421,11 @@ void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry) {
     }
 }
 
-/* This is a helper function for the COPY command.
- * Duplicate a list object, with the guarantee that the returned object
- * has the same encoding as the original one.
+/* COPY 命令的辅助函数。
+ * 复制一个列表对象，并保证返回对象的编码与原对象相同。
  *
- * The resulting object always has refcount set to 1 */
+ * 返回对象的 refcount 始终被设置为 1
+ */
 robj *listTypeDup(robj *o) {
     robj *lobj;
 
@@ -444,7 +446,7 @@ robj *listTypeDup(robj *o) {
     return lobj;
 }
 
-/* Delete a range of elements from the list. */
+/* 从列表中删除指定范围的元素。 */
 void listTypeDelRange(robj *subject, long start, long count) {
     if (subject->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistDelRange(subject->ptr, start, count);
@@ -456,11 +458,14 @@ void listTypeDelRange(robj *subject, long start, long count) {
 }
 
 /*-----------------------------------------------------------------------------
- * List Commands
+ * List Commands（列表命令）
  *----------------------------------------------------------------------------*/
 
-/* Implements LPUSH/RPUSH/LPUSHX/RPUSHX. 
- * 'xx': push if key exists. */
+/* 实现 LPUSH/RPUSH/LPUSHX/RPUSHX 命令。
+ * 'xx': 仅在键存在时执行推入操作。
+ *
+ * 时间复杂度：O(N)，N 为要推入的元素数量。
+ */
 void pushGenericCommand(client *c, int where, int xx) {
     int j;
 
@@ -489,27 +494,42 @@ void pushGenericCommand(client *c, int where, int xx) {
     notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
 }
 
-/* LPUSH <key> <element> [<element> ...] */
+/* LPUSH <key> <element> [<element> ...]
+ * 将一个或多个元素从列表头部插入。
+ * 时间复杂度：O(N)，N 为要推入的元素数量。
+ */
 void lpushCommand(client *c) {
     pushGenericCommand(c,LIST_HEAD,0);
 }
 
-/* RPUSH <key> <element> [<element> ...] */
+/* RPUSH <key> <element> [<element> ...]
+ * 将一个或多个元素从列表尾部插入。
+ * 时间复杂度：O(N)，N 为要推入的元素数量。
+ */
 void rpushCommand(client *c) {
     pushGenericCommand(c,LIST_TAIL,0);
 }
 
-/* LPUSHX <key> <element> [<element> ...] */
+/* LPUSHX <key> <element> [<element> ...]
+ * 仅当列表存在时，才从列表头部插入一个或多个元素。
+ * 时间复杂度：O(N)，N 为要推入的元素数量。
+ */
 void lpushxCommand(client *c) {
     pushGenericCommand(c,LIST_HEAD,1);
 }
 
-/* RPUSHX <key> <element> [<element> ...] */
+/* RPUSHX <key> <element> [<element> ...]
+ * 仅当列表存在时，才从列表尾部插入一个或多个元素。
+ * 时间复杂度：O(N)，N 为要推入的元素数量。
+ */
 void rpushxCommand(client *c) {
     pushGenericCommand(c,LIST_TAIL,1);
 }
 
-/* LINSERT <key> (BEFORE|AFTER) <pivot> <element> */
+/* LINSERT <key> (BEFORE|AFTER) <pivot> <element>
+ * 在列表中 pivot 元素之前或之后插入一个新元素。
+ * 时间复杂度：O(N)，N 为 pivot 距离列表头部的距离。
+ */
 void linsertCommand(client *c) {
     int where;
     robj *subject;
@@ -529,14 +549,12 @@ void linsertCommand(client *c) {
     if ((subject = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,subject,OBJ_LIST)) return;
 
-    /* We're not sure if this value can be inserted yet, but we cannot
-     * convert the list inside the iterator. We don't want to loop over
-     * the list twice (once to see if the value can be inserted and once
-     * to do the actual insert), so we assume this value can be inserted
-     * and convert the listpack to a regular list if necessary. */
+    /* 此时尚不确定该值能否被插入，但我们不能在迭代器内部进行编码转换。
+     * 也不希望遍历列表两次（一次判断是否能插入，一次执行实际插入），
+     * 因此我们假设该值可以被插入，并在必要时将 listpack 转换为常规列表。 */
     listTypeTryConversionAppend(subject,c->argv,4,4,NULL,NULL);
 
-    /* Seek pivot from head to tail */
+    /* 从头到尾扫描以查找 pivot */
     iter = listTypeInitIterator(subject,0,LIST_TAIL);
     while (listTypeNext(iter,&entry)) {
         if (listTypeEqual(&entry,c->argv[3])) {
@@ -553,7 +571,7 @@ void linsertCommand(client *c) {
                             c->argv[1],c->db->id);
         server.dirty++;
     } else {
-        /* Notify client of a failed insert */
+        /* 通知客户端插入失败 */
         addReplyLongLong(c,-1);
         return;
     }
@@ -561,14 +579,20 @@ void linsertCommand(client *c) {
     addReplyLongLong(c,listTypeLength(subject));
 }
 
-/* LLEN <key> */
+/* LLEN <key>
+ * 返回列表的长度。
+ * 时间复杂度：O(1)
+ */
 void llenCommand(client *c) {
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.czero);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
     addReplyLongLong(c,listTypeLength(o));
 }
 
-/* LINDEX <key> <index> */
+/* LINDEX <key> <index>
+ * 返回列表中指定索引的元素，支持负索引（-1 表示最后一个元素）。
+ * 时间复杂度：O(N)，N 为到达索引需要遍历的元素数；头/尾元素为 O(1)。
+ */
 void lindexCommand(client *c) {
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
@@ -597,7 +621,10 @@ void lindexCommand(client *c) {
     listTypeReleaseIterator(iter);
 }
 
-/* LSET <key> <index> <element> */
+/* LSET <key> <index> <element>
+ * 将列表中指定索引的元素设置为新值。
+ * 时间复杂度：O(N)，N 为到达索引需要遍历的元素数；头/尾元素为 O(1)。
+ */
 void lsetCommand(client *c) {
     robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
@@ -609,9 +636,9 @@ void lsetCommand(client *c) {
 
     listTypeTryConversionAppend(o,c->argv,3,3,NULL,NULL);
     if (listTypeReplaceAtIndex(o,index,value)) {
-        /* We might replace a big item with a small one or vice versa, but we've
-         * already handled the growing case in listTypeTryConversionAppend()
-         * above, so here we just need to try the conversion for shrinking. */
+        /* 可能用大元素替换小元素，也可能反过来，但增长场景已在
+         * 上方的 listTypeTryConversionAppend() 中处理，
+         * 这里只需尝试收缩场景下的转换。 */
         listTypeTryConversion(o,LIST_CONV_SHRINKING,NULL,NULL);
         addReply(c,shared.ok);
         signalModifiedKey(c,c->db,c->argv[1]);
@@ -622,17 +649,17 @@ void lsetCommand(client *c) {
     }
 }
 
-/* A helper function like addListRangeReply, more details see below.
- * The difference is that here we are returning nested arrays, like:
+/* 类似于 addListRangeReply 的辅助函数，更多细节见下文。
+ * 不同之处在于这里返回的是嵌套数组，形式如下：
  * 1) keyname
  * 2) 1) element1
  *    2) element2
  *
- * And also actually pop out from the list by calling listElementsRemoved.
- * We maintain the server.dirty and notifications there.
+ * 同时还会通过 listElementsRemoved 真正从列表中弹出这些元素。
+ * server.dirty 和事件通知在该函数中维护。
  *
- * 'deleted' is an optional output argument to get an indication
- * if the key got deleted by this function. */
+ * 'deleted' 是可选的输出参数，用于指示该键是否被本函数删除。
+ */
 void listPopRangeAndReplyWithKey(client *c, robj *o, robj *key, int where, long count, int signal, int *deleted) {
     long llen = listTypeLength(o);
     long rangelen = (count > llen) ? llen : count;
@@ -640,29 +667,29 @@ void listPopRangeAndReplyWithKey(client *c, robj *o, robj *key, int where, long 
     long rangeend = (where == LIST_HEAD) ? rangelen - 1 : -1;
     int reverse = (where == LIST_HEAD) ? 0 : 1;
 
-    /* We return key-name just once, and an array of elements */
+    /* 仅返回一次键名，并附带一个元素数组 */
     addReplyArrayLen(c, 2);
     addReplyBulk(c, key);
     addListRangeReply(c, o, rangestart, rangeend, reverse);
 
-    /* Pop these elements. */
+    /* 弹出这些元素 */
     listTypeDelRange(o, rangestart, rangelen);
-    /* Maintain the notifications and dirty. */
+    /* 维护事件通知与 dirty 计数 */
     listElementsRemoved(c, key, where, o, rangelen, signal, deleted);
 }
 
-/* Extracted from `addListRangeReply()` to reply with a quicklist list.
- * Note that the purpose is to make the methods small so that the
- * code in the loop can be inlined better to improve performance. */
+/* 从 addListRangeReply() 中抽离出来的实现，用于对 quicklist 编码列表进行回复。
+ * 之所以单独抽出来，是为了把方法体尽量写小，
+ * 这样循环中的代码可以更好地被内联以提升性能。 */
 void addListQuicklistRangeReply(client *c, robj *o, int from, int rangelen, int reverse) {
-    /* Return the result in form of a multi-bulk reply */
+    /* 以 multi-bulk 回复形式返回结果 */
     addReplyArrayLen(c,rangelen);
 
     int direction = reverse ? AL_START_TAIL : AL_START_HEAD;
     quicklistIter *iter = quicklistGetIteratorAtIdx(o->ptr, direction, from);
     while(rangelen--) {
         quicklistEntry qe;
-        serverAssert(quicklistNext(iter, &qe)); /* fail on corrupt data */
+        serverAssert(quicklistNext(iter, &qe)); /* 数据损坏则失败 */
         if (qe.value) {
             addReplyBulkCBuffer(c,qe.value,qe.sz);
         } else {
@@ -672,20 +699,20 @@ void addListQuicklistRangeReply(client *c, robj *o, int from, int rangelen, int 
     quicklistReleaseIterator(iter);
 }
 
-/* Extracted from `addListRangeReply()` to reply with a listpack list.
- * Note that the purpose is to make the methods small so that the
- * code in the loop can be inlined better to improve performance. */
+/* 从 addListRangeReply() 中抽离出来的实现，用于对 listpack 编码列表进行回复。
+ * 之所以单独抽出来，是为了把方法体尽量写小，
+ * 这样循环中的代码可以更好地被内联以提升性能。 */
 void addListListpackRangeReply(client *c, robj *o, int from, int rangelen, int reverse) {
     unsigned char *p = lpSeek(o->ptr, from);
     unsigned char *vstr;
     unsigned int vlen;
     long long lval;
 
-    /* Return the result in form of a multi-bulk reply */
+    /* 以 multi-bulk 回复形式返回结果 */
     addReplyArrayLen(c,rangelen);
 
     while(rangelen--) {
-        serverAssert(p); /* fail on corrupt data */
+        serverAssert(p); /* 数据损坏则失败 */
         vstr = lpGetValue(p, &vlen, &lval);
         if (vstr) {
             addReplyBulkCBuffer(c,vstr,vlen);
@@ -696,21 +723,20 @@ void addListListpackRangeReply(client *c, robj *o, int from, int rangelen, int r
     }
 }
 
-/* A helper for replying with a list's range between the inclusive start and end
- * indexes as multi-bulk, with support for negative indexes. Note that start
- * must be less than end or an empty array is returned. When the reverse
- * argument is set to a non-zero value, the reply is reversed so that elements
- * are returned from end to start. */
+/* 将列表在包含起始、结束索引之间的区间以 multi-bulk 形式回复给客户端，
+ * 支持负索引。注意：start 必须小于等于 end，否则会返回空数组。
+ * 当 reverse 参数为非零时，回复会被反转，即按 end 到 start 顺序返回元素。
+ */
 void addListRangeReply(client *c, robj *o, long start, long end, int reverse) {
     long rangelen, llen = listTypeLength(o);
 
-    /* Convert negative indexes. */
+    /* 转换负索引 */
     if (start < 0) start = llen+start;
     if (end < 0) end = llen+end;
     if (start < 0) start = 0;
 
-    /* Invariant: start >= 0, so this test will be true when end < 0.
-     * The range is empty when start > end or start >= length. */
+    /* 不变式：start >= 0，因此当 end < 0 时该判断为真。
+     * 当 start > end 或 start >= 列表长度时，区间为空。 */
     if (start > end || start >= llen) {
         addReply(c,shared.emptyarray);
         return;
@@ -727,12 +753,12 @@ void addListRangeReply(client *c, robj *o, long start, long end, int reverse) {
         serverPanic("Unknown list encoding");
 }
 
-/* A housekeeping helper for list elements popping tasks.
+/* 列表元素弹出任务的辅助整理函数。
  *
- * If 'signal' is 0, skip calling signalModifiedKey().
+ * 若 'signal' 为 0，则跳过调用 signalModifiedKey()。
  *
- * 'deleted' is an optional output argument to get an indication
- * if the key got deleted by this function. */
+ * 'deleted' 是可选的输出参数，用于指示该键是否被本函数删除。
+ */
 void listElementsRemoved(client *c, robj *key, int where, robj *o, long count, int signal, int *deleted) {
     char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
 
@@ -750,10 +776,10 @@ void listElementsRemoved(client *c, robj *key, int where, robj *o, long count, i
     server.dirty += count;
 }
 
-/* Implements the generic list pop operation for LPOP/RPOP.
- * The where argument specifies which end of the list is operated on. An
- * optional count may be provided as the third argument of the client's
- * command. */
+/* 实现 LPOP/RPOP 命令的通用弹出操作。
+ * where 参数指定操作列表的哪一端。
+ * 客户端命令的第三个参数（可选）为 count，表示一次弹出多个元素。
+ */
 void popGenericCommand(client *c, int where) {
     int hascount = (c->argc == 3);
     long count = 0;
@@ -763,8 +789,8 @@ void popGenericCommand(client *c, int where) {
         addReplyErrorArity(c);
         return;
     } else if (hascount) {
-        /* Parse the optional count argument. */
-        if (getPositiveLongFromObjectOrReply(c,c->argv[2],&count,NULL) != C_OK) 
+        /* 解析可选的 count 参数 */
+        if (getPositiveLongFromObjectOrReply(c,c->argv[2],&count,NULL) != C_OK)
             return;
     }
 
@@ -773,22 +799,21 @@ void popGenericCommand(client *c, int where) {
         return;
 
     if (hascount && !count) {
-        /* Fast exit path. */
+        /* 快速退出路径 */
         addReply(c,shared.emptyarray);
         return;
     }
 
     if (!count) {
-        /* Pop a single element. This is POP's original behavior that replies
-         * with a bulk string. */
+        /* 弹出单个元素。这是 POP 最初的语义，以 bulk 字符串形式回复。 */
         value = listTypePop(o,where);
         serverAssert(value != NULL);
         addReplyBulk(c,value);
         decrRefCount(value);
         listElementsRemoved(c,c->argv[1],where,o,1,1,NULL);
     } else {
-        /* Pop a range of elements. An addition to the original POP command,
-         *  which replies with a multi-bulk. */
+        /* 弹出一定范围的元素。这是 POP 命令新增的功能，
+         *  以 multi-bulk 形式回复。 */
         long llen = listTypeLength(o);
         long rangelen = (count > llen) ? llen : count;
         long rangestart = (where == LIST_HEAD) ? 0 : -rangelen;
@@ -801,13 +826,14 @@ void popGenericCommand(client *c, int where) {
     }
 }
 
-/* Like popGenericCommand but work with multiple keys.
- * Take multiple keys and return multiple elements from just one key.
+/* 与 popGenericCommand 类似，但支持多个键。
+ * 接收多个 key，最终只从其中一个 key 上弹出元素。
  *
- * 'numkeys' the number of keys.
- * 'count' is the number of elements requested to pop.
+ * 'numkeys' 键的数量。
+ * 'count'   请求弹出的元素数量。
  *
- * Always reply with array. */
+ * 始终以数组形式回复。
+ */
 void mpopGenericCommand(client *c, robj **keys, int numkeys, int where, long count) {
     int j;
     robj *o;
@@ -817,19 +843,19 @@ void mpopGenericCommand(client *c, robj **keys, int numkeys, int where, long cou
         key = keys[j];
         o = lookupKeyWrite(c->db, key);
 
-        /* Non-existing key, move to next key. */
+        /* 键不存在，跳到下一个键 */
         if (o == NULL) continue;
 
         if (checkType(c, o, OBJ_LIST)) return;
 
         long llen = listTypeLength(o);
-        /* Empty list, move to next key. */
+        /* 空列表，跳到下一个键 */
         if (llen == 0) continue;
 
-        /* Pop a range of elements in a nested arrays way. */
+        /* 以嵌套数组的形式弹出一定范围的元素 */
         listPopRangeAndReplyWithKey(c, o, key, where, count, 1, NULL);
 
-        /* Replicate it as [LR]POP COUNT. */
+        /* 在副本中改写为 [LR]POP COUNT */
         robj *count_obj = createStringObjectFromLongLong((count > llen) ? llen : count);
         rewriteClientCommandVector(c, 3,
                                    (where == LIST_HEAD) ? shared.lpop : shared.rpop,
@@ -838,21 +864,30 @@ void mpopGenericCommand(client *c, robj **keys, int numkeys, int where, long cou
         return;
     }
 
-    /* Look like we are not able to pop up any elements. */
+    /* 看起来无法弹出任何元素 */
     addReplyNullArray(c);
 }
 
-/* LPOP <key> [count] */
+/* LPOP <key> [count]
+ * 移除并返回列表头部的元素。
+ * 时间复杂度：O(N)，N 为弹出元素数量。
+ */
 void lpopCommand(client *c) {
     popGenericCommand(c,LIST_HEAD);
 }
 
-/* RPOP <key> [count] */
+/* RPOP <key> [count]
+ * 移除并返回列表尾部的元素。
+ * 时间复杂度：O(N)，N 为弹出元素数量。
+ */
 void rpopCommand(client *c) {
     popGenericCommand(c,LIST_TAIL);
 }
 
-/* LRANGE <key> <start> <stop> */
+/* LRANGE <key> <start> <stop>
+ * 返回列表中指定区间内的元素，支持负索引。
+ * 时间复杂度：O(S+N)，S 为 start 偏移，N 为区间元素数量。
+ */
 void lrangeCommand(client *c) {
     robj *o;
     long start, end;
@@ -866,7 +901,10 @@ void lrangeCommand(client *c) {
     addListRangeReply(c,o,start,end,0);
 }
 
-/* LTRIM <key> <start> <stop> */
+/* LTRIM <key> <start> <stop>
+ * 将列表只保留指定区间内的元素，其它元素被移除。
+ * 时间复杂度：O(N)，N 为被删除的元素总数。
+ */
 void ltrimCommand(client *c) {
     robj *o;
     long start, end, llen, ltrim, rtrim;
@@ -878,15 +916,15 @@ void ltrimCommand(client *c) {
         checkType(c,o,OBJ_LIST)) return;
     llen = listTypeLength(o);
 
-    /* convert negative indexes */
+    /* 转换负索引 */
     if (start < 0) start = llen+start;
     if (end < 0) end = llen+end;
     if (start < 0) start = 0;
 
-    /* Invariant: start >= 0, so this test will be true when end < 0.
-     * The range is empty when start > end or start >= length. */
+    /* 不变式：start >= 0，因此当 end < 0 时该判断为真。
+     * 当 start > end 或 start >= 列表长度时，区间为空。 */
     if (start > end || start >= llen) {
-        /* Out of range start or start > end result in empty list */
+        /* start 越界或 start > end 时，列表将被清空 */
         ltrim = llen;
         rtrim = 0;
     } else {
@@ -895,7 +933,7 @@ void ltrimCommand(client *c) {
         rtrim = llen-end-1;
     }
 
-    /* Remove list elements to perform the trim */
+    /* 删除列表元素以完成 trim 操作 */
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistDelRange(o->ptr,0,ltrim);
         quicklistDelRange(o->ptr,-rtrim,rtrim);
@@ -920,21 +958,18 @@ void ltrimCommand(client *c) {
 
 /* LPOS key element [RANK rank] [COUNT num-matches] [MAXLEN len]
  *
- * The "rank" is the position of the match, so if it is 1, the first match
- * is returned, if it is 2 the second match is returned and so forth.
- * It is 1 by default. If negative has the same meaning but the search is
- * performed starting from the end of the list.
+ * "rank" 表示匹配项的位置，1 表示返回第一个匹配，2 表示返回第二个匹配，
+ * 以此类推。默认值为 1。若为负数，含义相同，但搜索从列表尾部开始。
  *
- * If COUNT is given, instead of returning the single element, a list of
- * all the matching elements up to "num-matches" are returned. COUNT can
- * be combined with RANK in order to returning only the element starting
- * from the Nth. If COUNT is zero, all the matching elements are returned.
+ * 如果指定了 COUNT，则不再返回单个元素，而是返回最多 "num-matches" 个
+ * 匹配元素的列表。COUNT 可以与 RANK 组合使用，以便仅返回从第 N 个匹配
+ * 开始的元素。若 COUNT 为 0，则返回所有匹配元素。
  *
- * MAXLEN tells the command to scan a max of len elements. If zero (the
- * default), all the elements in the list are scanned if needed.
+ * MAXLEN 指示命令最多扫描 len 个元素。若为 0（默认值），
+ * 则会在必要时扫描列表中的所有元素。
  *
- * The returned elements indexes are always referring to what LINDEX
- * would return. So first element from head is 0, and so forth. */
+ * 返回的索引与 LINDEX 返回的语义一致：列表头部第一个元素索引为 0，依次类推。
+ */
 void lposCommand(client *c) {
     robj *o, *ele;
     ele = c->argv[2];
