@@ -10,26 +10,24 @@
 #include "endianconv.h"
 #include "stream.h"
 
-/* Every stream item inside the listpack, has a flags field that is used to
- * mark the entry as deleted, or having the same field as the "master"
- * entry at the start of the listpack> */
-#define STREAM_ITEM_FLAG_NONE 0             /* No special flags. */
-#define STREAM_ITEM_FLAG_DELETED (1<<0)     /* Entry is deleted. Skip it. */
-#define STREAM_ITEM_FLAG_SAMEFIELDS (1<<1)  /* Same fields as master entry. */
+/* listpack 内每个 stream 条目都有一个 flags 字段，
+ * 用于将条目标记为已删除，或标记该条目的字段与 listpack 开头的 "master" 条目相同。*/
+#define STREAM_ITEM_FLAG_NONE 0             /* 没有特殊标记。 */
+#define STREAM_ITEM_FLAG_DELETED (1<<0)     /* 条目已删除。迭代时跳过。 */
+#define STREAM_ITEM_FLAG_SAMEFIELDS (1<<1)  /* 与 master 条目的字段相同。 */
 
-/* For stream commands that require multiple IDs
- * when the number of IDs is less than 'STREAMID_STATIC_VECTOR_LEN',
- * avoid malloc allocation.*/
+/* 对于需要多个 ID 的 stream 命令，
+ * 当 ID 数量小于 'STREAMID_STATIC_VECTOR_LEN' 时，
+ * 避免使用 malloc 动态分配。*/
 #define STREAMID_STATIC_VECTOR_LEN 8
 
-/* Max pre-allocation for listpack. This is done to avoid abuse of a user
- * setting stream_node_max_bytes to a huge number. */
+/* listpack 的最大预分配大小。这样做是为了避免用户
+ * 将 stream_node_max_bytes 设置为过大数值造成的滥用。 */
 #define STREAM_LISTPACK_MAX_PRE_ALLOCATE 4096
 
-/* Don't let listpacks grow too big, even if the user config allows it.
- * doing so can lead to an overflow (trying to store more than 32bit length
- * into the listpack header), or actually an assertion since lpInsert
- * will return NULL. */
+/* 即使用户配置允许，也不要让 listpack 增长得太大。
+ * 否则可能导致溢出（试图将超过 32 位长度的数据存储到 listpack 头中），
+ * 或者实际上触发一个断言失败，因为 lpInsert 将返回 NULL。 */
 #define STREAM_LISTPACK_MAX_SIZE (1<<30)
 
 void streamFreeCG(streamCG *cg);
@@ -39,10 +37,10 @@ int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missin
 int streamParseIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq);
 
 /* -----------------------------------------------------------------------
- * Low level stream encoding: a radix tree of listpacks.
+ * 底层 stream 编码：由 listpack 构成的基数树。
  * ----------------------------------------------------------------------- */
 
-/* Create a new stream data structure. */
+/* 创建一个新的 stream 数据结构。*/
 stream *streamNew(void) {
     stream *s = zmalloc(sizeof(*s));
     s->rax = raxNew();
@@ -54,11 +52,11 @@ stream *streamNew(void) {
     s->max_deleted_entry_id.seq = 0;
     s->max_deleted_entry_id.ms = 0;
     s->entries_added = 0;
-    s->cgroups = NULL; /* Created on demand to save memory when not used. */
+    s->cgroups = NULL; /* 按需创建，以便在不使用时节省内存。 */
     return s;
 }
 
-/* Free a stream, including the listpacks stored inside the radix tree. */
+/* 释放一个 stream，包括存储在基数树中的所有 listpack。*/
 void freeStream(stream *s) {
     raxFreeWithCallback(s->rax,(void(*)(void*))lpFree);
     if (s->cgroups)
@@ -66,20 +64,19 @@ void freeStream(stream *s) {
     zfree(s);
 }
 
-/* Return the length of a stream. */
+/* 返回 stream 的长度。*/
 unsigned long streamLength(const robj *subject) {
     stream *s = subject->ptr;
     return s->length;
 }
 
-/* Set 'id' to be its successor stream ID.
- * If 'id' is the maximal possible id, it is wrapped around to 0-0 and a
- * C_ERR is returned. */
+/* 将 'id' 设置为其后继 stream ID。
+ * 如果 'id' 是最大可能的 ID，则环绕回 0-0 并返回 C_ERR。*/
 int streamIncrID(streamID *id) {
     int ret = C_OK;
     if (id->seq == UINT64_MAX) {
         if (id->ms == UINT64_MAX) {
-            /* Special case where 'id' is the last possible streamID... */
+            /* 特殊情况：'id' 已经是最后一个可能的 streamID... */
             id->ms = id->seq = 0;
             ret = C_ERR;
         } else {
@@ -92,14 +89,13 @@ int streamIncrID(streamID *id) {
     return ret;
 }
 
-/* Set 'id' to be its predecessor stream ID.
- * If 'id' is the minimal possible id, it remains 0-0 and a C_ERR is
- * returned. */
+/* 将 'id' 设置为其前驱 stream ID。
+ * 如果 'id' 是最小可能的 ID，则保持 0-0 并返回 C_ERR。*/
 int streamDecrID(streamID *id) {
     int ret = C_OK;
     if (id->seq == 0) {
         if (id->ms == 0) {
-            /* Special case where 'id' is the first possible streamID... */
+            /* 特殊情况：'id' 已经是第一个可能的 streamID... */
             id->ms = id->seq = UINT64_MAX;
             ret = C_ERR;
         } else {
@@ -112,10 +108,9 @@ int streamDecrID(streamID *id) {
     return ret;
 }
 
-/* Generate the next stream item ID given the previous one. If the current
- * milliseconds Unix time is greater than the previous one, just use this
- * as time part and start with sequence part of zero. Otherwise we use the
- * previous time (and never go backward) and increment the sequence. */
+/* 根据上一个 stream 条目 ID 生成下一个 ID。如果当前 Unix 毫秒时间
+ * 大于上一个 ID 的时间部分，则直接使用该时间作为时间部分，
+ * 序列号从 0 开始。否则使用上一个时间（绝不回退）并递增序列号。*/
 void streamNextID(streamID *last_id, streamID *new_id) {
     uint64_t ms = commandTimeSnapshot();
     if (ms > last_id->ms) {
@@ -127,11 +122,10 @@ void streamNextID(streamID *last_id, streamID *new_id) {
     }
 }
 
-/* This is a helper function for the COPY command.
- * Duplicate a Stream object, with the guarantee that the returned object
- * has the same encoding as the original one.
+/* 这是 COPY 命令的辅助函数。
+ * 复制一个 Stream 对象，保证返回的对象与原始对象具有相同的编码。
  *
- * The resulting object always has refcount set to 1 */
+ * 返回对象的 refcount 始终设置为 1 */
 robj *streamDup(robj *o) {
     robj *sobj;
 
@@ -155,9 +149,9 @@ robj *streamDup(robj *o) {
     uint64_t rax_key[2];
     raxStart(&ri, s->rax);
     raxSeek(&ri, "^", NULL, 0);
-    size_t lp_bytes = 0;      /* Total bytes in the listpack. */
-    unsigned char *lp = NULL; /* listpack pointer. */
-    /* Get a reference to the listpack node. */
+    size_t lp_bytes = 0;      /* listpack 中的总字节数。 */
+    unsigned char *lp = NULL; /* listpack 指针。 */
+    /* 获取 listpack 节点的引用。 */
     while (raxNext(&ri)) {
         lp = ri.data;
         lp_bytes = lpBytes(lp);
@@ -176,7 +170,7 @@ robj *streamDup(robj *o) {
 
     if (s->cgroups == NULL) return sobj;
 
-    /* Consumer Groups */
+    /* 复制消费组 */
     raxIterator ri_cgroups;
     raxStart(&ri_cgroups, s->cgroups);
     raxSeek(&ri_cgroups, "^", NULL, 0);
@@ -188,7 +182,7 @@ robj *streamDup(robj *o) {
 
         serverAssert(new_cg != NULL);
 
-        /* Consumer Group PEL */
+        /* 复制消费组的 PEL（待处理消息列表） */
         raxIterator ri_cg_pel;
         raxStart(&ri_cg_pel,cg->pel);
         raxSeek(&ri_cg_pel,"^",NULL,0);
@@ -201,7 +195,7 @@ robj *streamDup(robj *o) {
         }
         raxStop(&ri_cg_pel);
 
-        /* Consumers */
+        /* 复制消费者 */
         raxIterator ri_consumers;
         raxStart(&ri_consumers, cg->consumers);
         raxSeek(&ri_consumers, "^", NULL, 0);
@@ -216,7 +210,7 @@ robj *streamDup(robj *o) {
             new_consumer->seen_time = consumer->seen_time;
             new_consumer->active_time = consumer->active_time;
 
-            /* Consumer PEL */
+            /* 复制消费者的 PEL */
             raxIterator ri_cpel;
             raxStart(&ri_cpel, consumer->pel);
             raxSeek(&ri_cpel, "^", NULL, 0);
@@ -238,12 +232,10 @@ robj *streamDup(robj *o) {
     return sobj;
 }
 
-/* This is a wrapper function for lpGet() to directly get an integer value
- * from the listpack (that may store numbers as a string), converting
- * the string if needed.
- * The 'valid" argument is an optional output parameter to get an indication
- * if the record was valid, when this parameter is NULL, the function will
- * fail with an assertion. */
+/* 这是 lpGet() 的包装函数，用于直接从 listpack（可能将数字以字符串形式存储）中
+ * 获取整数值，并在需要时将字符串转换为整数。
+ * 'valid' 参数是可选的输出参数，用于指示记录是否有效，
+ * 当该参数为 NULL 时，函数将失败并触发断言。*/
 static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
     int64_t v;
     unsigned char *e = lpGet(ele,&v,NULL);
@@ -252,9 +244,9 @@ static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
             *valid = 1;
         return v;
     }
-    /* The following code path should never be used for how listpacks work:
-     * they should always be able to store an int64_t value in integer
-     * encoded form. However the implementation may change. */
+    /* 按照 listpack 的设计，以下代码路径永远不应被执行：
+     * 它们应当总能以整数编码形式存储 int64_t 值。
+     * 但实现可能会发生变化。*/
     long long ll;
     int ret = string2ll((char*)e,v,&ll);
     if (valid)
@@ -267,8 +259,8 @@ static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
 
 #define lpGetInteger(ele) lpGetIntegerIfValid(ele, NULL)
 
-/* Get an edge streamID of a given listpack.
- * 'master_id' is an input param, used to build the 'edge_id' output param */
+/* 获取给定 listpack 边缘条目的 streamID。
+ * 'master_id' 是输入参数，用于构造输出参数 'edge_id' */
 int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamID *edge_id)
 {
    if (lp == NULL)
@@ -276,48 +268,40 @@ int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamI
 
    unsigned char *lp_ele;
 
-   /* We need to seek either the first or the last entry depending
-    * on the direction of the iteration. */
+   /* 根据迭代方向，定位到第一个或最后一个条目。*/
    if (first) {
-       /* Get the master fields count. */
-       lp_ele = lpFirst(lp);        /* Seek items count */
-       lp_ele = lpNext(lp, lp_ele); /* Seek deleted count. */
-       lp_ele = lpNext(lp, lp_ele); /* Seek num fields. */
+       /* 获取 master 条目的字段数。*/
+       lp_ele = lpFirst(lp);        /* 定位到条目计数 */
+       lp_ele = lpNext(lp, lp_ele); /* 定位到删除计数 */
+       lp_ele = lpNext(lp, lp_ele); /* 定位到字段数 */
        int64_t master_fields_count = lpGetInteger(lp_ele);
-       lp_ele = lpNext(lp, lp_ele); /* Seek first field. */
+       lp_ele = lpNext(lp, lp_ele); /* 定位到第一个字段 */
 
-       /* If we are iterating in normal order, skip the master fields
-        * to seek the first actual entry. */
+       /* 若按正序迭代，则跳过 master 字段以定位到第一个实际条目。*/
        for (int64_t i = 0; i < master_fields_count; i++)
            lp_ele = lpNext(lp, lp_ele);
 
-       /* If we are going forward, skip the previous entry's
-        * lp-count field (or in case of the master entry, the zero
-        * term field) */
+       /* 若正向迭代，跳过前一条目的 lp-count 字段
+        * （若是 master 条目，则跳过零终止字段）*/
        lp_ele = lpNext(lp, lp_ele);
        if (lp_ele == NULL)
            return 0;
    } else {
-       /* If we are iterating in reverse direction, just seek the
-        * last part of the last entry in the listpack (that is, the
-        * fields count). */
+       /* 若按逆序迭代，则直接定位到 listpack 中最后一条目的最后一个部分（即字段计数）。*/
        lp_ele = lpLast(lp);
 
-       /* If we are going backward, read the number of elements this
-        * entry is composed of, and jump backward N times to seek
-        * its start. */
+       /* 若反向迭代，读取当前条目包含的元素个数，然后向前跳 N 次定位到其起始位置。*/
        int64_t lp_count = lpGetInteger(lp_ele);
-       if (lp_count == 0) /* We reached the master entry. */
+       if (lp_count == 0) /* 已到达 master 条目。*/
            return 0;
 
        while (lp_count--)
            lp_ele = lpPrev(lp, lp_ele);
    }
 
-   lp_ele = lpNext(lp, lp_ele); /* Seek ID (lp_ele currently points to 'flags'). */
+   lp_ele = lpNext(lp, lp_ele); /* 定位到 ID（lp_ele 当前指向 'flags'） */
 
-   /* Get the ID: it is encoded as difference between the master
-    * ID and this entry ID. */
+   /* 获取 ID：ID 被编码为与 master ID 之间的差值。*/
    streamID id = *master_id;
    id.ms += lpGetInteger(lp_ele);
    lp_ele = lpNext(lp, lp_ele);
@@ -326,8 +310,8 @@ int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamI
    return 1;
 }
 
-/* Debugging function to log the full content of a listpack. Useful
- * for development and debugging. */
+/* 调试函数，用于输出 listpack 的完整内容。
+ * 在开发和调试时很有用。*/
 void streamLogListpackContent(unsigned char *lp) {
     unsigned char *p = lpFirst(lp);
     while(p) {
@@ -339,8 +323,8 @@ void streamLogListpackContent(unsigned char *lp) {
     }
 }
 
-/* Convert the specified stream entry ID as a 128 bit big endian number, so
- * that the IDs can be sorted lexicographically. */
+/* 将指定的 stream 条目 ID 编码为 128 位大端整数，
+ * 以便可以按字典序对 ID 进行排序。*/
 void streamEncodeID(void *buf, streamID *id) {
     uint64_t e[2];
     e[0] = htonu64(id->ms);
@@ -348,9 +332,8 @@ void streamEncodeID(void *buf, streamID *id) {
     memcpy(buf,e,sizeof(e));
 }
 
-/* This is the reverse of streamEncodeID(): the decoded ID will be stored
- * in the 'id' structure passed by reference. The buffer 'buf' must point
- * to a 128 bit big-endian encoded ID. */
+/* 这是 streamEncodeID() 的逆操作：解码后的 ID 将被存放到传入的 'id' 结构中。
+ * 缓冲区 'buf' 必须指向一个 128 位大端编码的 ID。*/
 void streamDecodeID(void *buf, streamID *id) {
     uint64_t e[2];
     memcpy(e,buf,sizeof(e));
@@ -358,20 +341,20 @@ void streamDecodeID(void *buf, streamID *id) {
     id->seq = ntohu64(e[1]);
 }
 
-/* Compare two stream IDs. Return -1 if a < b, 0 if a == b, 1 if a > b. */
+/* 比较两个 stream ID。若 a < b 返回 -1，若 a == b 返回 0，若 a > b 返回 1。*/
 int streamCompareID(streamID *a, streamID *b) {
     if (a->ms > b->ms) return 1;
     else if (a->ms < b->ms) return -1;
-    /* The ms part is the same. Check the sequence part. */
+    /* ms 部分相同，比较序列号部分。*/
     else if (a->seq > b->seq) return 1;
     else if (a->seq < b->seq) return -1;
-    /* Everything is the same: IDs are equal. */
+    /* 全部相同：两个 ID 相等。*/
     return 0;
 }
 
-/* Retrieves the ID of the stream edge entry. An edge is either the first or
- * the last ID in the stream, and may be a tombstone. To filter out tombstones,
- * set the'skip_tombstones' argument to 1. */
+/* 获取 stream 边缘条目的 ID。边缘可以是流中的第一个或最后一个 ID，
+ * 也可能是一个墓碑条目（即已删除条目）。若要过滤掉墓碑条目，
+ * 可将 'skip_tombstones' 参数设置为 1。*/
 void streamGetEdgeID(stream *s, int first, int skip_tombstones, streamID *edge_id)
 {
     streamIterator si;
@@ -386,37 +369,33 @@ void streamGetEdgeID(stream *s, int first, int skip_tombstones, streamID *edge_i
     streamIteratorStop(&si);
 }
 
-/* Adds a new item into the stream 's' having the specified number of
- * field-value pairs as specified in 'numfields' and stored into 'argv'.
- * Returns the new entry ID populating the 'added_id' structure.
+/* 向 stream 's' 中添加一个新条目，其字段值对数量由 'numfields' 指定，
+ * 数据存放在 'argv' 中。
+ * 通过 'added_id' 结构返回新条目的 ID。
  *
- * If 'use_id' is not NULL, the ID is not auto-generated by the function,
- * but instead the passed ID is used to add the new entry. In this case
- * adding the entry may fail as specified later in this comment.
- * 
- * When 'use_id' is used alongside with a zero 'seq-given', the sequence
- * part of the passed ID is ignored and the function will attempt to use an
- * auto-generated sequence.
+ * 如果 'use_id' 不为 NULL，则不会由函数自动生成 ID，
+ * 而是使用传入的 ID 来添加新条目。这种情况下添加条目可能失败，
+ * 后续注释中有详细说明。
  *
- * The function returns C_OK if the item was added, this is always true
- * if the ID was generated by the function. However the function may return
- * C_ERR in several cases:
- * 1. If an ID was given via 'use_id', but adding it failed since the
- *    current top ID is greater or equal. errno will be set to EDOM.
- * 2. If a size of a single element or the sum of the elements is too big to
- *    be stored into the stream. errno will be set to ERANGE. */
+ * 当 'use_id' 与零 'seq-given' 一起使用时，传入 ID 的序列号部分将被忽略，
+ * 函数将尝试使用自动生成的序列号。
+ *
+ * 如果条目成功添加，函数返回 C_OK，如果 ID 是由函数自动生成的，则必然返回 C_OK。
+ * 但在以下几种情况下，函数可能返回 C_ERR：
+ * 1. 通过 'use_id' 给定了一个 ID，但由于当前顶部 ID 大于或等于该 ID，
+ *    添加失败。errno 将被设置为 EDOM。
+ * 2. 如果单个元素的大小或所有元素的合计大小过大，无法存储到 stream 中。
+ *    errno 将被设置为 ERANGE。*/
 int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id, int seq_given) {
 
-    /* Generate the new entry ID. */
+    /* 生成新条目的 ID。*/
     streamID id;
     if (use_id) {
         if (seq_given) {
             id = *use_id;
         } else {
-            /* The automatically generated sequence can be either zero (new
-             * timestamps) or the incremented sequence of the last ID. In the
-             * latter case, we need to prevent an overflow/advancing forward
-             * in time. */
+            /* 自动生成的序列号可以是零（新时间戳）或最后一个 ID 的递增序列号。
+             * 在后一种情况下，我们需要防止序列号溢出或在时间上前移。*/
             if (s->last_id.ms == use_id->ms) {
                 if (s->last_id.seq == UINT64_MAX) {
                     errno = EDOM;
@@ -432,18 +411,15 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         streamNextID(&s->last_id,&id);
     }
 
-    /* Check that the new ID is greater than the last entry ID
-     * or return an error. Automatically generated IDs might
-     * overflow (and wrap-around) when incrementing the sequence
-       part. */
+    /* 检查新 ID 必须大于最后一个条目 ID，否则返回错误。
+     * 自动生成的 ID 在递增序列号部分时可能溢出（并环绕）。*/
     if (streamCompareID(&id,&s->last_id) <= 0) {
         errno = EDOM;
         return C_ERR;
     }
 
-    /* Avoid overflow when trying to add an element to the stream (listpack
-     * can only host up to 32bit length strings, and also a total listpack size
-     * can't be bigger than 32bit length. */
+    /* 避免在向 stream 添加元素时发生溢出（listpack 最多只能容纳 32 位长度的字符串，
+     * 且 listpack 的总大小也不能超过 32 位长度）。*/
     size_t totelelen = 0;
     for (int64_t i = 0; i < numfields*2; i++) {
         sds ele = argv[i]->ptr;
@@ -454,62 +430,55 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         return C_ERR;
     }
 
-    /* Add the new entry. */
+    /* 添加新条目。*/
     raxIterator ri;
     raxStart(&ri,s->rax);
     raxSeek(&ri,"$",NULL,0);
 
-    size_t lp_bytes = 0;        /* Total bytes in the tail listpack. */
-    unsigned char *lp = NULL;   /* Tail listpack pointer. */
+    size_t lp_bytes = 0;        /* 尾 listpack 中的总字节数。*/
+    unsigned char *lp = NULL;   /* 尾 listpack 指针。*/
 
     if (!raxEOF(&ri)) {
-        /* Get a reference to the tail node listpack. */
+        /* 获取尾部节点 listpack 的引用。*/
         lp = ri.data;
         lp_bytes = lpBytes(lp);
     }
     raxStop(&ri);
 
-    /* We have to add the key into the radix tree in lexicographic order,
-     * to do so we consider the ID as a single 128 bit number written in
-     * big endian, so that the most significant bytes are the first ones. */
-    uint64_t rax_key[2];    /* Key in the radix tree containing the listpack.*/
-    streamID master_id;     /* ID of the master entry in the listpack. */
+    /* 我们必须按字典序将键添加到基数树中，
+     * 为此，我们将 ID 视为一个以大端序写入的 128 位整数，
+     * 这样最高有效字节排在最前面。*/
+    uint64_t rax_key[2];    /* 基数树中包含 listpack 的键。*/
+    streamID master_id;     /* listpack 中 master 条目的 ID。*/
 
-    /* Create a new listpack and radix tree node if needed. Note that when
-     * a new listpack is created, we populate it with a "master entry". This
-     * is just a set of fields that is taken as references in order to compress
-     * the stream entries that we'll add inside the listpack.
+    /* 如果需要，创建新的 listpack 和基数树节点。请注意，当创建新的 listpack 时，
+     * 我们会用 "master 条目" 来填充它。这只是一组字段，作为后续添加到
+     * listpack 中的 stream 条目的参考，用于压缩。
      *
-     * Note that while we use the first added entry fields to create
-     * the master entry, the first added entry is NOT represented in the master
-     * entry, which is a stand alone object. But of course, the first entry
-     * will compress well because it's used as reference.
+     * 注意，虽然我们使用第一个添加的条目的字段来创建 master 条目，
+     * 但第一个添加的条目本身并不表示在 master 条目中，master 条目是一个独立的对象。
+     * 当然，第一个条目本身将得到很好的压缩，因为它被用作参考。
      *
-     * The master entry is composed like in the following example:
+     * master 条目的组成如下例所示：
      *
      * +-------+---------+------------+---------+--/--+---------+---------+-+
      * | count | deleted | num-fields | field_1 | field_2 | ... | field_N |0|
      * +-------+---------+------------+---------+--/--+---------+---------+-+
      *
-     * count and deleted just represent respectively the total number of
-     * entries inside the listpack that are valid, and marked as deleted
-     * (deleted flag in the entry flags set). So the total number of items
-     * actually inside the listpack (both deleted and not) is count+deleted.
+     * count 和 deleted 分别表示 listpack 内有效条目的总数和被标记为已删除
+     * （在条目 flags 中设置了 deleted 标记）的条目数。因此 listpack 中
+     * 实际存在的条目总数（已删除和未删除的合计）为 count+deleted。
      *
-     * The real entries will be encoded with an ID that is just the
-     * millisecond and sequence difference compared to the key stored at
-     * the radix tree node containing the listpack (delta encoding), and
-     * if the fields of the entry are the same as the master entry fields, the
-     * entry flags will specify this fact and the entry fields and number
-     * of fields will be omitted (see later in the code of this function).
+     * 真正的条目将使用与存储在包含该 listpack 的基数树节点处的 key 之间的
+     * 毫秒和序列号差值来编码 ID（差分编码），如果该条目的字段与 master
+     * 条目的字段相同，则条目的 flags 将指定这一事实，并且条目的字段和字段数
+     * 将被省略（参见本函数后续代码）。
      *
-     * The "0" entry at the end is the same as the 'lp-count' entry in the
-     * regular stream entries (see below), and marks the fact that there are
-     * no more entries, when we scan the stream from right to left. */
+     * 末尾的 "0" 条目与常规 stream 条目中的 'lp-count' 条目相同
+     * （见下文），它标记当从右向左扫描 stream 时不再有更多条目。*/
 
-    /* First of all, check if we can append to the current macro node or
-     * if we need to switch to the next one. 'lp' will be set to NULL if
-     * the current node is full. */
+    /* 首先，检查是否可以追加到当前宏节点，或者是否需要切换到下一个节点。
+     * 如果当前节点已满，则将 'lp' 设置为 NULL。*/
     if (lp != NULL) {
         int new_node = 0;
         size_t node_max_bytes = server.stream_node_max_bytes;
@@ -519,13 +488,13 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
             new_node = 1;
         } else if (server.stream_node_max_entries) {
             unsigned char *lp_ele = lpFirst(lp);
-            /* Count both live entries and deleted ones. */
+            /* 同时统计有效条目和已删除条目。*/
             int64_t count = lpGetInteger(lp_ele) + lpGetInteger(lpNext(lp,lp_ele));
             if (count >= server.stream_node_max_entries) new_node = 1;
         }
 
         if (new_node) {
-            /* Shrink extra pre-allocated memory */
+            /* 收缩额外预分配的内存 */
             lp = lpShrinkToFit(lp);
             if (ri.data != lp)
                 raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
@@ -537,45 +506,42 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     if (lp == NULL) {
         master_id = id;
         streamEncodeID(rax_key,&id);
-        /* Create the listpack having the master entry ID and fields.
-         * Pre-allocate some bytes when creating listpack to avoid realloc on
-         * every XADD. Since listpack.c uses malloc_size, it'll grow in steps,
-         * and won't realloc on every XADD.
-         * When listpack reaches max number of entries, we'll shrink the
-         * allocation to fit the data. */
+        /* 创建包含 master 条目 ID 和字段的 listpack。
+         * 创建 listpack 时预分配一些字节，以避免每次 XADD 都进行 realloc。
+         * 由于 listpack.c 使用 malloc_size，它将按步长增长，
+         * 不会在每次 XADD 时都进行 realloc。
+         * 当 listpack 达到最大条目数时，我们会收缩内存分配以适配实际数据。*/
         size_t prealloc = STREAM_LISTPACK_MAX_PRE_ALLOCATE;
         if (server.stream_node_max_bytes > 0 && server.stream_node_max_bytes < prealloc) {
             prealloc = server.stream_node_max_bytes;
         }
         lp = lpNew(prealloc);
-        lp = lpAppendInteger(lp,1); /* One item, the one we are adding. */
-        lp = lpAppendInteger(lp,0); /* Zero deleted so far. */
+        lp = lpAppendInteger(lp,1); /* 一个条目，即我们正在添加的条目。*/
+        lp = lpAppendInteger(lp,0); /* 当前已删除条目数为 0。*/
         lp = lpAppendInteger(lp,numfields);
         for (int64_t i = 0; i < numfields; i++) {
             sds field = argv[i*2]->ptr;
             lp = lpAppend(lp,(unsigned char*)field,sdslen(field));
         }
-        lp = lpAppendInteger(lp,0); /* Master entry zero terminator. */
+        lp = lpAppendInteger(lp,0); /* master 条目的零终止符。*/
         raxInsert(s->rax,(unsigned char*)&rax_key,sizeof(rax_key),lp,NULL);
-        /* The first entry we insert, has obviously the same fields of the
-         * master entry. */
+        /* 我们插入的第一个条目显然具有与 master 条目相同的字段。*/
         flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
     } else {
         serverAssert(ri.key_len == sizeof(rax_key));
         memcpy(rax_key,ri.key,sizeof(rax_key));
 
-        /* Read the master ID from the radix tree key. */
+        /* 从基数树 key 中读取 master ID。*/
         streamDecodeID(rax_key,&master_id);
         unsigned char *lp_ele = lpFirst(lp);
 
-        /* Update count and skip the deleted fields. */
+        /* 更新 count 字段并跳过 deleted 字段。*/
         int64_t count = lpGetInteger(lp_ele);
         lp = lpReplaceInteger(lp,&lp_ele,count+1);
-        lp_ele = lpNext(lp,lp_ele); /* seek deleted. */
-        lp_ele = lpNext(lp,lp_ele); /* seek master entry num fields. */
+        lp_ele = lpNext(lp,lp_ele); /* 定位到 deleted。*/
+        lp_ele = lpNext(lp,lp_ele); /* 定位到 master 条目的字段数。*/
 
-        /* Check if the entry we are adding, have the same fields
-         * as the master entry. */
+        /* 检查我们正在添加的条目是否与 master 条目具有相同的字段。*/
         int64_t master_fields_count = lpGetInteger(lp_ele);
         lp_ele = lpNext(lp,lp_ele);
         if (numfields == master_fields_count) {
@@ -585,39 +551,35 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
                 int64_t e_len;
                 unsigned char buf[LP_INTBUF_SIZE];
                 unsigned char *e = lpGet(lp_ele,&e_len,buf);
-                /* Stop if there is a mismatch. */
+                /* 若出现不匹配则停止。*/
                 if (sdslen(field) != (size_t)e_len ||
                     memcmp(e,field,e_len) != 0) break;
                 lp_ele = lpNext(lp,lp_ele);
             }
-            /* All fields are the same! We can compress the field names
-             * setting a single bit in the flags. */
+            /* 所有字段都相同！我们可以通过在 flags 中设置一个位来压缩字段名。*/
             if (i == master_fields_count) flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
         }
     }
 
-    /* Populate the listpack with the new entry. We use the following
-     * encoding:
+    /* 用新条目填充 listpack。我们使用以下编码：
      *
      * +-----+--------+----------+-------+-------+-/-+-------+-------+--------+
      * |flags|entry-id|num-fields|field-1|value-1|...|field-N|value-N|lp-count|
      * +-----+--------+----------+-------+-------+-/-+-------+-------+--------+
      *
-     * However if the SAMEFIELD flag is set, we have just to populate
-     * the entry with the values, so it becomes:
+     * 但是，如果设置了 SAMEFIELD 标志，我们只需用值填充条目即可，
+     * 因此它将变为：
      *
      * +-----+--------+-------+-/-+-------+--------+
      * |flags|entry-id|value-1|...|value-N|lp-count|
      * +-----+--------+-------+-/-+-------+--------+
      *
-     * The entry-id field is actually two separated fields: the ms
-     * and seq difference compared to the master entry.
+     * entry-id 字段实际上由两个独立的字段组成：与 master 条目相比的
+     * 毫秒和序列号差值。
      *
-     * The lp-count field is a number that states the number of listpack pieces
-     * that compose the entry, so that it's possible to travel the entry
-     * in reverse order: we can just start from the end of the listpack, read
-     * the entry, and jump back N times to seek the "flags" field to read
-     * the stream full entry. */
+     * lp-count 字段是一个数字，表示组成该条目的 listpack 片段数，
+     * 以便可以反向遍历条目：我们可以从 listpack 末尾开始，读取条目，
+     * 并向前跳 N 次以定位 "flags" 字段来读取完整的 stream 条目。*/
     lp = lpAppendInteger(lp,flags);
     lp = lpAppendInteger(lp,id.ms - master_id.ms);
     lp = lpAppendInteger(lp,id.seq - master_id.seq);
@@ -629,17 +591,17 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
             lp = lpAppend(lp,(unsigned char*)field,sdslen(field));
         lp = lpAppend(lp,(unsigned char*)value,sdslen(value));
     }
-    /* Compute and store the lp-count field. */
+    /* 计算并存储 lp-count 字段。*/
     int64_t lp_count = numfields;
-    lp_count += 3; /* Add the 3 fixed fields flags + ms-diff + seq-diff. */
+    lp_count += 3; /* 加上 3 个固定字段 flags + ms-diff + seq-diff。*/
     if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS)) {
-        /* If the item is not compressed, it also has the fields other than
-         * the values, and an additional num-fields field. */
+        /* 如果条目未被压缩，它还包含字段名（除了值之外），
+         * 以及一个额外的 num-fields 字段。*/
         lp_count += numfields+1;
     }
     lp = lpAppendInteger(lp,lp_count);
 
-    /* Insert back into the tree in order to update the listpack pointer. */
+    /* 重新插入树中以更新 listpack 指针。*/
     if (ri.data != lp)
         raxInsert(s->rax,(unsigned char*)&rax_key,sizeof(rax_key),lp,NULL);
     s->length++;
@@ -651,51 +613,46 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
 }
 
 typedef struct {
-    /* XADD options */
-    streamID id; /* User-provided ID, for XADD only. */
-    int id_given; /* Was an ID different than "*" specified? for XADD only. */
-    int seq_given; /* Was an ID different than "ms-*" specified? for XADD only. */
-    int no_mkstream; /* if set to 1 do not create new stream */
+    /* XADD 选项 */
+    streamID id; /* 用户提供的 ID，仅用于 XADD。*/
+    int id_given; /* 是否指定了不同于 "*" 的 ID？仅用于 XADD。*/
+    int seq_given; /* 是否指定了不同于 "ms-*" 的 ID？仅用于 XADD。*/
+    int no_mkstream; /* 若设置为 1，则不创建新的 stream */
 
-    /* XADD + XTRIM common options */
+    /* XADD + XTRIM 通用选项 */
     int trim_strategy; /* TRIM_STRATEGY_* */
-    int trim_strategy_arg_idx; /* Index of the count in MAXLEN/MINID, for rewriting. */
-    int approx_trim; /* If 1 only delete whole radix tree nodes, so
-                      * the trim argument is not applied verbatim. */
-    long long limit; /* Maximum amount of entries to trim. If 0, no limitation
-                      * on the amount of trimming work is enforced. */
-    /* TRIM_STRATEGY_MAXLEN options */
-    long long maxlen; /* After trimming, leave stream at this length . */
-    /* TRIM_STRATEGY_MINID options */
-    streamID minid; /* Trim by ID (No stream entries with ID < 'minid' will remain) */
+    int trim_strategy_arg_idx; /* MAXLEN/MINID 中 count 在参数列表中的索引，用于重写。*/
+    int approx_trim; /* 若为 1，则仅删除整个基数树节点，
+                      * 因此 trim 参数不会被严格执行。*/
+    long long limit; /* 要 trim 的最大条目数。若为 0，则不限制
+                      * trim 操作的工作量。*/
+    /* TRIM_STRATEGY_MAXLEN 选项 */
+    long long maxlen; /* trim 后，stream 保留的长度。*/
+    /* TRIM_STRATEGY_MINID 选项 */
+    streamID minid; /* 按 ID 修剪（stream 中不会有 ID < 'minid' 的条目保留） */
 } streamAddTrimArgs;
 
 #define TRIM_STRATEGY_NONE 0
 #define TRIM_STRATEGY_MAXLEN 1
 #define TRIM_STRATEGY_MINID 2
 
-/* Trim the stream 's' according to args->trim_strategy, and return the
- * number of elements removed from the stream. The 'approx' option, if non-zero,
- * specifies that the trimming must be performed in a approximated way in
- * order to maximize performances. This means that the stream may contain
- * entries with IDs < 'id' in case of MINID (or more elements than 'maxlen'
- * in case of MAXLEN), and elements are only removed if we can remove
- * a *whole* node of the radix tree. The elements are removed from the head
- * of the stream (older elements).
+/* 根据 args->trim_strategy 修剪 stream 's'，并返回从 stream 中移除的元素数。
+ * 若 'approx' 选项非零，则指定修剪必须以近似方式执行，以最大化性能。
+ * 这意味着 stream 中可能仍保留 ID < 'id' 的条目（对于 MINID），
+ * 或者元素个数可能超过 'maxlen'（对于 MAXLEN），
+ * 只有当我们能删除基数树的*整个*节点时，才会删除元素。
+ * 元素从 stream 的头部（较旧的元素）开始删除。
  *
- * The function may return zero if:
+ * 该函数在以下情况下可能返回 0：
  *
- * 1) The minimal entry ID of the stream is already < 'id' (MINID); or
- * 2) The stream is already shorter or equal to the specified max length (MAXLEN); or
- * 3) The 'approx' option is true and the head node did not have enough elements
- *    to be deleted.
+ * 1) stream 的最小条目 ID 已经 < 'id'（MINID）；或者
+ * 2) stream 的长度已经小于或等于指定的最大长度（MAXLEN）；或者
+ * 3) 'approx' 选项为 true，但头节点没有足够的元素可删除。
  *
- * args->limit is the maximum number of entries to delete. The purpose is to
- * prevent this function from taking to long.
- * If 'limit' is 0 then we do not limit the number of deleted entries.
- * Much like the 'approx', if 'limit' is smaller than the number of entries
- * that should be trimmed, there is a chance we will still have entries with
- * IDs < 'id' (or number of elements >= maxlen in case of MAXLEN).
+ * args->limit 是要删除的最大条目数。其目的是防止该函数耗时过长。
+ * 如果 'limit' 为 0，则不限制被删除的条目数。
+ * 与 'approx' 类似，如果 'limit' 小于应修剪的条目数，
+ * 则 stream 中仍可能存在 ID < 'id' 的条目（MAXLEN 时元素数可能 >= maxlen）。
  */
 int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
     size_t maxlen = args->maxlen;
@@ -719,24 +676,24 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         unsigned char *lp = ri.data, *p = lpFirst(lp);
         int64_t entries = lpGetInteger(p);
 
-        /* Check if we exceeded the amount of work we could do */
+        /* 检查我们是否超出了可执行的工作量 */
         if (limit && (deleted + entries) > limit)
             break;
 
-        /* Check if we can remove the whole node. */
+        /* 检查是否可以删除整个节点。*/
         int remove_node;
-        streamID master_id = {0}; /* For MINID */
+        streamID master_id = {0}; /* 用于 MINID */
         if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
             remove_node = s->length - entries >= maxlen;
         } else {
-            /* Read the master ID from the radix tree key. */
+            /* 从基数树 key 中读取 master ID。*/
             streamDecodeID(ri.key, &master_id);
 
-            /* Read last ID. */
+            /* 读取最后一个 ID。*/
             streamID last_id = {0,0};
             lpGetEdgeStreamID(lp, 0, &master_id, &last_id);
 
-            /* We can remove the entire node id its last ID < 'id' */
+            /* 如果节点的最后一个 ID < 'id'，则可以删除整个节点 */
             remove_node = streamCompareID(&last_id, id) < 0;
         }
 
@@ -749,41 +706,39 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             continue;
         }
 
-        /* If we cannot remove a whole element, and approx is true,
-         * stop here. */
+        /* 如果无法删除整个元素，且 approx 为 true，则在此停止。*/
         if (approx) break;
 
-        /* Now we have to trim entries from within 'lp' */
+        /* 现在我们需要从 'lp' 内部修剪条目 */
         int64_t deleted_from_lp = 0;
 
-        p = lpNext(lp, p); /* Skip deleted field. */
-        p = lpNext(lp, p); /* Skip num-of-fields in the master entry. */
+        p = lpNext(lp, p); /* 跳过 deleted 字段。*/
+        p = lpNext(lp, p); /* 跳过 master 条目中的字段数。*/
 
-        /* Skip all the master fields. */
+        /* 跳过所有 master 字段。*/
         int64_t master_fields_count = lpGetInteger(p);
-        p = lpNext(lp,p); /* Skip the first field. */
+        p = lpNext(lp,p); /* 跳过第一个字段。*/
         for (int64_t j = 0; j < master_fields_count; j++)
-            p = lpNext(lp,p); /* Skip all master fields. */
-        p = lpNext(lp,p); /* Skip the zero master entry terminator. */
+            p = lpNext(lp,p); /* 跳过所有 master 字段。*/
+        p = lpNext(lp,p); /* 跳过 master 条目的零终止符。*/
 
-        /* 'p' is now pointing to the first entry inside the listpack.
-         * We have to run entry after entry, marking entries as deleted
-         * if they are already not deleted. */
+        /* 'p' 现在指向 listpack 中的第一个条目。
+         * 我们需要逐条扫描条目，将未删除的条目标记为已删除。*/
         while (p) {
-            /* We keep a copy of p (which point to flags part) in order to
-             * update it after (and if) we actually remove the entry */
+            /* 我们保留一份 p（指向 flags 部分）的副本，
+             * 以便在（且仅当）实际移除条目后更新它 */
             unsigned char *pcopy = p;
 
             int64_t flags = lpGetInteger(p);
-            p = lpNext(lp, p); /* Skip flags. */
+            p = lpNext(lp, p); /* 跳过 flags。*/
             int64_t to_skip;
 
             int64_t ms_delta = lpGetInteger(p);
-            p = lpNext(lp, p); /* Skip ID ms delta */
+            p = lpNext(lp, p); /* 跳过 ID ms 差值 */
             int64_t seq_delta = lpGetInteger(p);
-            p = lpNext(lp, p); /* Skip ID seq delta */
+            p = lpNext(lp, p); /* 跳过 ID seq 差值 */
 
-            streamID currid = {0}; /* For MINID */
+            streamID currid = {0}; /* 用于 MINID */
             if (trim_strategy == TRIM_STRATEGY_MINID) {
                 currid.ms = master_id.ms + ms_delta;
                 currid.seq = master_id.seq + seq_delta;
@@ -793,8 +748,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
                 stop = s->length <= maxlen;
             } else {
-                /* Following IDs will definitely be greater because the rax
-                 * tree is sorted, no point of continuing. */
+                /* 由于 rax 树是有序的，后续 ID 必然更大，没有必要继续。*/
                 stop = streamCompareID(&currid, id) >= 0;
             }
             if (stop)
@@ -803,15 +757,15 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
                 to_skip = master_fields_count;
             } else {
-                to_skip = lpGetInteger(p); /* Get num-fields. */
-                p = lpNext(lp,p); /* Skip num-fields. */
-                to_skip *= 2; /* Fields and values. */
+                to_skip = lpGetInteger(p); /* 获取字段数。*/
+                p = lpNext(lp,p); /* 跳过字段数。*/
+                to_skip *= 2; /* 字段和值。*/
             }
 
-            while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
-            p = lpNext(lp,p); /* Skip the final lp-count field. */
+            while(to_skip--) p = lpNext(lp,p); /* 跳过整个条目。*/
+            p = lpNext(lp,p); /* 跳过末尾的 lp-count 字段。*/
 
-            /* Mark the entry as deleted. */
+            /* 将条目标记为已删除。*/
             if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
                 intptr_t delta = p - lp;
                 flags |= STREAM_ITEM_FLAG_DELETED;
@@ -823,31 +777,30 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         }
         deleted += deleted_from_lp;
 
-        /* Now we update the entries/deleted counters. */
+        /* 现在我们更新条目/已删除计数器。*/
         p = lpFirst(lp);
         lp = lpReplaceInteger(lp,&p,entries-deleted_from_lp);
-        p = lpNext(lp,p); /* Skip deleted field. */
+        p = lpNext(lp,p); /* 跳过 deleted 字段。*/
         int64_t marked_deleted = lpGetInteger(p);
         lp = lpReplaceInteger(lp,&p,marked_deleted+deleted_from_lp);
-        p = lpNext(lp,p); /* Skip num-of-fields in the master entry. */
+        p = lpNext(lp,p); /* 跳过 master 条目中的字段数。*/
 
-        /* Here we should perform garbage collection in case at this point
-         * there are too many entries deleted inside the listpack. */
+        /* 如果此时 listpack 中已删除条目过多，我们应该执行垃圾回收。*/
         entries -= deleted_from_lp;
         marked_deleted += deleted_from_lp;
         if (entries + marked_deleted > 10 && marked_deleted > entries/2) {
-            /* TODO: perform a garbage collection. */
+            /* TODO: 执行垃圾回收。*/
         }
 
-        /* Update the listpack with the new pointer. */
+        /* 用新的 listpack 指针更新树。*/
         raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
 
-        break; /* If we are here, there was enough to delete in the current
-                  node, so no need to go to the next node. */
+        break; /* 如果到达这里，说明当前节点中已有足够多可删除的条目，
+                  不需要继续到下一个节点。*/
     }
     raxStop(&ri);
 
-    /* Update the stream's first ID after the trimming. */
+    /* 在修剪后更新 stream 的 first ID。*/
     if (s->length == 0) {
         s->first_id.ms = 0;
         s->first_id.seq = 0;
@@ -858,7 +811,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
     return deleted;
 }
 
-/* Trims a stream by length. Returns the number of deleted items. */
+/* 按长度修剪 stream。返回已删除的条目数。*/
 int64_t streamTrimByLength(stream *s, long long maxlen, int approx) {
     streamAddTrimArgs args = {
         .trim_strategy = TRIM_STRATEGY_MAXLEN,
@@ -869,7 +822,7 @@ int64_t streamTrimByLength(stream *s, long long maxlen, int approx) {
     return streamTrim(s, &args);
 }
 
-/* Trims a stream by minimum ID. Returns the number of deleted items. */
+/* 按最小 ID 修剪 stream。返回已删除的条目数。*/
 int64_t streamTrimByID(stream *s, streamID minid, int approx) {
     streamAddTrimArgs args = {
         .trim_strategy = TRIM_STRATEGY_MINID,
@@ -880,35 +833,33 @@ int64_t streamTrimByID(stream *s, streamID minid, int approx) {
     return streamTrim(s, &args);
 }
 
-/* Parse the arguments of XADD/XTRIM.
+/* 解析 XADD/XTRIM 的参数。
  *
- * See streamAddTrimArgs for more details about the arguments handled.
+ * 有关所处理参数的更多详细信息，请参阅 streamAddTrimArgs。
  *
- * This function returns the position of the ID argument (relevant only to XADD).
- * On error -1 is returned and a reply is sent. */
+ * 此函数返回 ID 参数的位置（仅与 XADD 相关）。
+ * 出错时返回 -1 并向客户端发送错误回复。*/
 static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, int xadd) {
-    /* Initialize arguments to defaults */
+    /* 将参数初始化为默认值 */
     memset(args, 0, sizeof(*args));
 
-    /* Parse options. */
-    int i = 2; /* This is the first argument position where we could
-                  find an option, or the ID. */
+    /* 解析选项。*/
+    int i = 2; /* 这是可能找到选项或 ID 的第一个参数位置。*/
     int limit_given = 0;
     for (; i < c->argc; i++) {
-        int moreargs = (c->argc-1) - i; /* Number of additional arguments. */
+        int moreargs = (c->argc-1) - i; /* 剩余参数个数。*/
         char *opt = c->argv[i]->ptr;
         if (xadd && opt[0] == '*' && opt[1] == '\0') {
-            /* This is just a fast path for the common case of auto-ID
-             * creation. */
+            /* 这是自动创建 ID 的常见情况的快速路径。*/
             break;
         } else if (!strcasecmp(opt,"maxlen") && moreargs) {
             if (args->trim_strategy != TRIM_STRATEGY_NONE) {
-                addReplyError(c,"syntax error, MAXLEN and MINID options at the same time are not compatible");
+                addReplyError(c,"语法错误，MAXLEN 和 MINID 选项不能同时使用");
                 return -1;
             }
             args->approx_trim = 0;
             char *next = c->argv[i+1]->ptr;
-            /* Check for the form MAXLEN ~ <count>. */
+            /* 检查 MAXLEN ~ <count> 形式。*/
             if (moreargs >= 2 && next[0] == '~' && next[1] == '\0') {
                 args->approx_trim = 1;
                 i++;
@@ -919,7 +870,7 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
                 != C_OK) return -1;
 
             if (args->maxlen < 0) {
-                addReplyError(c,"The MAXLEN argument must be >= 0.");
+                addReplyError(c,"MAXLEN 参数必须 >= 0。");
                 return -1;
             }
             i++;
@@ -927,12 +878,12 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
             args->trim_strategy_arg_idx = i;
         } else if (!strcasecmp(opt,"minid") && moreargs) {
             if (args->trim_strategy != TRIM_STRATEGY_NONE) {
-                addReplyError(c,"syntax error, MAXLEN and MINID options at the same time are not compatible");
+                addReplyError(c,"语法错误，MAXLEN 和 MINID 选项不能同时使用");
                 return -1;
             }
             args->approx_trim = 0;
             char *next = c->argv[i+1]->ptr;
-            /* Check for the form MINID ~ <id> */
+            /* 检查 MINID ~ <id> 形式 */
             if (moreargs >= 2 && next[0] == '~' && next[1] == '\0') {
                 args->approx_trim = 1;
                 i++;
@@ -942,22 +893,20 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
 
             if (streamParseStrictIDOrReply(c,c->argv[i+1],&args->minid,0,NULL) != C_OK)
                 return -1;
-            
+
             i++;
             args->trim_strategy = TRIM_STRATEGY_MINID;
             args->trim_strategy_arg_idx = i;
         } else if (!strcasecmp(opt,"limit") && moreargs) {
-            /* Note about LIMIT: If it was not provided by the caller we set
-             * it to 100*server.stream_node_max_entries, and that's to prevent the
-             * trimming from taking too long, on the expense of not deleting entries
-             * that should be trimmed.
-             * If user wanted exact trimming (i.e. no '~') we never limit the number
-             * of trimmed entries */
+            /* 关于 LIMIT 的说明：如果调用者没有提供，我们将其设置为
+             * 100*server.stream_node_max_entries，这是为了防止修剪时间过长，
+             * 代价是可能不会删除本应被修剪的条目。
+             * 如果用户想要精确修剪（即不使用 '~'），我们不会限制被修剪的条目数。*/
             if (getLongLongFromObjectOrReply(c,c->argv[i+1],&args->limit,NULL) != C_OK)
                 return -1;
 
             if (args->limit < 0) {
-                addReplyError(c,"The LIMIT argument must be >= 0.");
+                addReplyError(c,"LIMIT 参数必须 >= 0。");
                 return -1;
             }
             limit_given = 1;
@@ -965,7 +914,7 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
         } else if (xadd && !strcasecmp(opt,"nomkstream")) {
             args->no_mkstream = 1;
         } else if (xadd) {
-            /* If we are here is a syntax error or a valid ID. */
+            /* 如果到达这里，要么是语法错误，要么是有效的 ID。*/
             if (streamParseStrictIDOrReply(c,c->argv[i],&args->id,0,&args->seq_given) != C_OK)
                 return -1;
             args->id_given = 1;
@@ -977,41 +926,39 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
     }
 
     if (args->limit && args->trim_strategy == TRIM_STRATEGY_NONE) {
-        addReplyError(c,"syntax error, LIMIT cannot be used without specifying a trimming strategy");
+        addReplyError(c,"语法错误，LIMIT 必须与修剪策略一起使用");
         return -1;
     }
 
     if (!xadd && args->trim_strategy == TRIM_STRATEGY_NONE) {
-        addReplyError(c,"syntax error, XTRIM must be called with a trimming strategy");
+        addReplyError(c,"语法错误，XTRIM 必须指定修剪策略");
         return -1;
     }
 
     if (mustObeyClient(c)) {
-        /* If command came from master or from AOF we must not enforce maxnodes
-         * (The maxlen/minid argument was re-written to make sure there's no
-         * inconsistency). */
+        /* 如果命令来自 master 或 AOF，我们不能强制执行 maxnodes
+         *（maxlen/minid 参数已被重写以确保没有不一致）。*/
         args->limit = 0;
     } else {
-        /* We need to set the limit (only if we got '~') */
+        /* 我们需要设置 limit（仅当我们使用了 '~' 时）*/
         if (limit_given) {
             if (!args->approx_trim) {
-                /* LIMIT was provided without ~ */
-                addReplyError(c,"syntax error, LIMIT cannot be used without the special ~ option");
+                /* 在没有 ~ 的情况下提供了 LIMIT */
+                addReplyError(c,"语法错误，LIMIT 必须与特殊的 ~ 选项一起使用");
                 return -1;
             }
         } else {
-            /* User didn't provide LIMIT, we must set it. */
+            /* 用户没有提供 LIMIT，我们必须设置它。*/
             if (args->approx_trim) {
-                /* In order to prevent from trimming to do too much work and 
-                 * cause latency spikes we limit the amount of work it can do.
-                 * We have to cap args->limit from both sides in case 
-                 * stream_node_max_entries is 0 or too big (could cause overflow)
+                /* 为了防止修剪做太多工作而导致延迟尖峰，我们限制其工作量。
+                 * 我们必须从两端限制 args->limit，以防
+                 * stream_node_max_entries 为 0 或过大（可能导致溢出）。
                  */
-                args->limit = 100 * server.stream_node_max_entries; /* Maximum 100 rax nodes. */
+                args->limit = 100 * server.stream_node_max_entries; /* 最多 100 个 rax 节点。*/
                 if (args->limit <= 0) args->limit = 10000;
                 if (args->limit > 1000000) args->limit = 1000000;
             } else {
-                /* No LIMIT for exact trimming */
+                /* 精确修剪不使用 LIMIT */
                 args->limit = 0;
             }
         }
@@ -1020,13 +967,12 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
     return i;
 }
 
-/* Initialize the stream iterator, so that we can call iterating functions
- * to get the next items. This requires a corresponding streamIteratorStop()
- * at the end. The 'rev' parameter controls the direction. If it's zero the
- * iteration is from the start to the end element (inclusive), otherwise
- * if rev is non-zero, the iteration is reversed.
+/* 初始化 stream 迭代器，以便我们可以调用迭代函数获取下一个条目。
+ * 这需要在结束时调用对应的 streamIteratorStop()。
+ * 'rev' 参数控制迭代方向。如果为 0，则从开始到结束（含）进行迭代；
+ * 否则如果 rev 非零，则按相反方向进行迭代。
  *
- * Once the iterator is initialized, we iterate like this:
+ * 一旦初始化迭代器，我们按如下方式迭代：
  *
  *  streamIterator myiterator;
  *  streamIteratorStart(&myiterator,...);
@@ -1037,13 +983,12 @@ static int streamParseAddOrTrimArgsOrReply(client *c, streamAddTrimArgs *args, i
  *          size_t key_len, value_len;
  *          streamIteratorGetField(&myiterator,&key,&value,&key_len,&value_len);
  *
- *          ... do what you want with key and value ...
+ *          ... 对 key 和 value 进行所需处理 ...
  *      }
  *  }
  *  streamIteratorStop(&myiterator); */
 void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamID *end, int rev) {
-    /* Initialize the iterator and translates the iteration start/stop
-     * elements into a 128 big big-endian number. */
+    /* 初始化迭代器，并将迭代的开始/结束元素转换为 128 位大端整数。*/
     if (start) {
         streamEncodeID(si->start_key,start);
     } else {
@@ -1058,7 +1003,7 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
         si->end_key[1] = UINT64_MAX;
     }
 
-    /* Seek the correct node in the radix tree. */
+    /* 在基数树中定位到正确的节点。*/
     raxStart(&si->ri,s->rax);
     if (!rev) {
         if (start && (start->ms || start->seq)) {
@@ -1078,74 +1023,63 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
         }
     }
     si->stream = s;
-    si->lp = NULL;     /* There is no current listpack right now. */
-    si->lp_ele = NULL; /* Current listpack cursor. */
-    si->rev = rev;     /* Direction, if non-zero reversed, from end to start. */
-    si->skip_tombstones = 1;    /* By default tombstones aren't emitted. */
+    si->lp = NULL;     /* 当前没有 listpack。*/
+    si->lp_ele = NULL; /* 当前的 listpack 游标。*/
+    si->rev = rev;     /* 方向，非零表示反向，从结尾到开始。*/
+    si->skip_tombstones = 1;    /* 默认不输出墓碑条目。*/
 }
 
-/* Return 1 and store the current item ID at 'id' if there are still
- * elements within the iteration range, otherwise return 0 in order to
- * signal the iteration terminated. */
+/* 如果迭代范围内还有剩余元素，则返回 1 并将当前条目的 ID 存放在 'id' 中；
+ * 否则返回 0 以表示迭代已结束。*/
 int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
-    while(1) { /* Will stop when element > stop_key or end of radix tree. */
-        /* If the current listpack is set to NULL, this is the start of the
-         * iteration or the previous listpack was completely iterated.
-         * Go to the next node. */
+    while(1) { /* 当元素 > stop_key 或到达基数树末尾时停止。*/
+        /* 如果当前 listpack 为 NULL，则表示迭代刚开始，或上一个 listpack
+         * 已完全迭代完毕。转到下一个节点。*/
         if (si->lp == NULL || si->lp_ele == NULL) {
             if (!si->rev && !raxNext(&si->ri)) return 0;
             else if (si->rev && !raxPrev(&si->ri)) return 0;
             serverAssert(si->ri.key_len == sizeof(streamID));
-            /* Get the master ID. */
+            /* 获取 master ID。*/
             streamDecodeID(si->ri.key,&si->master_id);
-            /* Get the master fields count. */
+            /* 获取 master 条目的字段数。*/
             si->lp = si->ri.data;
-            si->lp_ele = lpFirst(si->lp);           /* Seek items count */
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek deleted count. */
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek num fields. */
+            si->lp_ele = lpFirst(si->lp);           /* 定位到条目计数 */
+            si->lp_ele = lpNext(si->lp,si->lp_ele); /* 定位到 deleted 计数 */
+            si->lp_ele = lpNext(si->lp,si->lp_ele); /* 定位到 num fields */
             si->master_fields_count = lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek first field. */
+            si->lp_ele = lpNext(si->lp,si->lp_ele); /* 定位到第一个字段 */
             si->master_fields_start = si->lp_ele;
-            /* We are now pointing to the first field of the master entry.
-             * We need to seek either the first or the last entry depending
-             * on the direction of the iteration. */
+            /* 我们现在指向 master 条目的第一个字段。
+             * 需要根据迭代方向定位到第一个或最后一个条目。*/
             if (!si->rev) {
-                /* If we are iterating in normal order, skip the master fields
-                 * to seek the first actual entry. */
+                /* 如果按正序迭代，跳过 master 字段以定位到第一个实际条目。*/
                 for (uint64_t i = 0; i < si->master_fields_count; i++)
                     si->lp_ele = lpNext(si->lp,si->lp_ele);
             } else {
-                /* If we are iterating in reverse direction, just seek the
-                 * last part of the last entry in the listpack (that is, the
-                 * fields count). */
+                /* 如果按反序迭代，则直接定位到 listpack 中最后一条目的最后一个部分（即字段计数）。*/
                 si->lp_ele = lpLast(si->lp);
             }
         } else if (si->rev) {
-            /* If we are iterating in the reverse order, and this is not
-             * the first entry emitted for this listpack, then we already
-             * emitted the current entry, and have to go back to the previous
-             * one. */
+            /* 如果按反序迭代，且这不是该 listpack 输出的第一个条目，
+             * 那么我们已经输出了当前条目，需要回到前一个条目。*/
             int64_t lp_count = lpGetInteger(si->lp_ele);
             while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
-            /* Seek lp-count of prev entry. */
+            /* 定位到前一条目的 lp-count 字段。*/
             si->lp_ele = lpPrev(si->lp,si->lp_ele);
         }
 
-        /* For every radix tree node, iterate the corresponding listpack,
-         * returning elements when they are within range. */
+        /* 对于每个基数树节点，迭代其对应的 listpack，
+         * 当元素在范围内时将其返回。*/
         while(1) {
             if (!si->rev) {
-                /* If we are going forward, skip the previous entry
-                 * lp-count field (or in case of the master entry, the zero
-                 * term field) */
+                /* 如果正向迭代，跳过前一条目的 lp-count 字段
+                 * （若是 master 条目，则跳过零终止字段）*/
                 si->lp_ele = lpNext(si->lp,si->lp_ele);
                 if (si->lp_ele == NULL) break;
             } else {
-                /* If we are going backward, read the number of elements this
-                 * entry is composed of, and jump backward N times to seek
-                 * its start. */
+                /* 如果反向迭代，读取当前条目包含的元素个数，并向前跳 N 次定位到其起始位置。*/
                 int64_t lp_count = lpGetInteger(si->lp_ele);
-                if (lp_count == 0) { /* We reached the master entry. */
+                if (lp_count == 0) { /* 已到达 master 条目。*/
                     si->lp = NULL;
                     si->lp_ele = NULL;
                     break;
@@ -1153,13 +1087,12 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
             }
 
-            /* Get the flags entry. */
+            /* 获取 flags 条目。*/
             si->lp_flags = si->lp_ele;
             int64_t flags = lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek ID. */
+            si->lp_ele = lpNext(si->lp,si->lp_ele); /* 定位到 ID。*/
 
-            /* Get the ID: it is encoded as difference between the master
-             * ID and this entry ID. */
+            /* 获取 ID：ID 被编码为 master ID 与该条目 ID 之间的差值。*/
             *id = si->master_id;
             id->ms += lpGetInteger(si->lp_ele);
             si->lp_ele = lpNext(si->lp,si->lp_ele);
@@ -1168,8 +1101,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
             unsigned char buf[sizeof(streamID)];
             streamEncodeID(buf,id);
 
-            /* The number of entries is here or not depending on the
-             * flags. */
+            /* 字段数是否存在取决于 flags。*/
             if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
                 *numfields = si->master_fields_count;
             } else {
@@ -1178,61 +1110,55 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
             }
             serverAssert(*numfields>=0);
 
-            /* If current >= start, and the entry is not marked as
-             * deleted or tombstones are included, emit it. */
+            /* 如果当前 ID >= 起始 ID，且条目未被标记为已删除
+             * （或允许输出墓碑条目），则输出它。*/
             if (!si->rev) {
                 if (memcmp(buf,si->start_key,sizeof(streamID)) >= 0 &&
                     (!si->skip_tombstones || !(flags & STREAM_ITEM_FLAG_DELETED)))
                 {
                     if (memcmp(buf,si->end_key,sizeof(streamID)) > 0)
-                        return 0; /* We are already out of range. */
+                        return 0; /* 已超出范围。*/
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
-                    return 1; /* Valid item returned. */
+                    return 1; /* 返回有效条目。*/
                 }
             } else {
                 if (memcmp(buf,si->end_key,sizeof(streamID)) <= 0 &&
                     (!si->skip_tombstones || !(flags & STREAM_ITEM_FLAG_DELETED)))
                 {
                     if (memcmp(buf,si->start_key,sizeof(streamID)) < 0)
-                        return 0; /* We are already out of range. */
+                        return 0; /* 已超出范围。*/
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
-                    return 1; /* Valid item returned. */
+                    return 1; /* 返回有效条目。*/
                 }
             }
 
-            /* If we do not emit, we have to discard if we are going
-             * forward, or seek the previous entry if we are going
-             * backward. */
+            /* 如果不输出该条目，我们需要正向丢弃它，或反向定位到前一条目。*/
             if (!si->rev) {
                 int64_t to_discard = (flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
                                       *numfields : *numfields*2;
                 for (int64_t i = 0; i < to_discard; i++)
                     si->lp_ele = lpNext(si->lp,si->lp_ele);
             } else {
-                int64_t prev_times = 4; /* flag + id ms + id seq + one more to
-                                           go back to the previous entry "count"
-                                           field. */
-                /* If the entry was not flagged SAMEFIELD we also read the
-                 * number of fields, so go back one more. */
+                int64_t prev_times = 4; /* flag + id ms + id seq + 一次额外跳转
+                                           以回到前一条目的 "count" 字段。*/
+                /* 如果条目未标记 SAMEFIELD，我们还会读取字段数，因此再回退一次。*/
                 if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS)) prev_times++;
                 while(prev_times--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
             }
         }
 
-        /* End of listpack reached. Try the next/prev radix tree node. */
+        /* 当前 listpack 结束，尝试下一个/上一个基数树节点。*/
     }
 }
 
-/* Get the field and value of the current item we are iterating. This should
- * be called immediately after streamIteratorGetID(), and for each field
- * according to the number of fields returned by streamIteratorGetID().
- * The function populates the field and value pointers and the corresponding
- * lengths by reference, that are valid until the next iterator call, assuming
- * no one touches the stream meanwhile. */
+/* 获取当前迭代条目的字段和值。应在 streamIteratorGetID() 之后立即调用，
+ * 并按照 streamIteratorGetID() 返回的字段数对每个字段调用一次。
+ * 该函数通过引用填充字段和值指针及对应的长度，这些值在下次迭代器调用之前有效，
+ * 前提是期间没有其他代码修改 stream。*/
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen) {
     if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
         *fieldptr = lpGet(si->master_fields_ptr,fieldlen,si->field_buf);
@@ -1245,54 +1171,48 @@ void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsign
     si->lp_ele = lpNext(si->lp,si->lp_ele);
 }
 
-/* Remove the current entry from the stream: can be called after the
- * GetID() API or after any GetField() call, however we need to iterate
- * a valid entry while calling this function. Moreover the function
- * requires the entry ID we are currently iterating, that was previously
- * returned by GetID().
+/* 从 stream 中移除当前条目：可以在 GetID() API 之后或任何 GetField() 调用之后调用，
+ * 但调用此函数时我们需要迭代到一个有效条目。此外，该函数需要我们当前迭代的
+ * 条目 ID（之前由 GetID() 返回）。
  *
- * Note that after calling this function, next calls to GetField() can't
- * be performed: the entry is now deleted. Instead the iterator will
- * automatically re-seek to the next entry, so the caller should continue
- * with GetID(). */
+ * 注意，调用此函数后，不能再调用 GetField()：该条目已被删除。
+ * 迭代器会自动重新定位到下一个条目，因此调用者应继续使用 GetID()。*/
 void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
     unsigned char *lp = si->lp;
     int64_t aux;
 
-    /* We do not really delete the entry here. Instead we mark it as
-     * deleted by flagging it, and also incrementing the count of the
-     * deleted entries in the listpack header.
+    /* 我们实际上并未真正删除条目。我们只是通过标记它为已删除，
+     * 并增加 listpack 头中已删除条目计数来实现。
      *
-     * We start flagging: */
+     * 开始标记：*/
     int64_t flags = lpGetInteger(si->lp_flags);
     flags |= STREAM_ITEM_FLAG_DELETED;
     lp = lpReplaceInteger(lp,&si->lp_flags,flags);
 
-    /* Change the valid/deleted entries count in the master entry. */
+    /* 更改 master 条目中的有效/已删除条目计数。*/
     unsigned char *p = lpFirst(lp);
     aux = lpGetInteger(p);
 
     if (aux == 1) {
-        /* If this is the last element in the listpack, we can remove the whole
-         * node. */
+        /* 如果这是 listpack 中的最后一个元素，则可以删除整个节点。*/
         lpFree(lp);
         raxRemove(si->stream->rax,si->ri.key,si->ri.key_len,NULL);
     } else {
-        /* In the base case we alter the counters of valid/deleted entries. */
+        /* 在基础情况下，我们修改有效/已删除条目的计数。*/
         lp = lpReplaceInteger(lp,&p,aux-1);
-        p = lpNext(lp,p); /* Seek deleted field. */
+        p = lpNext(lp,p); /* 定位到 deleted 字段。*/
         aux = lpGetInteger(p);
         lp = lpReplaceInteger(lp,&p,aux+1);
 
-        /* Update the listpack with the new pointer. */
+        /* 用新的 listpack 指针更新树。*/
         if (si->lp != lp)
             raxInsert(si->stream->rax,si->ri.key,si->ri.key_len,lp,NULL);
     }
 
-    /* Update the number of entries counter. */
+    /* 更新 stream 中的条目计数器。*/
     si->stream->length--;
 
-    /* Re-seek the iterator to fix the now messed up state. */
+    /* 重新定位迭代器以修复当前混乱的状态。*/
     streamID start, end;
     if (si->rev) {
         streamDecodeID(si->start_key,&start);
@@ -1304,18 +1224,17 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
     streamIteratorStop(si);
     streamIteratorStart(si,si->stream,&start,&end,si->rev);
 
-    /* TODO: perform a garbage collection here if the ratio between
-     * deleted and valid goes over a certain limit. */
+    /* TODO: 如果已删除与有效条目数之比超过某个限制，
+     * 应在此执行垃圾回收。*/
 }
 
-/* Stop the stream iterator. The only cleanup we need is to free the rax
- * iterator, since the stream iterator itself is supposed to be stack
- * allocated. */
+/* 停止 stream 迭代器。唯一需要做的清理工作是释放 rax 迭代器，
+ * 因为 stream 迭代器本身应在栈上分配。*/
 void streamIteratorStop(streamIterator *si) {
     raxStop(&si->ri);
 }
 
-/* Return 1 if `id` exists in `s` (and not marked as deleted) */
+/* 如果 `id` 存在于 `s` 中（且未被标记为已删除），则返回 1 */
 int streamEntryExists(stream *s, streamID *id) {
     streamIterator si;
     streamIteratorStart(&si,s,id,id,0);
@@ -1329,8 +1248,8 @@ int streamEntryExists(stream *s, streamID *id) {
     return 1;
 }
 
-/* Delete the specified item ID from the stream, returning 1 if the item
- * was deleted 0 otherwise (if it does not exist). */
+/* 从 stream 中删除指定的条目 ID。如果条目被删除则返回 1，
+ * 否则（如不存在）返回 0。*/
 int streamDeleteItem(stream *s, streamID *id) {
     int deleted = 0;
     streamIterator si;
@@ -1345,7 +1264,7 @@ int streamDeleteItem(stream *s, streamID *id) {
     return deleted;
 }
 
-/* Get the last valid (non-tombstone) streamID of 's'. */
+/* 获取 's' 的最后一个有效（非墓碑）streamID。*/
 void streamLastValidID(stream *s, streamID *maxid)
 {
     streamIterator si;
@@ -1356,23 +1275,21 @@ void streamLastValidID(stream *s, streamID *maxid)
     streamIteratorStop(&si);
 }
 
-/* Maximum size for a stream ID string. In theory 20*2+1 should be enough,
- * But to avoid chance for off by one issues and null-term, in case this will
- * be used as parsing buffer, we use a slightly larger buffer. On the other
- * hand considering sds header is gonna add 4 bytes, we wanna keep below the
- * allocator's 48 bytes bin. */
+/* stream ID 字符串的最大大小。理论上 20*2+1 就足够了，
+ * 但为了避免差一错误和空终止符的可能性，以防它被用作解析缓冲区，
+ * 我们使用稍大一些的缓冲区。另一方面，考虑到 sds 头部会添加 4 个字节，
+ * 我们希望保持在分配器的 48 字节桶以下。*/
 #define STREAM_ID_STR_LEN 44
 
 sds createStreamIDString(streamID *id) {
-    /* Optimization: pre-allocate a big enough buffer to avoid reallocs. */
+    /* 优化：预分配一个足够大的缓冲区以避免重新分配。*/
     sds str = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
     sdssetlen(str, 0);
     return sdscatfmt(str,"%U-%U", id->ms,id->seq);
 }
 
-/* Emit a reply in the client output buffer by formatting a Stream ID
- * in the standard <ms>-<seq> format, using the simple string protocol
- * of REPL. */
+/* 在客户端输出缓冲区中以标准的 <ms>-<seq> 格式格式化一个 Stream ID，
+ * 并使用 REPL 的简单字符串协议发送响应。*/
 void addReplyStreamID(client *c, streamID *id) {
     addReplyBulkSds(c,createStreamIDString(id));
 }
@@ -1381,27 +1298,24 @@ void setDeferredReplyStreamID(client *c, void *dr, streamID *id) {
     setDeferredReplyBulkSds(c, dr, createStreamIDString(id));
 }
 
-/* Similar to the above function, but just creates an object, usually useful
- * for replication purposes to create arguments. */
+/* 与上述函数类似，但仅创建一个对象，通常用于复制场景以构造参数。*/
 robj *createObjectFromStreamID(streamID *id) {
     return createObject(OBJ_STRING, createStreamIDString(id));
 }
 
-/* Returns non-zero if the ID is 0-0. */
+/* 如果 ID 为 0-0，则返回非零值。*/
 int streamIDEqZero(streamID *id) {
     return !(id->ms || id->seq);
 }
 
-/* A helper that returns non-zero if the range from 'start' to `end`
- * contains a tombstone.
+/* 一个辅助函数：如果从 'start' 到 'end' 的范围内包含墓碑条目，则返回非零值。
  *
- * NOTE: this assumes that the caller had verified that 'start' is less than
- * 's->last_id'. */
+ * 注意：此函数假定调用者已经验证 'start' 小于 's->last_id'。*/
 int streamRangeHasTombstones(stream *s, streamID *start, streamID *end) {
     streamID start_id, end_id;
 
     if (!s->length || streamIDEqZero(&s->max_deleted_entry_id)) {
-        /* The stream is empty or has no tombstones. */
+        /* stream 为空或没有墓碑条目。*/
         return 0;
     }
 
@@ -1422,46 +1336,43 @@ int streamRangeHasTombstones(stream *s, streamID *start, streamID *end) {
     if (streamCompareID(&start_id,&s->max_deleted_entry_id) <= 0 &&
         streamCompareID(&s->max_deleted_entry_id,&end_id) <= 0)
     {
-        /* start_id <= max_deleted_entry_id <= end_id: The range does include a tombstone. */
+        /* start_id <= max_deleted_entry_id <= end_id：该范围确实包含一个墓碑条目。*/
         return 1;
     }
 
-    /* The range doesn't includes a tombstone. */
+    /* 该范围不包含墓碑条目。*/
     return 0;
 }
 
-/* Replies with a consumer group's current lag, that is the number of messages
- * in the stream that are yet to be delivered. In case that the lag isn't
- * available due to fragmentation, the reply to the client is a null. */
+/* 回复消费组的当前 lag，即 stream 中尚未投递的消息数。
+ * 如果由于碎片化导致 lag 不可用，则向客户端回复一个 null。*/
 void streamReplyWithCGLag(client *c, stream *s, streamCG *cg) {
     int valid = 0;
     long long lag = 0;
 
     if (!s->entries_added) {
-        /* The lag of a newly-initialized stream is 0. */
+        /* 新初始化的 stream 的 lag 为 0。*/
         lag = 0;
         valid = 1;
-    } else if (!s->length) { /* All entries deleted, now empty. */
+    } else if (!s->length) { /* 所有条目已删除，stream 现在为空。*/
         lag = 0;
         valid = 1;
     } else if (streamCompareID(&cg->last_id,&s->first_id) < 0 &&
                streamCompareID(&s->max_deleted_entry_id,&s->first_id) < 0)
     {
-        /* When both the consumer group's last_id and the maximum tombstone are behind
-         * the stream's first entry, the consumer group's lag will always be equal to
-         * the number of remainin entries in the stream. */
+        /* 当消费组的 last_id 和最大墓碑条目都在 stream 第一个条目之前时，
+         * 消费组的 lag 始终等于 stream 中剩余条目的数量。*/
         lag = s->length;
         valid = 1;
     } else if (cg->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s,&cg->last_id,NULL)) {
-        /* No fragmentation ahead means that the group's logical reads counter
-         * is valid for performing the lag calculation. */
+        /* 前方没有碎片化意味着该组的逻辑读取计数器可用于 lag 计算。*/
         lag = (long long)s->entries_added - cg->entries_read;
         valid = 1;
     } else {
-        /* Attempt to retrieve the group's last ID logical read counter. */
+        /* 尝试获取该组 last ID 的逻辑读取计数器。*/
         long long entries_read = streamEstimateDistanceFromFirstEverEntry(s,&cg->last_id);
         if (entries_read != SCG_INVALID_ENTRIES_READ) {
-            /* A valid counter was obtained. */
+            /* 已获得有效的计数器。*/
             lag = (long long)s->entries_added - entries_read;
             valid = 1;
         }
@@ -1474,82 +1385,75 @@ void streamReplyWithCGLag(client *c, stream *s, streamCG *cg) {
     }
 }
 
-/* This function returns a value that is the ID's logical read counter, or its
- * distance (the number of entries) from the first entry ever to have been added
- * to the stream.
- * 
- * A counter is returned only in one of the following cases:
- * 1. The ID is the same as the stream's last ID. In this case, the returned
- *    is the same as the stream's entries_added counter.
- * 2. The ID equals that of the currently first entry in the stream, and the
- *    stream has no tombstones. The returned value, in this case, is the result
- *    of subtracting the stream's length from its added_entries, incremented by
- *    one.
- * 3. The ID less than the stream's first current entry's ID, and there are no
- *    tombstones. Here the estimated counter is the result of subtracting the
- *    stream's length from its added_entries.
- * 4. The stream's added_entries is zero, meaning that no entries were ever
- *    added.
+/* 此函数返回一个值，它是 ID 的逻辑读取计数器，或其与 stream 中曾经添加的第一个
+ * 条目之间的距离（即条目数）。
  *
- * The special return value of ULLONG_MAX signals that the counter's value isn't
- * obtainable. It is returned in these cases:
- * 1. The provided ID, if it even exists, is somewhere between the stream's
- *    current first and last entries' IDs, or in the future.
- * 2. The stream contains one or more tombstones. */
+ * 仅在以下情况之一会返回计数器：
+ * 1. ID 与 stream 的最后一个 ID 相同。在这种情况下，返回值与 stream 的
+ *    entries_added 计数器相同。
+ * 2. ID 等于 stream 当前第一个条目的 ID，且 stream 没有墓碑条目。
+ *    这种情况下，返回值是 stream 的 length 与 added_entries 之差再加 1。
+ * 3. ID 小于 stream 当前第一个条目的 ID，且没有墓碑条目。
+ *    这里的估计计数器是 stream 的 length 与 added_entries 之差。
+ * 4. stream 的 added_entries 为 0，意味着从未添加过任何条目。
+ *
+ * 特殊返回值 ULLONG_MAX 表示无法获得计数器值。在以下情况下会返回该值：
+ * 1. 所提供的 ID（即使存在）位于 stream 当前第一个条目 ID 和最后一个条目 ID
+ *    之间的某处，或者位于未来。
+ * 2. stream 包含一个或多个墓碑条目。*/
 long long streamEstimateDistanceFromFirstEverEntry(stream *s, streamID *id) {
-    /* The counter of any ID in an empty, never-before-used stream is 0. */
+    /* 空 stream 中（即从未使用过的 stream），任何 ID 的计数器均为 0。*/
     if (!s->entries_added) {
         return 0;
     }
 
-    /* In the empty stream, if the ID is smaller or equal to the last ID,
-     * it can set to the current added_entries value. */
+    /* 在空 stream 中，如果 ID 小于或等于最后一个 ID，
+     * 则可以将其设置为当前的 added_entries 值。*/
     if (!s->length && streamCompareID(id,&s->last_id) < 1) {
         return s->entries_added;
     }
 
-    /* There are fragmentations between the `id` and the stream's last-generated-id. */
+    /* 在 `id` 与 stream 最后生成的 ID 之间存在碎片。*/
     if (!streamIDEqZero(id) && streamCompareID(id,&s->max_deleted_entry_id) < 0)
         return SCG_INVALID_ENTRIES_READ;
 
     int cmp_last = streamCompareID(id,&s->last_id);
     if (cmp_last == 0) {
-        /* Return the exact counter of the last entry in the stream. */
+        /* 返回 stream 中最后一个条目的精确计数器。*/
         return s->entries_added;
     } else if (cmp_last > 0) {
-        /* The counter of a future ID is unknown. */
+        /* 未来 ID 的计数器未知。*/
         return SCG_INVALID_ENTRIES_READ;
     }
 
     int cmp_id_first = streamCompareID(id,&s->first_id);
     int cmp_xdel_first = streamCompareID(&s->max_deleted_entry_id,&s->first_id);
     if (streamIDEqZero(&s->max_deleted_entry_id) || cmp_xdel_first < 0) {
-        /* There's definitely no fragmentation ahead. */
+        /* 前方肯定没有碎片。*/
         if (cmp_id_first < 0) {
-            /* Return the estimated counter. */
+            /* 返回估计的计数器。*/
             return s->entries_added - s->length;
         } else if (cmp_id_first == 0) {
-            /* Return the exact counter of the first entry in the stream. */
+            /* 返回 stream 中第一个条目的精确计数器。*/
             return s->entries_added - s->length + 1;
         }
     }
 
-    /* The ID is either before an XDEL that fragments the stream or an arbitrary
-     * ID. Either case, so we can't make a prediction. */
+    /* ID 可能位于导致 stream 碎片化的 XDEL 之前，或者是一个任意 ID。
+     * 在这两种情况下，我们都无法进行预测。*/
     return SCG_INVALID_ENTRIES_READ;
 }
 
-/* As a result of an explicit XCLAIM or XREADGROUP command, new entries
- * are created in the pending list of the stream and consumers. We need
- * to propagate this changes in the form of XCLAIM commands. */
+/* 作为显式 XCLAIM 或 XREADGROUP 命令的结果，会在 stream 和消费者的
+ * 待处理列表中创建新条目。我们需要以 XCLAIM 命令的形式传播这些更改。*/
 void streamPropagateXCLAIM(client *c, robj *key, streamCG *group, robj *groupname, robj *id, streamNACK *nack) {
-    /* We need to generate an XCLAIM that will work in a idempotent fashion:
+    /* 我们需要生成一个以幂等方式工作的 XCLAIM：
      *
      * XCLAIM <key> <group> <consumer> 0 <id> TIME <milliseconds-unix-time>
      *        RETRYCOUNT <count> FORCE JUSTID LASTID <id>.
      *
-     * Note that JUSTID is useful in order to avoid that XCLAIM will do
-     * useless work in the slave side, trying to fetch the stream item. */
+     * 注意，JUSTID 用于避免 XCLAIM 在从节点上做无用的工作，
+     * 即尝试获取 stream 条目。*/
     robj *argv[14];
     argv[0] = shared.xclaim;
     argv[1] = key;
@@ -1574,9 +1478,9 @@ void streamPropagateXCLAIM(client *c, robj *key, streamCG *group, robj *groupnam
     decrRefCount(argv[13]);
 }
 
-/* We need this when we want to propagate the new last-id of a consumer group
- * that was consumed by XREADGROUP with the NOACK option: in that case we can't
- * propagate the last ID just using the XCLAIM LASTID option, so we emit
+/* 当我们需要传播消费组（被带有 NOACK 选项的 XREADGROUP 消费）的新 last-id 时
+ * 需要此函数：在这种情况下，我们不能仅使用 XCLAIM LASTID 选项来传播 last ID，
+ * 因此我们发出
  *
  *  XGROUP SETID <key> <groupname> <id> ENTRIESREAD <entries_read>
  */
@@ -1596,9 +1500,9 @@ void streamPropagateGroupID(client *c, robj *key, streamCG *group, robj *groupna
     decrRefCount(argv[6]);
 }
 
-/* We need this when we want to propagate creation of consumer that was created
- * by XREADGROUP with the NOACK option. In that case, the only way to create
- * the consumer at the replica is by using XGROUP CREATECONSUMER (see issue #7140)
+/* 当我们需要传播由带 NOACK 选项的 XREADGROUP 创建的消费者时需要此函数。
+ * 在这种情况下，在副本上创建消费者的唯一方法是使用 XGROUP CREATECONSUMER
+ * （参见 issue #7140）
  *
  *  XGROUP CREATECONSUMER <key> <groupname> <consumername>
  */
@@ -1615,58 +1519,45 @@ void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, sds 
     decrRefCount(argv[4]);
 }
 
-/* Send the stream items in the specified range to the client 'c'. The range
- * the client will receive is between start and end inclusive, if 'count' is
- * non zero, no more than 'count' elements are sent.
+/* 将指定范围内的 stream 条目发送给客户端 'c'。客户端接收的范围是从 start 到 end（含），
+ * 如果 'count' 非零，则最多发送 'count' 个元素。
  *
- * The 'end' pointer can be NULL to mean that we want all the elements from
- * 'start' till the end of the stream. If 'rev' is non zero, elements are
- * produced in reversed order from end to start.
+ * 'end' 指针可以为 NULL，表示我们希望从 'start' 到 stream 末尾的所有元素。
+ * 如果 'rev' 非零，则按相反顺序（从 end 到 start）输出元素。
  *
- * The function returns the number of entries emitted.
+ * 该函数返回已输出条目的数量。
  *
- * If group and consumer are not NULL, the function performs additional work:
- * 1. It updates the last delivered ID in the group in case we are
- *    sending IDs greater than the current last ID.
- * 2. If the requested IDs are already assigned to some other consumer, the
- *    function will not return it to the client.
- * 3. An entry in the pending list will be created for every entry delivered
- *    for the first time to this consumer.
- * 4. The group's read counter is incremented if it is already valid and there
- *    are no future tombstones, or is invalidated (set to 0) otherwise. If the
- *    counter is invalid to begin with, we try to obtain it for the last
- *    delivered ID.
+ * 如果 group 和 consumer 不为 NULL，该函数会执行额外的工作：
+ * 1. 当我们发送的 ID 大于当前的 last ID 时，更新组中的最后投递 ID。
+ * 2. 如果请求的 ID 已经分配给其他消费者，该函数不会将其返回给客户端。
+ * 3. 对于第一次投递给该消费者的每个条目，会在待处理列表中创建一条记录。
+ * 4. 如果组的读取计数器已有效且前方没有墓碑条目，则递增它；否则使其无效（设为 0）。
+ *    如果计数器一开始就无效，我们会尝试为最后投递的 ID 获取它。
  *
- * The behavior may be modified passing non-zero flags:
+ * 通过传递非零标志可以修改行为：
  *
- * STREAM_RWR_NOACK: Do not create PEL entries, that is, the point "3" above
- *                   is not performed.
- * STREAM_RWR_RAWENTRIES: Do not emit array boundaries, but just the entries,
- *                        and return the number of entries emitted as usually.
- *                        This is used when the function is just used in order
- *                        to emit data and there is some higher level logic.
+ * STREAM_RWR_NOACK：不创建 PEL 条目，即不执行上述第 "3" 点。
+ * STREAM_RWR_RAWENTRIES：不输出数组边界的协议，只输出条目本身，
+ *                       并照常返回已输出条目的数量。
+ *                       当该函数仅用于输出数据且存在更高级别的逻辑时使用。
  *
- * The final argument 'spi' (stream propagation info pointer) is a structure
- * filled with information needed to propagate the command execution to AOF
- * and slaves, in the case a consumer group was passed: we need to generate
- * XCLAIM commands to create the pending list into AOF/slaves in that case.
+ * 最后一个参数 'spi'（stream propagation info pointer）是一个结构体，
+ * 其中填充了将命令执行传播到 AOF 和从节点所需的信息（在传递了消费组的情况下）：
+ * 在这种情况下我们需要生成 XCLAIM 命令来在 AOF/从节点中创建待处理列表。
  *
- * If 'spi' is set to NULL no propagation will happen even if the group was
- * given, but currently such a feature is never used by the code base that
- * will always pass 'spi' and propagate when a group is passed.
+ * 如果 'spi' 设置为 NULL，即使传递了组，也不会发生任何传播，
+ * 但当前代码库从不使用此特性，总是传递 'spi' 并在传递组时进行传播。
  *
- * Note that this function is recursive in certain cases. When it's called
- * with a non NULL group and consumer argument, it may call
- * streamReplyWithRangeFromConsumerPEL() in order to get entries from the
- * consumer pending entries list. However such a function will then call
- * streamReplyWithRange() in order to emit single entries (found in the
- * PEL by ID) to the client. This is the use case for the STREAM_RWR_RAWENTRIES
- * flag.
+ * 注意，在某些情况下此函数是递归的。当使用非 NULL 的 group 和 consumer
+ * 参数调用时，它可能会调用 streamReplyWithRangeFromConsumerPEL()
+ * 以从消费者的待处理列表中获取条目。但是该函数随后会调用 streamReplyWithRange()
+ * 以将单个条目（通过 ID 在 PEL 中找到）输出给客户端。这就是
+ * STREAM_RWR_RAWENTRIES 标志的用例。
  */
-#define STREAM_RWR_NOACK (1<<0)         /* Do not create entries in the PEL. */
-#define STREAM_RWR_RAWENTRIES (1<<1)    /* Do not emit protocol for array
-                                           boundaries, just the entries. */
-#define STREAM_RWR_HISTORY (1<<2)       /* Only serve consumer local PEL. */
+#define STREAM_RWR_NOACK (1<<0)         /* 不在 PEL 中创建条目。*/
+#define STREAM_RWR_RAWENTRIES (1<<1)    /* 不输出数组边界的协议，
+                                           仅输出条目。*/
+#define STREAM_RWR_HISTORY (1<<2)       /* 仅服务消费者的本地 PEL。*/
 size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end, size_t count, int rev, streamCG *group, streamConsumer *consumer, int flags, streamPropInfo *spi, unsigned long *propCount) {
     void *arraylen_ptr = NULL;
     size_t arraylen = 0;
@@ -1678,11 +1569,9 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
     if (propCount) *propCount = 0;
 
-    /* If the client is asking for some history, we serve it using a
-     * different function, so that we return entries *solely* from its
-     * own PEL. This ensures each consumer will always and only see
-     * the history of messages delivered to it and not yet confirmed
-     * as delivered. */
+    /* 如果客户端请求某些历史记录，我们使用一个不同的函数来服务，
+     * 这样我们只返回其自身 PEL 中的条目。这确保每个消费者始终且仅能看到
+     * 已投递给它但尚未确认的消息的历史记录。*/
     if (group && (flags & STREAM_RWR_HISTORY)) {
         return streamReplyWithRangeFromConsumerPEL(c,s,start,end,count,
                                                    consumer);
@@ -1692,36 +1581,34 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
         arraylen_ptr = addReplyDeferredLen(c);
     streamIteratorStart(&si,s,start,end,rev);
     while(streamIteratorGetID(&si,&id,&numfields)) {
-        /* Update the group last_id if needed. */
+        /* 如有必要，更新组的 last_id。*/
         if (group && streamCompareID(&id,&group->last_id) > 0) {
             if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
                 streamCompareID(&group->last_id, &s->first_id) >= 0 &&
                 !streamRangeHasTombstones(s,&group->last_id,NULL))
             {
-                /* A valid counter and no tombstones between the group's last-delivered-id
-                 * and the stream's last-generated-id mean we can increment the read counter
-                 * to keep tracking the group's progress. */
+                /* 在组的 last-delivered-id 和 stream 的 last-generated-id 之间
+                 * 具有有效的计数器且没有墓碑条目，意味着我们可以递增读取计数器，
+                 * 以继续跟踪组的进度。*/
                 group->entries_read++;
             } else if (s->entries_added) {
-                /* The group's counter may be invalid, so we try to obtain it. */
+                /* 组的计数器可能无效，因此我们尝试获取它。*/
                 group->entries_read = streamEstimateDistanceFromFirstEverEntry(s,&id);
             }
             group->last_id = id;
-            /* In the past, we would only set it when NOACK was specified. And in
-             * #9127, XCLAIM did not propagate entries_read in ACK, which would
-             * cause entries_read to be inconsistent between master and replicas,
-             * so here we call streamPropagateGroupID unconditionally. */
+            /* 过去，我们仅在指定 NOACK 时才会设置它。在 #9127 中，
+             * XCLAIM 在 ACK 时未传播 entries_read，这会导致 master 和副本之间
+             * 的 entries_read 不一致，因此这里我们无条件调用 streamPropagateGroupID。*/
             propagate_last_id = 1;
         }
 
-        /* Emit a two elements array for each item. The first is
-         * the ID, the second is an array of field-value pairs. */
+        /* 为每个条目输出一个二元数组。第一个是 ID，第二个是字段值对数组。*/
         addReplyArrayLen(c,2);
         addReplyStreamID(c,&id);
 
         addReplyArrayLen(c,numfields*2);
 
-        /* Emit the field-value pairs. */
+        /* 输出字段值对。*/
         while(numfields--) {
             unsigned char *key, *value;
             int64_t key_len, value_len;
@@ -1730,31 +1617,28 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
             addReplyBulkCBuffer(c,value,value_len);
         }
 
-        /* If a group is passed, we need to create an entry in the
-         * PEL (pending entries list) of this group *and* this consumer.
+        /* 如果传递了 group，我们需要在该组 *以及* 该消费者的 PEL
+         * （待处理条目列表）中创建一个条目。
          *
-         * Note that we cannot be sure about the fact the message is not
-         * already owned by another consumer, because the admin is able
-         * to change the consumer group last delivered ID using the
-         * XGROUP SETID command. So if we find that there is already
-         * a NACK for the entry, we need to associate it to the new
-         * consumer. */
+         * 注意，我们无法确定该消息是否已被另一个消费者拥有，
+         * 因为管理员能够使用 XGROUP SETID 命令更改消费者组的最后投递 ID。
+         * 因此，如果我们发现该条目已经存在 NACK，
+         * 我们需要将其关联到新的消费者。*/
         if (group && !noack) {
             unsigned char buf[sizeof(streamID)];
             streamEncodeID(buf,&id);
 
-            /* Try to add a new NACK. Most of the time this will work and
-             * will not require extra lookups. We'll fix the problem later
-             * if we find that there is already a entry for this ID. */
+            /* 尝试添加一个新的 NACK。大多数时候这将成功，无需额外的查找。
+             * 如果发现该 ID 已经存在条目，我们将稍后修复该问题。*/
             streamNACK *nack = streamCreateNACK(consumer);
             int group_inserted =
                 raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
             int consumer_inserted =
                 raxTryInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
 
-            /* Now we can check if the entry was already busy, and
-             * in that case reassign the entry to the new consumer,
-             * or update it if the consumer is the same as before. */
+            /* 现在我们可以检查该条目是否已被占用，
+             * 如果是，则将该条目重新分配给新的消费者，
+             * 或者如果消费者与之前相同则进行更新。*/
             if (group_inserted == 0) {
                 streamFreeNACK(nack);
                 void *result;
@@ -1762,11 +1646,11 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                 serverAssert(found);
                 nack = result;
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
-                /* Update the consumer and NACK metadata. */
+                /* 更新消费者和 NACK 元数据。*/
                 nack->consumer = consumer;
                 nack->delivery_time = commandTimeSnapshot();
                 nack->delivery_count = 1;
-                /* Add the entry in the new consumer local PEL. */
+                /* 在新消费者的本地 PEL 中添加该条目。*/
                 raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
             } else if (group_inserted == 1 && consumer_inserted == 0) {
                 serverPanic("NACK half-created. Should not be possible.");
@@ -1774,7 +1658,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
             consumer->active_time = commandTimeSnapshot();
 
-            /* Propagate as XCLAIM. */
+            /* 以 XCLAIM 的形式进行传播。*/
             if (spi) {
                 robj *idarg = createObjectFromStreamID(&id);
                 streamPropagateXCLAIM(c,spi->keyname,group,spi->groupname,idarg,nack);
@@ -1797,19 +1681,16 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
     return arraylen;
 }
 
-/* This is a helper function for streamReplyWithRange() when called with
- * group and consumer arguments, but with a range that is referring to already
- * delivered messages. In this case we just emit messages that are already
- * in the history of the consumer, fetching the IDs from its PEL.
+/* 这是 streamReplyWithRange() 在使用 group 和 consumer 参数调用，但范围引用的是
+ * 已经投递的消息时的辅助函数。在这种情况下，我们只需输出已经在消费者历史记录中
+ * 的消息，从其 PEL 中获取 ID。
  *
- * Note that this function does not have a 'rev' argument because it's not
- * possible to iterate in reverse using a group. Basically this function
- * is only called as a result of the XREADGROUP command.
+ * 注意，此函数没有 'rev' 参数，因为在使用组时无法反向迭代。
+ * 基本上，此函数仅在 XREADGROUP 命令的结果中被调用。
  *
- * This function is more expensive because it needs to inspect the PEL and then
- * seek into the radix tree of the messages in order to emit the full message
- * to the client. However clients only reach this code path when they are
- * fetching the history of already retrieved messages, which is rare. */
+ * 该函数开销较大，因为它需要检查 PEL，然后在消息的基数树中定位以将完整消息
+ * 输出给客户端。但是，客户端仅在获取已检索消息的历史记录时才会进入此代码路径，
+ * 这种情况很少见。*/
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamConsumer *consumer) {
     raxIterator ri;
     unsigned char startkey[sizeof(streamID)];
@@ -1828,10 +1709,9 @@ size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start
         if (streamReplyWithRange(c,s,&thisid,&thisid,1,0,NULL,NULL,
                                  STREAM_RWR_RAWENTRIES,NULL,NULL) == 0)
         {
-            /* Note that we may have a not acknowledged entry in the PEL
-             * about a message that's no longer here because was removed
-             * by the user by other means. In that case we signal it emitting
-             * the ID but then a NULL entry for the fields. */
+            /* 注意，PEL 中可能存在一个未确认的条目，其对应的消息已不再存在，
+             * 因为用户已通过其他方式删除了它。在这种情况下，
+             * 我们通过输出该 ID 但为字段输出 NULL 来表示它。*/
             addReplyArrayLen(c,2);
             addReplyStreamID(c,&thisid);
             addReplyNullArray(c);
@@ -1848,11 +1728,11 @@ size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start
 }
 
 /* -----------------------------------------------------------------------
- * Stream commands implementation
+ * Stream 命令实现
  * ----------------------------------------------------------------------- */
 
-/* Look the stream at 'key' and return the corresponding stream object.
- * The function creates a key setting it to an empty stream if needed. */
+/* 在 'key' 处查找 stream 并返回对应的 stream 对象。
+ * 如有必要，函数会创建一个设置为空 stream 的 key。*/
 robj *streamTypeLookupWriteOrCreate(client *c, robj *key, int no_create) {
     robj *o = lookupKeyWrite(c->db,key);
     if (checkType(c,o,OBJ_STREAM)) return NULL;
@@ -1867,23 +1747,20 @@ robj *streamTypeLookupWriteOrCreate(client *c, robj *key, int no_create) {
     return o;
 }
 
-/* Parse a stream ID in the format given by clients to Redis, that is
- * <ms>-<seq>, and converts it into a streamID structure. If
- * the specified ID is invalid C_ERR is returned and an error is reported
- * to the client, otherwise C_OK is returned. The ID may be in incomplete
- * form, just stating the milliseconds time part of the stream. In such a case
- * the missing part is set according to the value of 'missing_seq' parameter.
+/* 解析客户端提供给 Redis 的格式（即 <ms>-<seq>）的 stream ID，
+ * 并将其转换为 streamID 结构。如果指定的 ID 无效，则返回 C_ERR
+ * 并向客户端报告错误；否则返回 C_OK。
+ * 该 ID 可能是不完整的，仅声明了 stream 的毫秒时间部分。在这种情况下，
+ * 缺失的部分根据 'missing_seq' 参数的值进行设置。
  *
- * The IDs "-" and "+" specify respectively the minimum and maximum IDs
- * that can be represented. If 'strict' is set to 1, "-" and "+" will be
- * treated as an invalid ID.
+ * ID "-" 和 "+" 分别指定可表示的最小和最大 ID。如果 'strict' 设置为 1，
+ * "-" 和 "+" 将被视为无效 ID。
  *
- * The ID form <ms>-* specifies a millisconds-only ID, leaving the sequence part
- * to be autogenerated. When a non-NULL 'seq_given' argument is provided, this
- * form is accepted and the argument is set to 0 unless the sequence part is
- * specified.
- * 
- * If 'c' is set to NULL, no reply is sent to the client. */
+ * ID 形式 <ms>-* 指定仅包含毫秒的 ID，序列号部分将自动生成。
+ * 当提供非 NULL 的 'seq_given' 参数时，接受这种形式，
+ * 并且除非指定了序列号部分，否则该参数将被设置为 0。
+ *
+ * 如果 'c' 设置为 NULL，则不会向客户端发送回复。*/
 int streamGenericParseIDOrReply(client *c, const robj *o, streamID *id, uint64_t missing_seq, int strict, int *seq_given) {
     char buf[128];
     if (sdslen(o->ptr) > sizeof(buf)-1) goto invalid;
@@ -1896,7 +1773,7 @@ int streamGenericParseIDOrReply(client *c, const robj *o, streamID *id, uint64_t
         *seq_given = 1;
     }
 
-    /* Handle the "-" and "+" special cases. */
+    /* 处理 "-" 和 "+" 特殊情况。*/
     if (buf[0] == '-' && buf[1] == '\0') {
         id->ms = 0;
         id->seq = 0;
@@ -1907,7 +1784,7 @@ int streamGenericParseIDOrReply(client *c, const robj *o, streamID *id, uint64_t
         return C_OK;
     }
 
-    /* Parse <ms>-<seq> form. */
+    /* 解析 <ms>-<seq> 形式。*/
     unsigned long long ms, seq;
     char *dot = strchr(buf,'-');
     if (dot) *dot = '\0';
@@ -1915,7 +1792,7 @@ int streamGenericParseIDOrReply(client *c, const robj *o, streamID *id, uint64_t
     if (dot) {
         size_t seqlen = strlen(dot+1);
         if (seq_given != NULL && seqlen == 1 && *(dot + 1) == '*') {
-            /* Handle the <ms>-* form. */
+            /* 处理 <ms>-* 形式。*/
             seq = 0;
             *seq_given = 0;
         } else if (string2ull(dot+1,&seq) == 0) {
@@ -1929,34 +1806,31 @@ int streamGenericParseIDOrReply(client *c, const robj *o, streamID *id, uint64_t
     return C_OK;
 
 invalid:
-    if (c) addReplyError(c,"Invalid stream ID specified as stream "
-                           "command argument");
+    if (c) addReplyError(c,"作为 stream 命令参数的 stream ID 无效");
     return C_ERR;
 }
 
-/* Wrapper for streamGenericParseIDOrReply() used by module API. */
+/* streamGenericParseIDOrReply() 的包装函数，供模块 API 使用。*/
 int streamParseID(const robj *o, streamID *id) {
     return streamGenericParseIDOrReply(NULL,o,id,0,0,NULL);
 }
 
-/* Wrapper for streamGenericParseIDOrReply() with 'strict' argument set to
- * 0, to be used when - and + are acceptable IDs. */
+/* streamGenericParseIDOrReply() 的包装函数，'strict' 参数设置为 0，
+ * 用于 - 和 + 是可接受的 ID 时。*/
 int streamParseIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq) {
     return streamGenericParseIDOrReply(c,o,id,missing_seq,0,NULL);
 }
 
-/* Wrapper for streamGenericParseIDOrReply() with 'strict' argument set to
- * 1, to be used when we want to return an error if the special IDs + or -
- * are provided. */
+/* streamGenericParseIDOrReply() 的包装函数，'strict' 参数设置为 1，
+ * 用于在提供特殊 ID + 或 - 时希望返回错误的情况。*/
 int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq, int *seq_given) {
     return streamGenericParseIDOrReply(c,o,id,missing_seq,1,seq_given);
 }
 
-/* Helper for parsing a stream ID that is a range query interval. When the
- * exclude argument is NULL, streamParseIDOrReply() is called and the interval
- * is treated as close (inclusive). Otherwise, the exclude argument is set if 
- * the interval is open (the "(" prefix) and streamParseStrictIDOrReply() is
- * called in that case.
+/* 用于解析作为范围查询区间的 stream ID 的辅助函数。
+ * 当 exclude 参数为 NULL 时，调用 streamParseIDOrReply()，
+ * 该区间被视为闭区间（含端点）。否则，如果该区间是开区间
+ * （带有 "(" 前缀），则设置 exclude 参数，并调用 streamParseStrictIDOrReply()。
  */
 int streamParseIntervalIDOrReply(client *c, robj *o, streamID *id, int *exclude, uint64_t missing_seq) {
     char *p = o->ptr;
@@ -1979,8 +1853,8 @@ void streamRewriteApproxSpecifier(client *c, int idx) {
     rewriteClientCommandArgument(c,idx,shared.special_equals);
 }
 
-/* We propagate MAXLEN/MINID ~ <count> as MAXLEN/MINID = <resulting-len-of-stream>
- * otherwise trimming is no longer deterministic on replicas / AOF. */
+/* 我们将 MAXLEN/MINID ~ <count> 传播为 MAXLEN/MINID = <resulting-len-of-stream>，
+ * 否则修剪在副本/AOF 上不再是确定性的。*/
 void streamRewriteTrimArgument(client *c, stream *s, int trim_strategy, int idx) {
     robj *arg;
     if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
@@ -1997,43 +1871,42 @@ void streamRewriteTrimArgument(client *c, stream *s, int trim_strategy, int idx)
 
 /* XADD key [(MAXLEN [~|=] <count> | MINID [~|=] <id>) [LIMIT <entries>]] [NOMKSTREAM] <ID or *> [field value] [field value] ... */
 void xaddCommand(client *c) {
-    /* Parse options. */
+    /* 解析选项。*/
     streamAddTrimArgs parsed_args;
     int idpos = streamParseAddOrTrimArgsOrReply(c, &parsed_args, 1);
     if (idpos < 0)
-        return; /* streamParseAddOrTrimArgsOrReply already replied. */
-    int field_pos = idpos+1; /* The ID is always one argument before the first field */
+        return; /* streamParseAddOrTrimArgsOrReply 已发送回复。*/
+    int field_pos = idpos+1; /* ID 始终是第一个字段之前的一个参数 */
 
-    /* Check arity. */
+    /* 检查参数数量。*/
     if ((c->argc - field_pos) < 2 || ((c->argc-field_pos) % 2) == 1) {
         addReplyErrorArity(c);
         return;
     }
 
-    /* Return ASAP if minimal ID (0-0) was given so we avoid possibly creating
-     * a new stream and have streamAppendItem fail, leaving an empty key in the
-     * database. */
+    /* 如果给出了最小 ID (0-0)，则立即返回，以避免可能创建新 stream
+     * 并导致 streamAppendItem 失败而在数据库中留下一个空 key。*/
     if (parsed_args.id_given && parsed_args.seq_given &&
         parsed_args.id.ms == 0 && parsed_args.id.seq == 0)
     {
-        addReplyError(c,"The ID specified in XADD must be greater than 0-0");
+        addReplyError(c,"XADD 中指定的 ID 必须大于 0-0");
         return;
     }
 
-    /* Lookup the stream at key. */
+    /* 在 key 处查找 stream。*/
     robj *o;
     stream *s;
     if ((o = streamTypeLookupWriteOrCreate(c,c->argv[1],parsed_args.no_mkstream)) == NULL) return;
     s = o->ptr;
 
-    /* Return ASAP if the stream has reached the last possible ID */
+    /* 如果 stream 已达到最后一个可能的 ID，则立即返回 */
     if (s->last_id.ms == UINT64_MAX && s->last_id.seq == UINT64_MAX) {
-        addReplyError(c,"The stream has exhausted the last possible ID, "
-                        "unable to add more items");
+        addReplyError(c,"stream 已用尽最后一个可能的 ID，"
+                        "无法再添加更多条目");
         return;
     }
 
-    /* Append using the low level function and return the ID. */
+    /* 使用底层函数追加并返回 ID。*/
     errno = 0;
     streamID id;
     if (streamAppendItem(s,c->argv+field_pos,(c->argc-field_pos)/2,
@@ -2041,10 +1914,10 @@ void xaddCommand(client *c) {
     {
         serverAssert(errno != 0);
         if (errno == EDOM)
-            addReplyError(c,"The ID specified in XADD is equal or smaller than "
-                            "the target stream top item");
+            addReplyError(c,"XADD 中指定的 ID 等于或小于 "
+                            "目标 stream 的顶部条目");
         else
-            addReplyError(c,"Elements are too large to be stored");
+            addReplyError(c,"元素过大而无法存储");
         return;
     }
     sds replyid = createStreamIDString(&id);
@@ -2053,17 +1926,16 @@ void xaddCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_STREAM,"xadd",c->argv[1],c->db->id);
     server.dirty++;
 
-    /* Trim if needed. */
+    /* 如果需要则执行 trim。*/
     if (parsed_args.trim_strategy != TRIM_STRATEGY_NONE) {
         if (streamTrim(s, &parsed_args)) {
             notifyKeyspaceEvent(NOTIFY_STREAM,"xtrim",c->argv[1],c->db->id);
         }
         if (parsed_args.approx_trim) {
-            /* In case our trimming was limited (by LIMIT or by ~) we must
-             * re-write the relevant trim argument to make sure there will be
-             * no inconsistencies in AOF loading or in the replica.
-             * It's enough to check only args->approx because there is no
-             * way LIMIT is given without the ~ option. */
+            /* 如果我们的修剪被限制（通过 LIMIT 或 ~），我们必须
+             * 重写相关的 trim 参数，以确保在 AOF 加载或副本中不会出现不一致。
+             * 只需检查 args->approx 就足够了，因为不存在 LIMIT 在没有 ~ 选项
+             * 的情况下被给出的情况。*/
             streamRewriteApproxSpecifier(c,parsed_args.trim_strategy_arg_idx-1);
             streamRewriteTrimArgument(c,s,parsed_args.trim_strategy,parsed_args.trim_strategy_arg_idx);
         }
@@ -2071,8 +1943,7 @@ void xaddCommand(client *c) {
 
     signalModifiedKey(c,c->db,c->argv[1]);
 
-    /* Let's rewrite the ID argument with the one actually generated for
-     * AOF/replication propagation. */
+    /* 让我们用实际生成的 ID 重写 ID 参数，以用于 AOF/复制传播。*/
     if (!parsed_args.id_given || !parsed_args.seq_given) {
         robj *idarg = createObject(OBJ_STRING, replyid);
         rewriteClientCommandArgument(c, idpos, idarg);
@@ -2081,17 +1952,16 @@ void xaddCommand(client *c) {
         sdsfree(replyid);
     }
 
-    /* We need to signal to blocked clients that there is new data on this
-     * stream. */
+    /* 我们需要向被阻塞的客户端发出信号，告知此 stream 上有新数据。*/
     signalKeyAsReady(c->db, c->argv[1], OBJ_STREAM);
 }
 
-/* XRANGE/XREVRANGE actual implementation.
- * The 'start' and 'end' IDs are parsed as follows:
- *   Incomplete 'start' has its sequence set to 0, and 'end' to UINT64_MAX.
- *   "-" and "+"" mean the minimal and maximal ID values, respectively.
- *   The "(" prefix means an open (exclusive) range, so XRANGE stream (1-0 (2-0
- *   will match anything from 1-1 and 1-UINT64_MAX.
+/* XRANGE/XREVRANGE 的实际实现。
+ * 'start' 和 'end' ID 按以下方式解析：
+ *   不完整的 'start' 的序列号设置为 0，'end' 设置为 UINT64_MAX。
+ *   "-" 和 "+" 分别表示最小和最大 ID 值。
+ *   "(" 前缀表示开（排他）区间，所以 XRANGE stream (1-0 (2-0
+ *   将匹配从 1-1 到 1-UINT64_MAX 之间的任何内容。
  */
 void xrangeGenericCommand(client *c, int rev) {
     robj *o;
@@ -2101,22 +1971,22 @@ void xrangeGenericCommand(client *c, int rev) {
     robj *startarg = rev ? c->argv[3] : c->argv[2];
     robj *endarg = rev ? c->argv[2] : c->argv[3];
     int startex = 0, endex = 0;
-    
-    /* Parse start and end IDs. */
+
+    /* 解析 start 和 end ID。*/
     if (streamParseIntervalIDOrReply(c,startarg,&startid,&startex,0) != C_OK)
         return;
     if (startex && streamIncrID(&startid) != C_OK) {
-        addReplyError(c,"invalid start ID for the interval");
+        addReplyError(c,"区间的无效 start ID");
         return;
     }
     if (streamParseIntervalIDOrReply(c,endarg,&endid,&endex,UINT64_MAX) != C_OK)
         return;
     if (endex && streamDecrID(&endid) != C_OK) {
-        addReplyError(c,"invalid end ID for the interval");
+        addReplyError(c,"区间的无效 end ID");
         return;
     }
 
-    /* Parse the COUNT option if any. */
+    /* 如果存在 COUNT 选项则进行解析。*/
     if (c->argc > 4) {
         for (int j = 4; j < c->argc; j++) {
             int additional = c->argc-j-1;
@@ -2124,7 +1994,7 @@ void xrangeGenericCommand(client *c, int rev) {
                 if (getLongLongFromObjectOrReply(c,c->argv[j+1],&count,NULL)
                     != C_OK) return;
                 if (count < 0) count = 0;
-                j++; /* Consume additional arg. */
+                j++; /* 消耗额外参数。*/
             } else {
                 addReplyErrorObject(c,shared.syntaxerr);
                 return;
@@ -2132,7 +2002,7 @@ void xrangeGenericCommand(client *c, int rev) {
         }
     }
 
-    /* Return the specified range to the user. */
+    /* 将指定的范围返回给用户。*/
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray)) == NULL ||
          checkType(c,o,OBJ_STREAM)) return;
 
@@ -2168,25 +2038,24 @@ void xlenCommand(client *c) {
 /* XREAD [BLOCK <milliseconds>] [COUNT <count>] STREAMS key_1 key_2 ... key_N
  *       ID_1 ID_2 ... ID_N
  *
- * This function also implements the XREADGROUP command, which is like XREAD
- * but accepting the [GROUP group-name consumer-name] additional option.
- * This is useful because while XREAD is a read command and can be called
- * on slaves, XREADGROUP is not. */
+ * 此函数还实现了 XREADGROUP 命令，它类似于 XREAD，但接受额外的
+ * [GROUP group-name consumer-name] 选项。这很有用，因为 XREAD 是读命令，
+ * 可以在从节点上调用，而 XREADGROUP 不行。*/
 #define XREAD_BLOCKED_DEFAULT_COUNT 1000
 void xreadCommand(client *c) {
-    long long timeout = -1; /* -1 means, no BLOCK argument given. */
+    long long timeout = -1; /* -1 表示未给出 BLOCK 参数。*/
     long long count = 0;
     int streams_count = 0;
     int streams_arg = 0;
-    int noack = 0;          /* True if NOACK option was specified. */
+    int noack = 0;          /* 如果指定了 NOACK 选项则为 true。*/
     streamID static_ids[STREAMID_STATIC_VECTOR_LEN];
     streamID *ids = static_ids;
     streamCG **groups = NULL;
-    int xreadgroup = sdslen(c->argv[0]->ptr) == 10; /* XREAD or XREADGROUP? */
+    int xreadgroup = sdslen(c->argv[0]->ptr) == 10; /* XREAD 还是 XREADGROUP？*/
     robj *groupname = NULL;
     robj *consumername = NULL;
 
-    /* Parse arguments. */
+    /* 解析参数。*/
     for (int i = 1; i < c->argc; i++) {
         int moreargs = c->argc-i-1;
         char *o = c->argv[i]->ptr;
@@ -2204,17 +2073,17 @@ void xreadCommand(client *c) {
             streams_count = (c->argc-streams_arg);
             if ((streams_count % 2) != 0) {
                 char symbol = xreadgroup ? '>' : '$';
-                addReplyErrorFormat(c,"Unbalanced '%s' list of streams: "
-                                      "for each stream key an ID or '%c' must be "
-                                      "specified.", c->cmd->fullname,symbol);
+                addReplyErrorFormat(c,"'%s' 的 stream 列表不平衡："
+                                      "每个 stream key 必须指定一个 ID 或 '%c'。",
+                                      c->cmd->fullname,symbol);
                 return;
             }
-            streams_count /= 2; /* We have two arguments for each stream. */
+            streams_count /= 2; /* 每个 stream 有两个参数。*/
             break;
         } else if (!strcasecmp(o,"GROUP") && moreargs >= 2) {
             if (!xreadgroup) {
-                addReplyError(c,"The GROUP option is only supported by "
-                                "XREADGROUP. You called XREAD instead.");
+                addReplyError(c,"GROUP 选项仅由 XREADGROUP 支持。"
+                                "你调用的是 XREAD。");
                 return;
             }
             groupname = c->argv[i+1];
@@ -2222,8 +2091,8 @@ void xreadCommand(client *c) {
             i += 2;
         } else if (!strcasecmp(o,"NOACK")) {
             if (!xreadgroup) {
-                addReplyError(c,"The NOACK option is only supported by "
-                                "XREADGROUP. You called XREAD instead.");
+                addReplyError(c,"NOACK 选项仅由 XREADGROUP 支持。"
+                                "你调用的是 XREAD。");
                 return;
             }
             noack = 1;
@@ -2233,43 +2102,39 @@ void xreadCommand(client *c) {
         }
     }
 
-    /* STREAMS option is mandatory. */
+    /* STREAMS 选项是必需的。*/
     if (streams_arg == 0) {
         addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
-    /* If the user specified XREADGROUP then it must also
-     * provide the GROUP option. */
+    /* 如果用户指定了 XREADGROUP，那么还必须提供 GROUP 选项。*/
     if (xreadgroup && groupname == NULL) {
-        addReplyError(c,"Missing GROUP option for XREADGROUP");
+        addReplyError(c,"XREADGROUP 缺少 GROUP 选项");
         return;
     }
 
-    /* Parse the IDs and resolve the group name. */
+    /* 解析 ID 并解析组名。*/
     if (streams_count > STREAMID_STATIC_VECTOR_LEN)
         ids = zmalloc(sizeof(streamID)*streams_count);
     if (groupname) groups = zmalloc(sizeof(streamCG*)*streams_count);
 
     for (int i = streams_arg + streams_count; i < c->argc; i++) {
-        /* Specifying "$" as last-known-id means that the client wants to be
-         * served with just the messages that will arrive into the stream
-         * starting from now. */
+        /* 将 "$" 指定为最后已知 ID 意味着客户端希望仅获取从现在起
+         * 将到达 stream 中的消息。*/
         int id_idx = i - streams_arg - streams_count;
         robj *key = c->argv[i-streams_count];
         robj *o = lookupKeyRead(c->db,key);
         if (checkType(c,o,OBJ_STREAM)) goto cleanup;
         streamCG *group = NULL;
 
-        /* If a group was specified, than we need to be sure that the
-         * key and group actually exist. */
+        /* 如果指定了 group，则我们需要确保 key 和 group 确实存在。*/
         if (groupname) {
             if (o == NULL ||
                 (group = streamLookupCG(o->ptr,groupname->ptr)) == NULL)
             {
-                addReplyErrorFormat(c, "-NOGROUP No such key '%s' or consumer "
-                                       "group '%s' in XREADGROUP with GROUP "
-                                       "option",
+                addReplyErrorFormat(c, "-NOGROUP 在带 GROUP 选项的 XREADGROUP 中，"
+                                       "不存在 key '%s' 或消费者组 '%s'",
                                     (char*)key->ptr,(char*)groupname->ptr);
                 goto cleanup;
             }
@@ -2278,11 +2143,10 @@ void xreadCommand(client *c) {
 
         if (strcmp(c->argv[i]->ptr,"$") == 0) {
             if (xreadgroup) {
-                addReplyError(c,"The $ ID is meaningless in the context of "
-                                "XREADGROUP: you want to read the history of "
-                                "this consumer by specifying a proper ID, or "
-                                "use the > ID to get new messages. The $ ID would "
-                                "just return an empty result set.");
+                addReplyError(c,"在 XREADGROUP 的上下文中 $ ID 没有意义："
+                                "你希望通过指定一个适当的 ID 来读取此消费者的历史记录，"
+                                "或者使用 > ID 来获取新消息。"
+                                "$ ID 只会返回一个空结果集。");
                 goto cleanup;
             }
             if (o) {
@@ -2295,18 +2159,16 @@ void xreadCommand(client *c) {
             continue;
         } else if (strcmp(c->argv[i]->ptr,"+") == 0) {
             if (xreadgroup) {
-                addReplyError(c,"The + ID is meaningless in the context of "
-                                "XREADGROUP: you want to read the history of "
-                                "this consumer by specifying a proper ID, or "
-                                "use the > ID to get new messages. The + ID would "
-                                "just return an empty result set.");
+                addReplyError(c,"在 XREADGROUP 的上下文中 + ID 没有意义："
+                                "你希望通过指定一个适当的 ID 来读取此消费者的历史记录，"
+                                "或者使用 > ID 来获取新消息。"
+                                "+ ID 只会返回一个空结果集。");
                 goto cleanup;
             }
             if (o && ((stream *)o->ptr)->length) {
                 stream *s = o->ptr;
-                /* We need to get the last valid ID.
-                 * It is impossible to use s->last_id because
-                 * entry with s->last_id may have been removed. */
+                /* 我们需要获取最后一个有效的 ID。
+                 * 不能使用 s->last_id，因为 ID 为 s->last_id 的条目可能已被删除。*/
                 streamLastValidID(s, &ids[id_idx]);
                 streamDecrID(&ids[id_idx]);
             } else {
@@ -2316,14 +2178,13 @@ void xreadCommand(client *c) {
             continue;
         } else if (strcmp(c->argv[i]->ptr,">") == 0) {
             if (!xreadgroup) {
-                addReplyError(c,"The > ID can be specified only when calling "
-                                "XREADGROUP using the GROUP <group> "
-                                "<consumer> option.");
+                addReplyError(c,"仅在使用 GROUP <group> <consumer> 选项"
+                                "调用 XREADGROUP 时才能指定 > ID。");
                 goto cleanup;
             }
-            /* We use just the maximum ID to signal this is a ">" ID, anyway
-             * the code handling the blocking clients will have to update the
-             * ID later in order to match the changing consumer group last ID. */
+            /* 我们仅使用最大 ID 来表示这是 ">" ID，
+             * 处理阻塞客户端的代码稍后必须更新 ID，
+             * 以匹配不断变化的消费者组 last ID。*/
             ids[id_idx].ms = UINT64_MAX;
             ids[id_idx].seq = UINT64_MAX;
             continue;
@@ -2332,34 +2193,31 @@ void xreadCommand(client *c) {
             goto cleanup;
     }
 
-    /* Try to serve the client synchronously. */
+    /* 尝试同步服务客户端。*/
     size_t arraylen = 0;
     void *arraylen_ptr = NULL;
     for (int i = 0; i < streams_count; i++) {
         robj *o = lookupKeyRead(c->db,c->argv[streams_arg+i]);
         if (o == NULL) continue;
         stream *s = o->ptr;
-        streamID *gt = ids+i; /* ID must be greater than this. */
+        streamID *gt = ids+i; /* ID 必须大于此值。*/
         int serve_synchronously = 0;
-        int serve_history = 0; /* True for XREADGROUP with ID != ">". */
-        streamConsumer *consumer = NULL; /* Unused if XREAD */
-        streamPropInfo spi = {c->argv[streams_arg+i],groupname}; /* Unused if XREAD */
+        int serve_history = 0; /* 对于 ID != ">" 的 XREADGROUP 为 true。*/
+        streamConsumer *consumer = NULL; /* XREAD 时不使用 */
+        streamPropInfo spi = {c->argv[streams_arg+i],groupname}; /* XREAD 时不使用 */
 
-        /* Check if there are the conditions to serve the client
-         * synchronously. */
+        /* 检查是否有同步服务客户端的条件。*/
         if (groups) {
-            /* If the consumer is blocked on a group, we always serve it
-             * synchronously (serving its local history) if the ID specified
-             * was not the special ">" ID. */
+            /* 如果消费者阻塞在一个组上，当指定的 ID 不是特殊的 ">" ID 时，
+             * 我们始终同步为其提供服务（即服务其本地历史）。*/
             if (gt->ms != UINT64_MAX ||
                 gt->seq != UINT64_MAX)
             {
                 serve_synchronously = 1;
                 serve_history = 1;
             } else if (s->length) {
-                /* We also want to serve a consumer in a consumer group
-                 * synchronously in case the group top item delivered is smaller
-                 * than what the stream has inside. */
+                /* 当消费者组已投递的顶部条目小于 stream 中实际包含的内容时，
+                 * 我们也希望同步服务该消费者组。*/
                 streamID maxid, *last = &groups[i]->last_id;
                 streamLastValidID(s, &maxid);
                 if (streamCompareID(&maxid, last) > 0) {
@@ -2379,8 +2237,8 @@ void xreadCommand(client *c) {
             }
             consumer->seen_time = commandTimeSnapshot();
         } else if (s->length) {
-            /* For consumers without a group, we serve synchronously if we can
-             * actually provide at least one item from the stream. */
+            /* 对于不在组中的消费者，如果实际上能从 stream 提供至少一个条目，
+             * 我们就同步服务。*/
             streamID maxid;
             streamLastValidID(s, &maxid);
             if (streamCompareID(&maxid, gt) > 0) {
@@ -2391,17 +2249,15 @@ void xreadCommand(client *c) {
         if (serve_synchronously) {
             arraylen++;
             if (arraylen == 1) arraylen_ptr = addReplyDeferredLen(c);
-            /* streamReplyWithRange() handles the 'start' ID as inclusive,
-             * so start from the next ID, since we want only messages with
-             * IDs greater than start. */
+            /* streamReplyWithRange() 将 'start' ID 视为包含端点，
+             * 所以从下一个 ID 开始，因为我们只想要 ID 大于 start 的消息。*/
             streamID start = *gt;
             streamIncrID(&start);
 
-            /* Emit the two elements sub-array consisting of the name
-             * of the stream and the data we extracted from it. */
+            /* 输出由 stream 名称和我们从中提取的数据组成的二元子数组。*/
             if (c->resp == 2) addReplyArrayLen(c,2);
             addReplyBulk(c,c->argv[streams_arg+i]);
-            
+
             int flags = 0;
             unsigned long propCount = 0;
             if (noack) flags |= STREAM_RWR_NOACK;
@@ -2413,7 +2269,7 @@ void xreadCommand(client *c) {
         }
     }
 
-     /* We replied synchronously! Set the top array len and return to caller. */
+     /* 我们已同步回复！设置顶层数组长度并返回调用方。*/
     if (arraylen) {
         if (c->resp == 2)
             setDeferredArrayLen(c,arraylen_ptr,arraylen);
@@ -2422,17 +2278,17 @@ void xreadCommand(client *c) {
         goto cleanup;
     }
 
-    /* Block if needed. */
+    /* 如果需要则进行阻塞。*/
     if (timeout != -1) {
-        /* If we are not allowed to block the client, the only thing
-         * we can do is treating it as a timeout (even with timeout 0). */
+        /* 如果我们不允许阻塞客户端，那么唯一能做的
+         * 就是将其视为超时（即使超时为 0）。*/
         if (c->flags & CLIENT_DENY_BLOCKING) {
             addReplyNullArray(c);
             goto cleanup;
         }
-        /* We change the '$' to the current last ID for this stream. this is
-         * Since later on when we unblock on arriving data - we would like to
-         * re-process the command and in case '$' stays we will spin-block forever.
+        /* 我们将 '$' 更改为该 stream 的当前最后 ID。
+         * 因为稍后在有新数据时解除阻塞时——我们希望
+         * 重新处理该命令，如果 '$' 保持不变，我们将永远自旋阻塞。
          */
         for (int id_idx = 0; id_idx < streams_count; id_idx++) {
             int arg_idx = id_idx + streams_arg + streams_count;
@@ -2446,27 +2302,26 @@ void xreadCommand(client *c) {
         goto cleanup;
     }
 
-    /* No BLOCK option, nor any stream we can serve. Reply as with a
-     * timeout happened. */
+    /* 没有 BLOCK 选项，且没有可以服务的 stream。
+     * 按超时发生的方式回复。*/
     addReplyNullArray(c);
-    /* Continue to cleanup... */
+    /* 继续执行 cleanup... */
 
-cleanup: /* Cleanup. */
+cleanup: /* 清理。*/
 
-    /* The command is propagated (in the READGROUP form) as a side effect
-     * of calling lower level APIs. So stop any implicit propagation. */
+    /* 命令（以 READGROUP 形式）作为调用低层 API 的副作用被传播。
+     * 因此停止任何隐式传播。*/
     preventCommandPropagation(c);
     if (ids != static_ids) zfree(ids);
     zfree(groups);
 }
 
 /* -----------------------------------------------------------------------
- * Low level implementation of consumer groups
+ * 消费组的底层实现
  * ----------------------------------------------------------------------- */
 
-/* Create a NACK entry setting the delivery count to 1 and the delivery
- * time to the current time. The NACK consumer will be set to the one
- * specified as argument of the function. */
+/* 创建一个 NACK 条目，将投递计数设置为 1，投递时间设置为当前时间。
+ * NACK 的 consumer 将被设置为函数参数中指定的那个。*/
 streamNACK *streamCreateNACK(streamConsumer *consumer) {
     streamNACK *nack = zmalloc(sizeof(*nack));
     nack->delivery_time = commandTimeSnapshot();
@@ -2475,27 +2330,23 @@ streamNACK *streamCreateNACK(streamConsumer *consumer) {
     return nack;
 }
 
-/* Free a NACK entry. */
+/* 释放一个 NACK 条目。*/
 void streamFreeNACK(streamNACK *na) {
     zfree(na);
 }
 
-/* Free a consumer and associated data structures. Note that this function
- * will not reassign the pending messages associated with this consumer
- * nor will delete them from the stream, so when this function is called
- * to delete a consumer, and not when the whole stream is destroyed, the caller
- * should do some work before. */
+/* 释放一个消费者及其关联的数据结构。注意，此函数不会重新分配
+ * 与该消费者关联的待处理消息，也不会从 stream 中删除它们，
+ * 因此当调用此函数删除消费者（而非销毁整个 stream）时，
+ * 调用者应在之前做一些工作。*/
 void streamFreeConsumer(streamConsumer *sc) {
-    raxFree(sc->pel); /* No value free callback: the PEL entries are shared
-                         between the consumer and the main stream PEL. */
+    raxFree(sc->pel); /* 没有值释放回调：PEL 条目在消费者和主 stream PEL 之间共享。*/
     sdsfree(sc->name);
     zfree(sc);
 }
 
-/* Create a new consumer group in the context of the stream 's', having the
- * specified name, last server ID and reads counter. If a consumer group with
- * the same name already exists NULL is returned, otherwise the pointer to the
- * consumer group is returned. */
+/* 在 stream 's' 的上下文中创建一个具有指定名称、最后服务器 ID 和读取计数器的新消费组。
+ * 如果已存在同名的消费组，则返回 NULL，否则返回指向该消费组的指针。*/
 streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, long long entries_read) {
     if (s->cgroups == NULL) s->cgroups = raxNew();
     if (raxFind(s->cgroups,(unsigned char*)name,namelen,NULL))
@@ -2510,15 +2361,14 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     return cg;
 }
 
-/* Free a consumer group and all its associated data. */
+/* 释放一个消费组及其所有关联数据。*/
 void streamFreeCG(streamCG *cg) {
     raxFreeWithCallback(cg->pel,(void(*)(void*))streamFreeNACK);
     raxFreeWithCallback(cg->consumers,(void(*)(void*))streamFreeConsumer);
     zfree(cg);
 }
 
-/* Lookup the consumer group in the specified stream and returns its
- * pointer, otherwise if there is no such group, NULL is returned. */
+/* 在指定的 stream 中查找消费组并返回其指针，如果没有这样的组，则返回 NULL。*/
 streamCG *streamLookupCG(stream *s, sds groupname) {
     if (s->cgroups == NULL) return NULL;
     void *cg = NULL;
@@ -2526,10 +2376,9 @@ streamCG *streamLookupCG(stream *s, sds groupname) {
     return cg;
 }
 
-/* Create a consumer with the specified name in the group 'cg' and return.
- * If the consumer exists, return NULL. As a side effect, when the consumer
- * is successfully created, the key space will be notified and dirty++ unless
- * the SCC_NO_NOTIFY or SCC_NO_DIRTIFY flags is specified. */
+/* 在组 'cg' 中创建一个具有指定名称的消费者并返回。
+ * 如果该消费者已存在，则返回 NULL。作为副作用，当消费者成功创建后，
+ * 除非指定了 SCC_NO_NOTIFY 或 SCC_NO_DIRTIFY 标志，否则会通知 key 空间并执行 dirty++。*/
 streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid, int flags) {
     if (cg == NULL) return NULL;
     int notify = !(flags & SCC_NO_NOTIFY);
@@ -2550,7 +2399,7 @@ streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid
     return consumer;
 }
 
-/* Lookup the consumer with the specified name in the group 'cg'. */
+/* 在组 'cg' 中查找具有指定名称的消费者。*/
 streamConsumer *streamLookupConsumer(streamCG *cg, sds name) {
     if (cg == NULL) return NULL;
     void *consumer = NULL;
@@ -2558,10 +2407,9 @@ streamConsumer *streamLookupConsumer(streamCG *cg, sds name) {
     return consumer;
 }
 
-/* Delete the consumer specified in the consumer group 'cg'. */
+/* 删除消费组 'cg' 中指定的消费者。*/
 void streamDelConsumer(streamCG *cg, streamConsumer *consumer) {
-    /* Iterate all the consumer pending messages, deleting every corresponding
-     * entry from the global entry. */
+    /* 遍历该消费者的所有待处理消息，从全局条目中删除每个对应的条目。*/
     raxIterator ri;
     raxStart(&ri,consumer->pel);
     raxSeek(&ri,"^",NULL,0);
@@ -2572,14 +2420,14 @@ void streamDelConsumer(streamCG *cg, streamConsumer *consumer) {
     }
     raxStop(&ri);
 
-    /* Deallocate the consumer. */
+    /* 释放消费者。*/
     raxRemove(cg->consumers,(unsigned char*)consumer->name,
               sdslen(consumer->name),NULL);
     streamFreeConsumer(consumer);
 }
 
 /* -----------------------------------------------------------------------
- * Consumer groups commands
+ * 消费组命令
  * ----------------------------------------------------------------------- */
 
 /* XGROUP CREATE <key> <groupname> <id or $> [MKSTREAM] [ENTRIESREAD entries_read]
@@ -2591,14 +2439,14 @@ void xgroupCommand(client *c) {
     stream *s = NULL;
     sds grpname = NULL;
     streamCG *cg = NULL;
-    char *opt = c->argv[1]->ptr; /* Subcommand name. */
+    char *opt = c->argv[1]->ptr; /* 子命令名称。*/
     int mkstream = 0;
     long long entries_read = SCG_INVALID_ENTRIES_READ;
     robj *o;
 
-    /* Everything but the "HELP" option requires a key and group name. */
+    /* 除 "HELP" 选项外的所有操作都需要 key 和组名。*/
     if (c->argc >= 4) {
-        /* Parse optional arguments for CREATE and SETID */
+        /* 解析 CREATE 和 SETID 的可选参数 */
         int i = 5;
         int create_subcmd = !strcasecmp(opt,"CREATE");
         int setid_subcmd = !strcasecmp(opt,"SETID");
@@ -2610,7 +2458,7 @@ void xgroupCommand(client *c) {
                 if (getLongLongFromObjectOrReply(c,c->argv[i+1],&entries_read,NULL) != C_OK)
                     return;
                 if (entries_read < 0 && entries_read != SCG_INVALID_ENTRIES_READ) {
-                    addReplyError(c,"value for ENTRIESREAD must be positive or -1");
+                    addReplyError(c,"ENTRIESREAD 的值必须为正数或 -1");
                     return;
                 }
                 i += 2;
@@ -2628,47 +2476,46 @@ void xgroupCommand(client *c) {
         grpname = c->argv[3]->ptr;
     }
 
-    /* Check for missing key/group. */
+    /* 检查是否缺少 key/组。*/
     if (c->argc >= 4 && !mkstream) {
-        /* At this point key must exist, or there is an error. */
+        /* 此时 key 必须存在，否则会出错。*/
         if (s == NULL) {
             addReplyError(c,
-                "The XGROUP subcommand requires the key to exist. "
-                "Note that for CREATE you may want to use the MKSTREAM "
-                "option to create an empty stream automatically.");
+                "XGROUP 子命令要求 key 必须存在。"
+                "注意，对于 CREATE，你可能希望使用 MKSTREAM 选项"
+                "来自动创建一个空的 stream。");
             return;
         }
 
-        /* Certain subcommands require the group to exist. */
+        /* 某些子命令要求组必须存在。*/
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
             (!strcasecmp(opt,"SETID") ||
              !strcasecmp(opt,"CREATECONSUMER") ||
              !strcasecmp(opt,"DELCONSUMER")))
         {
-            addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
-                                   "for key name '%s'",
+            addReplyErrorFormat(c, "-NOGROUP key '%s' 上不存在消费者组 '%s'",
                                    (char*)grpname, (char*)c->argv[2]->ptr);
             return;
         }
     }
 
-    /* Dispatch the different subcommands. */
+    /* 分发不同的子命令。*/
     if (c->argc == 2 && !strcasecmp(opt,"HELP")) {
         const char *help[] = {
 "CREATE <key> <groupname> <id|$> [option]",
-"    Create a new consumer group. Options are:",
+"    创建一个新的消费者组。选项包括：",
 "    * MKSTREAM",
-"      Create the empty stream if it does not exist.",
+"      如果 stream 不存在则创建空 stream。",
 "    * ENTRIESREAD entries_read",
-"      Set the group's entries_read counter (internal use).",
+"      设置组的 entries_read 计数器（内部使用）。",
 "CREATECONSUMER <key> <groupname> <consumer>",
-"    Create a new consumer in the specified group.",
+"    在指定组中创建一个新的消费者。",
 "DELCONSUMER <key> <groupname> <consumer>",
-"    Remove the specified consumer.",
+"    删除指定的消费者。",
 "DESTROY <key> <groupname>",
-"    Remove the specified group.",
+"    删除指定的组。",
 "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
-"    Set the current group ID and entries_read counter.",
+"    设置当前组的 ID 和 entries_read 计数器。",
 NULL
         };
         addReplyHelp(c, help);
@@ -2701,7 +2548,7 @@ NULL
             notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-create",
                                 c->argv[2],c->db->id);
         } else {
-            addReplyError(c,"-BUSYGROUP Consumer Group name already exists");
+            addReplyError(c,"-BUSYGROUP 消费者组名称已存在");
         }
     } else if (!strcasecmp(opt,"SETID") && (c->argc == 5 || c->argc == 7)) {
         streamID id;
@@ -2723,7 +2570,7 @@ NULL
             server.dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-destroy",
                                 c->argv[2],c->db->id);
-            /* We want to unblock any XREADGROUP consumers with -NOGROUP. */
+            /* 我们希望解除任何因 -NOGROUP 而阻塞的 XREADGROUP 消费者。*/
             signalKeyAsReady(c->db,c->argv[2],OBJ_STREAM);
         } else {
             addReply(c,shared.czero);
@@ -2736,8 +2583,7 @@ NULL
         long long pending = 0;
         streamConsumer *consumer = streamLookupConsumer(cg,c->argv[4]->ptr);
         if (consumer) {
-            /* Delete the consumer and returns the number of pending messages
-             * that were yet associated with such a consumer. */
+            /* 删除消费者并返回仍与此消费者关联的待处理消息数。*/
             pending = raxSize(consumer->pel);
             streamDelConsumer(cg,consumer);
             server.dirty++;
@@ -2752,8 +2598,7 @@ NULL
 
 /* XSETID <stream> <id> [ENTRIESADDED entries_added] [MAXDELETEDID max_deleted_entry_id]
  *
- * Set the internal "last ID", "added entries" and "maximal deleted entry ID"
- * of a stream. */
+ * 设置 stream 的内部 "last ID"、"added entries" 和 "maximal deleted entry ID"。*/
 void xsetidCommand(client *c) {
     streamID id, max_xdel_id = {0, 0};
     long long entries_added = -1;
@@ -2763,13 +2608,13 @@ void xsetidCommand(client *c) {
 
     int i = 3;
     while (i < c->argc) {
-        int moreargs = (c->argc-1) - i; /* Number of additional arguments. */
+        int moreargs = (c->argc-1) - i; /* 剩余参数个数。*/
         char *opt = c->argv[i]->ptr;
         if (!strcasecmp(opt,"ENTRIESADDED") && moreargs) {
             if (getLongLongFromObjectOrReply(c,c->argv[i+1],&entries_added,NULL) != C_OK) {
                 return;
             } else if (entries_added < 0) {
-                addReplyError(c,"entries_added must be positive");
+                addReplyError(c,"entries_added 必须为正数");
                 return;
             }
             i += 2;
@@ -2777,7 +2622,7 @@ void xsetidCommand(client *c) {
             if (streamParseStrictIDOrReply(c,c->argv[i+1],&max_xdel_id,0,NULL) != C_OK) {
                 return;
             } else if (streamCompareID(&id,&max_xdel_id) < 0) {
-                addReplyError(c,"The ID specified in XSETID is smaller than the provided max_deleted_entry_id");
+                addReplyError(c,"XSETID 中指定的 ID 小于提供的 max_deleted_entry_id");
                 return;
             }
             i += 2;
@@ -2792,25 +2637,25 @@ void xsetidCommand(client *c) {
     stream *s = o->ptr;
 
     if (streamCompareID(&id,&s->max_deleted_entry_id) < 0) {
-        addReplyError(c,"The ID specified in XSETID is smaller than current max_deleted_entry_id");
+        addReplyError(c,"XSETID 中指定的 ID 小于当前的 max_deleted_entry_id");
         return;
     }
 
-    /* If the stream has at least one item, we want to check that the user
-     * is setting a last ID that is equal or greater than the current top
-     * item, otherwise the fundamental ID monotonicity assumption is violated. */
+    /* 如果 stream 至少有一个条目，我们希望检查用户是否正在设置
+     * 一个大于或等于当前顶部条目的 last ID，
+     * 否则将违反 ID 单调性的基本假设。*/
     if (s->length > 0) {
         streamID maxid;
         streamLastValidID(s,&maxid);
 
         if (streamCompareID(&id,&maxid) < 0) {
-            addReplyError(c,"The ID specified in XSETID is smaller than the target stream top item");
+            addReplyError(c,"XSETID 中指定的 ID 小于目标 stream 的顶部条目");
             return;
         }
 
-        /* If an entries_added was provided, it can't be lower than the length. */
+        /* 如果提供了 entries_added，它不能小于 length。*/
         if (entries_added != -1 && s->length > (uint64_t)entries_added) {
-            addReplyError(c,"The entries_added specified in XSETID is smaller than the target stream length");
+            addReplyError(c,"XSETID 中指定的 entries_added 小于目标 stream 的长度");
             return;
         }
     }
@@ -2826,31 +2671,28 @@ void xsetidCommand(client *c) {
 }
 
 /* XACK <key> <group> <id> <id> ... <id>
- * Acknowledge a message as processed. In practical terms we just check the
- * pending entries list (PEL) of the group, and delete the PEL entry both from
- * the group and the consumer (pending messages are referenced in both places).
+ * 确认消息已处理。实际上我们只是检查组的待处理条目列表 (PEL)，
+ * 并从组和消费者中删除 PEL 条目（待处理消息在两处都被引用）。
  *
- * Return value of the command is the number of messages successfully
- * acknowledged, that is, the IDs we were actually able to resolve in the PEL.
+ * 命令的返回值是已成功确认的消息数，即我们实际上能够在 PEL 中解析的 ID 数量。
  */
 void xackCommand(client *c) {
     streamCG *group = NULL;
     robj *o = lookupKeyRead(c->db,c->argv[1]);
     if (o) {
-        if (checkType(c,o,OBJ_STREAM)) return; /* Type error. */
+        if (checkType(c,o,OBJ_STREAM)) return; /* 类型错误。*/
         group = streamLookupCG(o->ptr,c->argv[2]->ptr);
     }
 
-    /* No key or group? Nothing to ack. */
+    /* 没有 key 或组？无需确认。*/
     if (o == NULL || group == NULL) {
         addReply(c,shared.czero);
         return;
     }
 
-    /* Start parsing the IDs, so that we abort ASAP if there is a syntax
-     * error: the return value of this command cannot be an error in case
-     * the client successfully acknowledged some messages, so it should be
-     * executed in a "all or nothing" fashion. */
+    /* 尽快开始解析 ID，以便在出现语法错误时立即中止：
+     * 该命令的返回值在客户端成功确认一些消息的情况下不能是错误，
+     * 因此应以 "全有或全无" 的方式执行。*/
     streamID static_ids[STREAMID_STATIC_VECTOR_LEN];
     streamID *ids = static_ids;
     int id_count = c->argc-3;
@@ -2865,9 +2707,8 @@ void xackCommand(client *c) {
         unsigned char buf[sizeof(streamID)];
         streamEncodeID(buf,&ids[j-3]);
 
-        /* Lookup the ID in the group PEL: it will have a reference to the
-         * NACK structure that will have a reference to the consumer, so that
-         * we are able to remove the entry from both PELs. */
+        /* 在组 PEL 中查找 ID：它将具有对 NACK 结构的引用，
+         * 该 NACK 结构将引用消费者，以便我们能够从两个 PEL 中删除该条目。*/
         void *result;
         if (raxFind(group->pel,buf,sizeof(buf),&result)) {
             streamNACK *nack = result;
@@ -2889,12 +2730,10 @@ cleanup:
  * the amount of pending messages for the key/group pair, together with
  * the minimum and maximum ID of pending messages.
  *
- * If start and stop are provided instead, the pending messages are returned
- * with information about the current owner, number of deliveries and last
- * delivery time and so forth. */
+ * 如果提供了 start 和 stop，则返回待处理消息及其当前所有者、
+ * 投递次数和最后投递时间等信息。*/
 void xpendingCommand(client *c) {
-    int justinfo = c->argc == 3; /* Without the range just outputs general
-                                    information about the PEL. */
+    int justinfo = c->argc == 3; /* 没有范围时，仅输出关于 PEL 的一般信息。*/
     robj *key = c->argv[1];
     robj *groupname = c->argv[2];
     robj *consumername = NULL;
@@ -2903,55 +2742,54 @@ void xpendingCommand(client *c) {
     long long minidle = 0;
     int startex = 0, endex = 0;
 
-    /* Start and stop, and the consumer, can be omitted. Also the IDLE modifier. */
+    /* start 和 stop 以及 consumer 可以省略。IDLE 修饰符也是如此。*/
     if (c->argc != 3 && (c->argc < 6 || c->argc > 9)) {
         addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
-    /* Parse start/end/count arguments ASAP if needed, in order to report
-     * syntax errors before any other error. */
+    /* 尽快解析 start/end/count 参数，以便在任何其他错误之前报告语法错误。*/
     if (c->argc >= 6) {
-        int startidx = 3; /* Without IDLE */
+        int startidx = 3; /* 不含 IDLE */
 
         if (!strcasecmp(c->argv[3]->ptr, "IDLE")) {
             if (getLongLongFromObjectOrReply(c, c->argv[4], &minidle, NULL) == C_ERR)
                 return;
             if (c->argc < 8) {
-                /* If IDLE was provided we must have at least 'start end count' */
+                /* 如果提供了 IDLE，则必须至少有 'start end count' */
                 addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
-            /* Search for rest of arguments after 'IDLE <idle>' */
+            /* 在 'IDLE <idle>' 之后搜索其余参数 */
             startidx += 2;
         }
 
-        /* count argument. */
+        /* count 参数。*/
         if (getLongLongFromObjectOrReply(c,c->argv[startidx+2],&count,NULL) == C_ERR)
             return;
         if (count < 0) count = 0;
 
-        /* start and end arguments. */
+        /* start 和 end 参数。*/
         if (streamParseIntervalIDOrReply(c,c->argv[startidx],&startid,&startex,0) != C_OK)
             return;
         if (startex && streamIncrID(&startid) != C_OK) {
-            addReplyError(c,"invalid start ID for the interval");
+            addReplyError(c,"区间的无效 start ID");
             return;
         }
         if (streamParseIntervalIDOrReply(c,c->argv[startidx+1],&endid,&endex,UINT64_MAX) != C_OK)
             return;
         if (endex && streamDecrID(&endid) != C_OK) {
-            addReplyError(c,"invalid end ID for the interval");
+            addReplyError(c,"区间的无效 end ID");
             return;
         }
 
         if (startidx+3 < c->argc) {
-            /* 'consumer' was provided */
+            /* 已提供 'consumer' */
             consumername = c->argv[startidx+3];
         }
     }
 
-    /* Lookup the key and the group inside the stream. */
+    /* 在 stream 中查找 key 和组。*/
     robj *o = lookupKeyRead(c->db,c->argv[1]);
     streamCG *group;
 
@@ -2959,24 +2797,23 @@ void xpendingCommand(client *c) {
     if (o == NULL ||
         (group = streamLookupCG(o->ptr,groupname->ptr)) == NULL)
     {
-        addReplyErrorFormat(c, "-NOGROUP No such key '%s' or consumer "
-                               "group '%s'",
+        addReplyErrorFormat(c, "-NOGROUP 不存在 key '%s' 或消费者组 '%s'",
                                (char*)key->ptr,(char*)groupname->ptr);
         return;
     }
 
-    /* XPENDING <key> <group> variant. */
+    /* XPENDING <key> <group> 变体。*/
     if (justinfo) {
         addReplyArrayLen(c,4);
-        /* Total number of messages in the PEL. */
+        /* PEL 中的消息总数。*/
         addReplyLongLong(c,raxSize(group->pel));
-        /* First and last IDs. */
+        /* 第一个和最后一个 ID。*/
         if (raxSize(group->pel) == 0) {
-            addReplyNull(c); /* Start. */
-            addReplyNull(c); /* End. */
-            addReplyNullArray(c); /* Clients. */
+            addReplyNull(c); /* Start。*/
+            addReplyNull(c); /* End。*/
+            addReplyNullArray(c); /* Clients。*/
         } else {
-            /* Start. */
+            /* Start。*/
             raxIterator ri;
             raxStart(&ri,group->pel);
             raxSeek(&ri,"^",NULL,0);
@@ -2984,14 +2821,14 @@ void xpendingCommand(client *c) {
             streamDecodeID(ri.key,&startid);
             addReplyStreamID(c,&startid);
 
-            /* End. */
+            /* End。*/
             raxSeek(&ri,"$",NULL,0);
             raxNext(&ri);
             streamDecodeID(ri.key,&endid);
             addReplyStreamID(c,&endid);
             raxStop(&ri);
 
-            /* Consumers with pending messages. */
+            /* 具有待处理消息的消费者。*/
             raxStart(&ri,group->consumers);
             raxSeek(&ri,"^",NULL,0);
             void *arraylen_ptr = addReplyDeferredLen(c);
@@ -3007,13 +2844,12 @@ void xpendingCommand(client *c) {
             setDeferredArrayLen(c,arraylen_ptr,arraylen);
             raxStop(&ri);
         }
-    } else { /* <start>, <stop> and <count> provided, return actual pending entries (not just info) */
+    } else { /* 提供了 <start>, <stop> 和 <count>，返回实际的待处理条目（不仅仅是信息） */
         streamConsumer *consumer = NULL;
         if (consumername) {
             consumer = streamLookupConsumer(group,consumername->ptr);
 
-            /* If a consumer name was mentioned but it does not exist, we can
-             * just return an empty array. */
+            /* 如果提到了消费者名称但它不存在，我们可以直接返回一个空数组。*/
             if (consumer == NULL) {
                 addReplyArrayLen(c,0);
                 return;
@@ -3045,21 +2881,21 @@ void xpendingCommand(client *c) {
             count--;
             addReplyArrayLen(c,4);
 
-            /* Entry ID. */
+            /* 条目 ID。*/
             streamID id;
             streamDecodeID(ri.key,&id);
             addReplyStreamID(c,&id);
 
-            /* Consumer name. */
+            /* 消费者名称。*/
             addReplyBulkCBuffer(c,nack->consumer->name,
                                 sdslen(nack->consumer->name));
 
-            /* Milliseconds elapsed since last delivery. */
+            /* 自上次投递以来经过的毫秒数。*/
             mstime_t elapsed = now - nack->delivery_time;
             if (elapsed < 0) elapsed = 0;
             addReplyLongLong(c,elapsed);
 
-            /* Number of deliveries. */
+            /* 投递次数。*/
             addReplyLongLong(c,nack->delivery_count);
         }
         raxStop(&ri);
@@ -3071,100 +2907,85 @@ void xpendingCommand(client *c) {
  *        [IDLE <milliseconds>] [TIME <mstime>] [RETRYCOUNT <count>]
  *        [FORCE] [JUSTID]
  *
- * Changes ownership of one or multiple messages in the Pending Entries List
- * of a given stream consumer group.
+ * 更改指定 stream 消费者组待处理条目列表中一个或多个消息的所有权。
  *
- * If the message ID (among the specified ones) exists, and its idle
- * time greater or equal to <min-idle-time>, then the message new owner
- * becomes the specified <consumer>. If the minimum idle time specified
- * is zero, messages are claimed regardless of their idle time.
+ * 如果（在指定的消息 ID 中）某消息 ID 存在，并且其空闲时间
+ * 大于或等于 <min-idle-time>，则该消息的新所有者变为指定的 <consumer>。
+ * 如果指定的最小空闲时间为 0，则无论空闲时间如何都声明该消息。
  *
- * All the messages that cannot be found inside the pending entries list
- * are ignored, but in case the FORCE option is used. In that case we
- * create the NACK (representing a not yet acknowledged message) entry in
- * the consumer group PEL.
+ * 所有在待处理条目列表中找不到的消息都将被忽略，但如果使用了
+ * FORCE 选项则例外。在这种情况下，我们会在消费者组 PEL 中创建一个
+ * NACK（代表尚未确认的消息）条目。
  *
- * This command creates the consumer as side effect if it does not yet
- * exists. Moreover the command reset the idle time of the message to 0,
- * even if by using the IDLE or TIME options, the user can control the
- * new idle time.
+ * 该命令在消费者不存在时会将其创建作为副作用。此外，该命令将
+ * 消息的空闲时间重置为 0，即使通过 IDLE 或 TIME 选项，
+ * 用户也可以控制新的空闲时间。
  *
- * The options at the end can be used in order to specify more attributes
- * to set in the representation of the pending message:
+ * 末尾的选项可用于指定要设置的待处理消息表示的更多属性：
  *
  * 1. IDLE <ms>:
- *      Set the idle time (last time it was delivered) of the message.
- *      If IDLE is not specified, an IDLE of 0 is assumed, that is,
- *      the time count is reset because the message has now a new
- *      owner trying to process it.
+ *      设置消息的空闲时间（上次投递的时间）。
+ *      如果未指定 IDLE，则假定 IDLE 为 0，即时间计数被重置，
+ *      因为消息现在有了新的所有者正在尝试处理它。
  *
  * 2. TIME <ms-unix-time>:
- *      This is the same as IDLE but instead of a relative amount of
- *      milliseconds, it sets the idle time to a specific unix time
- *      (in milliseconds). This is useful in order to rewrite the AOF
- *      file generating XCLAIM commands.
+ *      这与 IDLE 相同，但不是相对的毫秒数，而是将空闲时间
+ *      设置为特定的 unix 时间（以毫秒为单位）。这对于重写
+ *      AOF 文件以生成 XCLAIM 命令很有用。
  *
  * 3. RETRYCOUNT <count>:
- *      Set the retry counter to the specified value. This counter is
- *      incremented every time a message is delivered again. Normally
- *      XCLAIM does not alter this counter, which is just served to clients
- *      when the XPENDING command is called: this way clients can detect
- *      anomalies, like messages that are never processed for some reason
- *      after a big number of delivery attempts.
+ *      将重试计数器设置为指定的值。每次消息再次被投递时，
+ *      该计数器都会递增。通常 XCLAIM 不会更改此计数器，
+ *      它仅在调用 XPENDING 命令时提供给客户端：通过这种方式，
+ *      客户端可以检测异常，例如由于某些原因在大量投递尝试后
+ *      从未处理的消息。
  *
  * 4. FORCE:
- *      Creates the pending message entry in the PEL even if certain
- *      specified IDs are not already in the PEL assigned to a different
- *      client. However the message must be exist in the stream, otherwise
- *      the IDs of non existing messages are ignored.
+ *      即使某些指定的 ID 尚未在分配给其他客户端的 PEL 中，
+ *      也会在 PEL 中创建待处理消息条目。但是消息必须存在于
+ *      stream 中，否则不存在的消息 ID 将被忽略。
  *
  * 5. JUSTID:
- *      Return just an array of IDs of messages successfully claimed,
- *      without returning the actual message.
+ *      仅返回成功声明的消息的 ID 数组，而不返回实际的消息。
  *
  * 6. LASTID <id>:
- *      Update the consumer group last ID with the specified ID if the
- *      current last ID is smaller than the provided one.
- *      This is used for replication / AOF, so that when we read from a
- *      consumer group, the XCLAIM that gets propagated to give ownership
- *      to the consumer, is also used in order to update the group current
- *      ID.
+ *      如果当前 last ID 小于提供的 ID，则使用指定的 ID 更新
+ *      消费者组的 last ID。这用于复制/AOF，因此当我们从消费者
+ *      组读取时，被传播以将所有权交给消费者的 XCLAIM 也将用于
+ *      更新组的当前 ID。
  *
- * The command returns an array of messages that the user
- * successfully claimed, so that the caller is able to understand
- * what messages it is now in charge of. */
+ * 该命令返回用户成功声明的消息数组，以便调用者能够了解
+ * 它现在负责哪些消息。*/
 void xclaimCommand(client *c) {
     streamCG *group = NULL;
     robj *o = lookupKeyRead(c->db,c->argv[1]);
-    long long minidle; /* Minimum idle time argument. */
-    long long retrycount = -1;   /* -1 means RETRYCOUNT option not given. */
-    mstime_t deliverytime = -1;  /* -1 means IDLE/TIME options not given. */
+    long long minidle; /* 最小空闲时间参数。*/
+    long long retrycount = -1;   /* -1 表示未给出 RETRYCOUNT 选项。*/
+    mstime_t deliverytime = -1;  /* -1 表示未给出 IDLE/TIME 选项。*/
     int force = 0;
     int justid = 0;
 
     if (o) {
-        if (checkType(c,o,OBJ_STREAM)) return; /* Type error. */
+        if (checkType(c,o,OBJ_STREAM)) return; /* 类型错误。*/
         group = streamLookupCG(o->ptr,c->argv[2]->ptr);
     }
 
-    /* No key or group? Send an error given that the group creation
-     * is mandatory. */
+    /* 没有 key 或组？由于必须创建组，因此发送错误。*/
     if (o == NULL || group == NULL) {
-        addReplyErrorFormat(c,"-NOGROUP No such key '%s' or "
-                              "consumer group '%s'", (char*)c->argv[1]->ptr,
+        addReplyErrorFormat(c,"-NOGROUP 不存在 key '%s' 或消费者组 '%s'",
+                              (char*)c->argv[1]->ptr,
                               (char*)c->argv[2]->ptr);
         return;
     }
 
     if (getLongLongFromObjectOrReply(c,c->argv[4],&minidle,
-        "Invalid min-idle-time argument for XCLAIM")
+        "XCLAIM 的 min-idle-time 参数无效")
         != C_OK) return;
     if (minidle < 0) minidle = 0;
 
-    /* Start parsing the IDs, so that we abort ASAP if there is a syntax
-     * error: the return value of this command cannot be an error in case
-     * the client successfully claimed some message, so it should be
-     * executed in a "all or nothing" fashion. */
+    /* 尽快开始解析 ID，以便在出现语法错误时立即中止：
+     * 该命令的返回值在客户端成功声明某些消息的情况下不能是错误，
+     * 因此应以 "全有或全无" 的方式执行。*/
     int j;
     streamID static_ids[STREAMID_STATIC_VECTOR_LEN];
     streamID *ids = static_ids;
@@ -3174,15 +2995,14 @@ void xclaimCommand(client *c) {
     for (j = 5; j < c->argc; j++) {
         if (streamParseStrictIDOrReply(NULL,c->argv[j],&ids[j-5],0,NULL) != C_OK) break;
     }
-    int last_id_arg = j-1; /* Next time we iterate the IDs we now the range. */
+    int last_id_arg = j-1; /* 下次迭代这些 ID 时我们将知道其范围。*/
 
-    /* If we stopped because some IDs cannot be parsed, perhaps they
-     * are trailing options. */
+    /* 如果我们因为某些 ID 无法解析而停止，那么它们可能是尾部的选项。*/
     mstime_t now = commandTimeSnapshot();
     streamID last_id = {0,0};
     int propagate_last_id = 0;
     for (; j < c->argc; j++) {
-        int moreargs = (c->argc-1) - j; /* Number of additional arguments. */
+        int moreargs = (c->argc-1) - j; /* 剩余参数个数。*/
         char *opt = c->argv[j]->ptr;
         if (!strcasecmp(opt,"FORCE")) {
             force = 1;
@@ -3191,24 +3011,24 @@ void xclaimCommand(client *c) {
         } else if (!strcasecmp(opt,"IDLE") && moreargs) {
             j++;
             if (getLongLongFromObjectOrReply(c,c->argv[j],&deliverytime,
-                "Invalid IDLE option argument for XCLAIM")
+                "XCLAIM 的 IDLE 选项参数无效")
                 != C_OK) goto cleanup;
             deliverytime = now - deliverytime;
         } else if (!strcasecmp(opt,"TIME") && moreargs) {
             j++;
             if (getLongLongFromObjectOrReply(c,c->argv[j],&deliverytime,
-                "Invalid TIME option argument for XCLAIM")
+                "XCLAIM 的 TIME 选项参数无效")
                 != C_OK) goto cleanup;
         } else if (!strcasecmp(opt,"RETRYCOUNT") && moreargs) {
             j++;
             if (getLongLongFromObjectOrReply(c,c->argv[j],&retrycount,
-                "Invalid RETRYCOUNT option argument for XCLAIM")
+                "XCLAIM 的 RETRYCOUNT 选项参数无效")
                 != C_OK) goto cleanup;
         } else if (!strcasecmp(opt,"LASTID") && moreargs) {
             j++;
             if (streamParseStrictIDOrReply(c,c->argv[j],&last_id,0,NULL) != C_OK) goto cleanup;
         } else {
-            addReplyErrorFormat(c,"Unrecognized XCLAIM option '%s'",opt);
+            addReplyErrorFormat(c,"无法识别的 XCLAIM 选项 '%s'",opt);
             goto cleanup;
         }
     }
@@ -3219,22 +3039,19 @@ void xclaimCommand(client *c) {
     }
 
     if (deliverytime != -1) {
-        /* If a delivery time was passed, either with IDLE or TIME, we
-         * do some sanity check on it, and set the deliverytime to now
-         * (which is a sane choice usually) if the value is bogus.
-         * To raise an error here is not wise because clients may compute
-         * the idle time doing some math starting from their local time,
-         * and this is not a good excuse to fail in case, for instance,
-         * the computer time is a bit in the future from our POV. */
+        /* 如果通过 IDLE 或 TIME 传递了投递时间，我们对其做一些合理性检查，
+         * 并在值无效时将 deliverytime 设为 now（通常是合理的选择）。
+         * 在此处引发错误是不明智的，因为客户端可能会从其本地时间开始
+         * 进行一些数学运算来计算空闲时间，而例如计算机时间从我们的角度
+         * 来看略微超前，并不是失败的好借口。*/
         if (deliverytime < 0 || deliverytime > now) deliverytime = now;
     } else {
-        /* If no IDLE/TIME option was passed, we want the last delivery
-         * time to be now, so that the idle time of the message will be
-         * zero. */
+        /* 如果没有传递 IDLE/TIME 选项，我们希望最后投递时间为 now，
+         * 这样消息的空闲时间将为零。*/
         deliverytime = now;
     }
 
-    /* Do the actual claiming. */
+    /* 执行实际的声明操作。*/
     streamConsumer *consumer = streamLookupConsumer(group,c->argv[3]->ptr);
     if (consumer == NULL) {
         consumer = streamCreateConsumer(group,c->argv[3]->ptr,c->argv[1],c->db->id,SCC_DEFAULT);
@@ -3248,20 +3065,20 @@ void xclaimCommand(client *c) {
         unsigned char buf[sizeof(streamID)];
         streamEncodeID(buf,&id);
 
-        /* Lookup the ID in the group PEL. */
+        /* 在组 PEL 中查找 ID。*/
         void *result = NULL;
         raxFind(group->pel,buf,sizeof(buf),&result);
         streamNACK *nack = result;
 
-        /* Item must exist for us to transfer it to another consumer. */
+        /* 条目必须存在，我们才能将其转移给另一个消费者。*/
         if (!streamEntryExists(o->ptr,&id)) {
-            /* Clear this entry from the PEL, it no longer exists */
+            /* 从 PEL 中清除此条目，它已不再存在 */
             if (nack != NULL) {
-                /* Propagate this change (we are going to delete the NACK). */
+                /* 传播此更改（我们将删除 NACK）。*/
                 streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
-                propagate_last_id = 0; /* Will be propagated by XCLAIM itself. */
+                propagate_last_id = 0; /* 将由 XCLAIM 自身传播。*/
                 server.dirty++;
-                /* Release the NACK */
+                /* 释放 NACK */
                 raxRemove(group->pel,buf,sizeof(buf),NULL);
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
                 streamFreeNACK(nack);
@@ -3269,50 +3086,47 @@ void xclaimCommand(client *c) {
             continue;
         }
 
-        /* If FORCE is passed, let's check if at least the entry
-         * exists in the Stream. In such case, we'll create a new
-         * entry in the PEL from scratch, so that XCLAIM can also
-         * be used to create entries in the PEL. Useful for AOF
-         * and replication of consumer groups. */
+        /* 如果传递了 FORCE，让我们检查该条目是否至少存在于 stream 中。
+         * 在这种情况下，我们将从头开始在 PEL 中创建一个新条目，
+         * 以便 XCLAIM 也可以用于在 PEL 中创建条目。
+         * 这对于 AOF 和消费组的复制非常有用。*/
         if (force && nack == NULL) {
-            /* Create the NACK. */
+            /* 创建 NACK。*/
             nack = streamCreateNACK(NULL);
             raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
         }
 
         if (nack != NULL) {
-            /* We need to check if the minimum idle time requested
-             * by the caller is satisfied by this entry.
+            /* 我们需要检查此条目是否满足调用者请求的最小空闲时间。
              *
-             * Note that the nack could be created by FORCE, in this
-             * case there was no pre-existing entry and minidle should
-             * be ignored, but in that case nack->consumer is NULL. */
+             * 注意，nack 可能由 FORCE 创建，在这种情况下没有预先存在的条目，
+             * 因此应忽略 minidle，但在这种情况下 nack->consumer 为 NULL。*/
             if (nack->consumer && minidle) {
                 mstime_t this_idle = now - nack->delivery_time;
                 if (this_idle < minidle) continue;
             }
 
             if (nack->consumer != consumer) {
-                /* Remove the entry from the old consumer.
-                 * Note that nack->consumer is NULL if we created the
-                 * NACK above because of the FORCE option. */
+                /* 从旧消费者中移除该条目。
+                 * 注意，如果我们由于 FORCE 选项在上面创建了 NACK，
+                 * 则 nack->consumer 为 NULL。*/
                 if (nack->consumer)
                     raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             }
             nack->delivery_time = deliverytime;
-            /* Set the delivery attempts counter if given, otherwise
-             * autoincrement unless JUSTID option provided */
+            /* 如果给出了投递尝试计数器，则设置它；
+             * 否则除非提供了 JUSTID 选项，否则自动递增 */
             if (retrycount >= 0) {
                 nack->delivery_count = retrycount;
             } else if (!justid) {
                 nack->delivery_count++;
             }
             if (nack->consumer != consumer) {
-                /* Add the entry in the new consumer local PEL. */
+                /* 在新消费者的本地 PEL 中添加该条目。*/
                 raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
                 nack->consumer = consumer;
             }
-            /* Send the reply for this entry. */
+            /* 为此条目发送回复。*/
             if (justid) {
                 addReplyStreamID(c,&id);
             } else {
@@ -3322,9 +3136,9 @@ void xclaimCommand(client *c) {
 
             consumer->active_time = commandTimeSnapshot();
 
-            /* Propagate this change. */
+            /* 传播此更改。*/
             streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
-            propagate_last_id = 0; /* Will be propagated by XCLAIM itself. */
+            propagate_last_id = 0; /* 将由 XCLAIM 自身传播。*/
             server.dirty++;
         }
     }
@@ -3340,50 +3154,46 @@ cleanup:
 
 /* XAUTOCLAIM <key> <group> <consumer> <min-idle-time> <start> [COUNT <count>] [JUSTID]
  *
- * Changes ownership of one or multiple messages in the Pending Entries List
- * of a given stream consumer group.
+ * 更改指定 stream 消费者组待处理条目列表中一个或多个消息的所有权。
  *
- * For each PEL entry, if its idle time greater or equal to <min-idle-time>,
- * then the message new owner becomes the specified <consumer>.
- * If the minimum idle time specified is zero, messages are claimed
- * regardless of their idle time.
+ * 对于每个 PEL 条目，如果其空闲时间大于或等于 <min-idle-time>，
+ * 则该消息的新所有者变为指定的 <consumer>。
+ * 如果指定的最小空闲时间为 0，则无论空闲时间如何都声明该消息。
  *
- * This command creates the consumer as side effect if it does not yet
- * exists. Moreover the command reset the idle time of the message to 0.
+ * 该命令在消费者不存在时会将其创建作为副作用。此外，该命令将
+ * 消息的空闲时间重置为 0。
  *
- * The command returns an array of messages that the user
- * successfully claimed, so that the caller is able to understand
- * what messages it is now in charge of. */
+ * 该命令返回用户成功声明的消息数组，以便调用者能够了解
+ * 它现在负责哪些消息。*/
 void xautoclaimCommand(client *c) {
     streamCG *group = NULL;
     robj *o = lookupKeyRead(c->db,c->argv[1]);
-    long long minidle; /* Minimum idle time argument, in milliseconds. */
-    long count = 100; /* Maximum entries to claim. */
+    long long minidle; /* 最小空闲时间参数，以毫秒为单位。*/
+    long count = 100; /* 最大声明条目数。*/
     const unsigned attempts_factor = 10;
     streamID startid;
     int startex;
     int justid = 0;
 
-    /* Parse idle/start/end/count arguments ASAP if needed, in order to report
-     * syntax errors before any other error. */
-    if (getLongLongFromObjectOrReply(c,c->argv[4],&minidle,"Invalid min-idle-time argument for XAUTOCLAIM") != C_OK)
+    /* 尽快解析 idle/start/end/count 参数，以便在任何其他错误之前报告语法错误。*/
+    if (getLongLongFromObjectOrReply(c,c->argv[4],&minidle,"XAUTOCLAIM 的 min-idle-time 参数无效") != C_OK)
         return;
     if (minidle < 0) minidle = 0;
 
     if (streamParseIntervalIDOrReply(c,c->argv[5],&startid,&startex,0) != C_OK)
         return;
     if (startex && streamIncrID(&startid) != C_OK) {
-        addReplyError(c,"invalid start ID for the interval");
+        addReplyError(c,"区间的无效 start ID");
         return;
     }
 
-    int j = 6; /* options start at argv[6] */
+    int j = 6; /* 选项从 argv[6] 开始 */
     while(j < c->argc) {
-        int moreargs = (c->argc-1) - j; /* Number of additional arguments. */
+        int moreargs = (c->argc-1) - j; /* 剩余参数个数。*/
         char *opt = c->argv[j]->ptr;
         if (!strcasecmp(opt,"COUNT") && moreargs) {
             long max_count = LONG_MAX / (max(sizeof(streamID), attempts_factor));
-            if (getRangeLongFromObjectOrReply(c,c->argv[j+1],1,max_count,&count,"COUNT must be > 0") != C_OK)
+            if (getRangeLongFromObjectOrReply(c,c->argv[j+1],1,max_count,&count,"COUNT 必须 > 0") != C_OK)
                 return;
             j++;
         } else if (!strcasecmp(opt,"JUSTID")) {
@@ -3397,14 +3207,13 @@ void xautoclaimCommand(client *c) {
 
     if (o) {
         if (checkType(c,o,OBJ_STREAM))
-            return; /* Type error. */
+            return; /* 类型错误。*/
         group = streamLookupCG(o->ptr,c->argv[2]->ptr);
     }
 
-    /* No key or group? Send an error given that the group creation
-     * is mandatory. */
+    /* 没有 key 或组？由于必须创建组，因此发送错误。*/
     if (o == NULL || group == NULL) {
-        addReplyErrorFormat(c,"-NOGROUP No such key '%s' or consumer group '%s'",
+        addReplyErrorFormat(c,"-NOGROUP 不存在 key '%s' 或消费者组 '%s'",
                             (char*)c->argv[1]->ptr,
                             (char*)c->argv[2]->ptr);
         return;
@@ -3412,11 +3221,11 @@ void xautoclaimCommand(client *c) {
 
     streamID *deleted_ids = ztrymalloc(count * sizeof(streamID));
     if (!deleted_ids) {
-        addReplyError(c, "Insufficient memory, failed allocating transient memory, COUNT too high.");
+        addReplyError(c, "内存不足，无法分配临时内存，COUNT 过高。");
         return;
     }
 
-    /* Do the actual claiming. */
+    /* 执行实际的声明操作。*/
     streamConsumer *consumer = streamLookupConsumer(group,c->argv[3]->ptr);
     if (consumer == NULL) {
         consumer = streamCreateConsumer(group,c->argv[3]->ptr,c->argv[1],c->db->id,SCC_DEFAULT);
@@ -3425,7 +3234,7 @@ void xautoclaimCommand(client *c) {
 
     long long attempts = count * attempts_factor;
 
-    addReplyArrayLen(c, 3); /* We add another reply later */
+    addReplyArrayLen(c, 3); /* 稍后会添加另一个回复 */
     void *endidptr = addReplyDeferredLen(c); /* reply[0] */
     void *arraylenptr = addReplyDeferredLen(c); /* reply[1] */
 
@@ -3443,21 +3252,21 @@ void xautoclaimCommand(client *c) {
         streamID id;
         streamDecodeID(ri.key, &id);
 
-        /* Item must exist for us to transfer it to another consumer. */
+        /* 条目必须存在，我们才能将其转移给另一个消费者。*/
         if (!streamEntryExists(o->ptr,&id)) {
-            /* Propagate this change (we are going to delete the NACK). */
+            /* 传播此更改（我们将删除 NACK）。*/
             robj *idstr = createObjectFromStreamID(&id);
             streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],idstr,nack);
             decrRefCount(idstr);
             server.dirty++;
-            /* Clear this entry from the PEL, it no longer exists */
+            /* 从 PEL 中清除此条目，它已不再存在 */
             raxRemove(group->pel,ri.key,ri.key_len,NULL);
             raxRemove(nack->consumer->pel,ri.key,ri.key_len,NULL);
             streamFreeNACK(nack);
-            /* Remember the ID for later */
+            /* 稍后记住该 ID */
             deleted_ids[deleted_id_num++] = id;
             raxSeek(&ri,">=",ri.key,ri.key_len);
-            count--; /* Count is a limit of the command response size. */
+            count--; /* count 是命令响应大小的限制。*/
             continue;
         }
 
@@ -3468,26 +3277,26 @@ void xautoclaimCommand(client *c) {
         }
 
         if (nack->consumer != consumer) {
-            /* Remove the entry from the old consumer.
-             * Note that nack->consumer is NULL if we created the
-             * NACK above because of the FORCE option. */
+            /* 从旧消费者中移除该条目。
+             * 注意，如果我们由于 FORCE 选项在上面创建了 NACK，
+             * 则 nack->consumer 为 NULL。*/
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,ri.key,ri.key_len,NULL);
         }
 
-        /* Update the consumer and idle time. */
+        /* 更新消费者和空闲时间。*/
         nack->delivery_time = now;
-        /* Increment the delivery attempts counter unless JUSTID option provided */
+        /* 除非提供了 JUSTID 选项，否则递增投递尝试计数器 */
         if (!justid)
             nack->delivery_count++;
 
         if (nack->consumer != consumer) {
-            /* Add the entry in the new consumer local PEL. */
+            /* 在新消费者的本地 PEL 中添加该条目。*/
             raxInsert(consumer->pel,ri.key,ri.key_len,nack,NULL);
             nack->consumer = consumer;
         }
 
-        /* Send the reply for this entry. */
+        /* 为此条目发送回复。*/
         if (justid) {
             addReplyStreamID(c,&id);
         } else {
@@ -3498,14 +3307,14 @@ void xautoclaimCommand(client *c) {
 
         consumer->active_time = commandTimeSnapshot();
 
-        /* Propagate this change. */
+        /* 传播此更改。*/
         robj *idstr = createObjectFromStreamID(&id);
         streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],idstr,nack);
         decrRefCount(idstr);
         server.dirty++;
     }
 
-    /* We need to return the next entry as a cursor for the next XAUTOCLAIM call */
+    /* 我们需要返回下一个条目作为下一次 XAUTOCLAIM 调用的游标 */
     raxNext(&ri);
 
     streamID endid;
@@ -3530,9 +3339,8 @@ void xautoclaimCommand(client *c) {
 
 /* XDEL <key> [<ID1> <ID2> ... <IDN>]
  *
- * Removes the specified entries from the stream. Returns the number
- * of items actually deleted, that may be different from the number
- * of IDs passed in case certain IDs do not exist. */
+ * 从 stream 中删除指定的条目。返回实际删除的项目数，
+ * 当某些 ID 不存在时，该数字可能与传入的 ID 数量不同。*/
 void xdelCommand(client *c) {
     robj *o;
 
@@ -3540,9 +3348,9 @@ void xdelCommand(client *c) {
         || checkType(c,o,OBJ_STREAM)) return;
     stream *s = o->ptr;
 
-    /* We need to sanity check the IDs passed to start. Even if not
-     * a big issue, it is not great that the command is only partially
-     * executed because at some point an invalid ID is parsed. */
+    /* 我们需要在开始时对传入的 ID 进行合理性检查。
+     * 即使不是一个严重问题，但命令因解析到无效 ID 而仅部分执行
+     * 也是不好的。*/
     streamID static_ids[STREAMID_STATIC_VECTOR_LEN];
     streamID *ids = static_ids;
     int id_count = c->argc-2;
@@ -3552,18 +3360,18 @@ void xdelCommand(client *c) {
         if (streamParseStrictIDOrReply(c,c->argv[j],&ids[j-2],0,NULL) != C_OK) goto cleanup;
     }
 
-    /* Actually apply the command. */
+    /* 实际执行命令。*/
     int deleted = 0;
     int first_entry = 0;
     for (int j = 2; j < c->argc; j++) {
         streamID *id = &ids[j-2];
         if (streamDeleteItem(s,id)) {
-            /* We want to know if the first entry in the stream was deleted
-             * so we can later set the new one. */
+            /* 我们想知道 stream 中的第一个条目是否已被删除，
+             * 以便稍后设置新的第一个条目。*/
             if (streamCompareID(id,&s->first_id) == 0) {
                 first_entry = 1;
             }
-            /* Update the stream's maximal tombstone if needed. */
+            /* 如有必要，更新 stream 的最大墓碑 ID。*/
             if (streamCompareID(id,&s->max_deleted_entry_id) > 0) {
                 s->max_deleted_entry_id = *id;
             }
@@ -3571,7 +3379,7 @@ void xdelCommand(client *c) {
         };
     }
 
-    /* Update the stream's first ID. */
+    /* 更新 stream 的 first ID。*/
     if (deleted) {
         if (s->length == 0) {
             s->first_id.ms = 0;
@@ -3581,7 +3389,7 @@ void xdelCommand(client *c) {
         }
     }
 
-    /* Propagate the write if needed. */
+    /* 如有必要，传播写入。*/
     if (deleted) {
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STREAM,"xdel",c->argv[1],c->db->id);
@@ -3592,90 +3400,86 @@ cleanup:
     if (ids != static_ids) zfree(ids);
 }
 
-/* General form: XTRIM <key> [... options ...]
+/* 通用形式：XTRIM <key> [... 选项 ...]
  *
- * List of options:
+ * 选项列表：
  *
- * Trim strategies:
+ * 修剪策略：
  *
- * MAXLEN [~|=] <count>     -- Trim so that the stream will be capped at
- *                             the specified length. Use ~ before the
- *                             count in order to demand approximated trimming
- *                             (like XADD MAXLEN option).
- * MINID [~|=] <id>         -- Trim so that the stream will not contain entries
- *                             with IDs smaller than 'id'. Use ~ before the
- *                             count in order to demand approximated trimming
- *                             (like XADD MINID option).
+ * MAXLEN [~|=] <count>     -- 修剪 stream，使其长度不超过
+ *                             指定的长度。在 count 前使用 ~
+ *                             以请求近似修剪（如 XADD MAXLEN 选项）。
+ * MINID [~|=] <id>         -- 修剪 stream，使其不包含
+ *                             ID 小于 'id' 的条目。在 count 前使用 ~
+ *                             以请求近似修剪（如 XADD MINID 选项）。
  *
- * Other options:
+ * 其他选项：
  *
- * LIMIT <entries>          -- The maximum number of entries to trim.
- *                             0 means unlimited. Unless specified, it is set
- *                             to a default of 100*server.stream_node_max_entries,
- *                             and that's in order to keep the trimming time sane.
- *                             Has meaning only if `~` was provided.
+ * LIMIT <entries>          -- 要修剪的最大条目数。
+ *                             0 表示无限制。除非另有指定，否则将其设置为
+ *                             默认值 100*server.stream_node_max_entries，
+ *                             这是为了保持修剪时间合理。
+ *                             仅当提供了 `~` 时才有意义。
  */
 void xtrimCommand(client *c) {
     robj *o;
 
-    /* Argument parsing. */
+    /* 参数解析。*/
     streamAddTrimArgs parsed_args;
     if (streamParseAddOrTrimArgsOrReply(c, &parsed_args, 0) < 0)
-        return; /* streamParseAddOrTrimArgsOrReply already replied. */
+        return; /* streamParseAddOrTrimArgsOrReply 已发送回复。*/
 
-    /* If the key does not exist, we are ok returning zero, that is, the
-     * number of elements removed from the stream. */
+    /* 如果 key 不存在，我们返回零即可，即从 stream 中移除的元素数。*/
     if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL
         || checkType(c,o,OBJ_STREAM)) return;
     stream *s = o->ptr;
 
-    /* Perform the trimming. */
+    /* 执行修剪操作。*/
     int64_t deleted = streamTrim(s, &parsed_args);
     if (deleted) {
         notifyKeyspaceEvent(NOTIFY_STREAM,"xtrim",c->argv[1],c->db->id);
         if (parsed_args.approx_trim) {
-            /* In case our trimming was limited (by LIMIT or by ~) we must
-             * re-write the relevant trim argument to make sure there will be
-             * no inconsistencies in AOF loading or in the replica.
+            /* 如果我们的修剪被限制（通过 LIMIT 或 ~），我们必须
+             * 重写相关的 trim 参数，以确保在 AOF 加载或副本中不会出现不一致。
              * It's enough to check only args->approx because there is no
              * way LIMIT is given without the ~ option. */
             streamRewriteApproxSpecifier(c,parsed_args.trim_strategy_arg_idx-1);
             streamRewriteTrimArgument(c,s,parsed_args.trim_strategy,parsed_args.trim_strategy_arg_idx);
         }
 
-        /* Propagate the write. */
+        /* 传播写入。*/
         signalModifiedKey(c, c->db,c->argv[1]);
         server.dirty += deleted;
     }
     addReplyLongLong(c,deleted);
 }
 
-/* Helper function for xinfoCommand.
- * Handles the variants of XINFO STREAM */
+/* xinfoCommand 的辅助函数。
+ * 处理 XINFO STREAM 的各种变体 */
 void xinfoReplyWithStreamInfo(client *c, stream *s) {
     int full = 1;
-    long long count = 10; /* Default COUNT is 10 so we don't block the server */
-    robj **optv = c->argv + 3; /* Options start after XINFO STREAM <key> */
+    long long count = 10; /* 默认 COUNT 为 10，以避免阻塞服务器 */
+    robj **optv = c->argv + 3; /* 选项从 XINFO STREAM <key> 之后开始 */
     int optc = c->argc - 3;
 
-    /* Parse options. */
+    /* 解析选项。*/
     if (optc == 0) {
         full = 0;
     } else {
-        /* Valid options are [FULL] or [FULL COUNT <count>] */
+        /* 有效选项为 [FULL] 或 [FULL COUNT <count>] */
         if (optc != 1 && optc != 3) {
             addReplySubcommandSyntaxError(c);
             return;
         }
 
-        /* First option must be "FULL" */
+        /* 第一个选项必须是 "FULL" */
         if (strcasecmp(optv[0]->ptr,"full")) {
             addReplySubcommandSyntaxError(c);
             return;
         }
 
         if (optc == 3) {
-            /* First option must be "FULL" */
+            /* 第一个选项必须是 "FULL" */
             if (strcasecmp(optv[1]->ptr,"count")) {
                 addReplySubcommandSyntaxError(c);
                 return;
@@ -3708,7 +3512,7 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
         addReplyBulkCString(c,"groups");
         addReplyLongLong(c,s->cgroups ? raxSize(s->cgroups) : 0);
 
-        /* To emit the first/last entry we use streamReplyWithRange(). */
+        /* 为了输出第一个/最后一个条目，我们使用 streamReplyWithRange()。*/
         int emitted;
         streamID start, end;
         start.ms = start.seq = 0;
@@ -3724,11 +3528,11 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
     } else {
         /* XINFO STREAM <key> FULL [COUNT <count>] */
 
-        /* Stream entries */
+        /* Stream 条目 */
         addReplyBulkCString(c,"entries");
         streamReplyWithRange(c,s,NULL,NULL,count,0,NULL,NULL,0,NULL,NULL);
 
-        /* Consumer groups */
+        /* 消费组 */
         addReplyBulkCString(c,"groups");
         if (s->cgroups == NULL) {
             addReplyArrayLen(c,0);
@@ -3741,15 +3545,15 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                 streamCG *cg = ri_cgroups.data;
                 addReplyMapLen(c,7);
 
-                /* Name */
+                /* 名称 */
                 addReplyBulkCString(c,"name");
                 addReplyBulkCBuffer(c,ri_cgroups.key,ri_cgroups.key_len);
 
-                /* Last delivered ID */
+                /* 最后投递 ID */
                 addReplyBulkCString(c,"last-delivered-id");
                 addReplyStreamID(c,&cg->last_id);
 
-                /* Read counter of the last delivered ID */
+                /* 最后投递 ID 的读取计数器 */
                 addReplyBulkCString(c,"entries-read");
                 if (cg->entries_read != SCG_INVALID_ENTRIES_READ) {
                     addReplyLongLong(c,cg->entries_read);
@@ -3757,15 +3561,15 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                     addReplyNull(c);
                 }
 
-                /* Group lag */
+                /* 组 lag */
                 addReplyBulkCString(c,"lag");
                 streamReplyWithCGLag(c,s,cg);
 
-                /* Group PEL count */
+                /* 组 PEL 计数 */
                 addReplyBulkCString(c,"pel-count");
                 addReplyLongLong(c,raxSize(cg->pel));
 
-                /* Group PEL */
+                /* 组 PEL */
                 addReplyBulkCString(c,"pending");
                 long long arraylen_cg_pel = 0;
                 void *arrayptr_cg_pel = addReplyDeferredLen(c);
@@ -3776,20 +3580,20 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                     streamNACK *nack = ri_cg_pel.data;
                     addReplyArrayLen(c,4);
 
-                    /* Entry ID. */
+                    /* 条目 ID。*/
                     streamID id;
                     streamDecodeID(ri_cg_pel.key,&id);
                     addReplyStreamID(c,&id);
 
-                    /* Consumer name. */
-                    serverAssert(nack->consumer); /* assertion for valgrind (avoid NPD) */
+                    /* 消费者名称。*/
+                    serverAssert(nack->consumer); /* valgrind 的断言（避免 NPD） */
                     addReplyBulkCBuffer(c,nack->consumer->name,
                                         sdslen(nack->consumer->name));
 
-                    /* Last delivery. */
+                    /* 最后投递时间。*/
                     addReplyLongLong(c,nack->delivery_time);
 
-                    /* Number of deliveries. */
+                    /* 投递次数。*/
                     addReplyLongLong(c,nack->delivery_count);
 
                     arraylen_cg_pel++;
@@ -3797,7 +3601,7 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                 setDeferredArrayLen(c,arrayptr_cg_pel,arraylen_cg_pel);
                 raxStop(&ri_cg_pel);
 
-                /* Consumers */
+                /* 消费者 */
                 addReplyBulkCString(c,"consumers");
                 addReplyArrayLen(c,raxSize(cg->consumers));
                 raxIterator ri_consumers;
@@ -3807,23 +3611,23 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                     streamConsumer *consumer = ri_consumers.data;
                     addReplyMapLen(c,5);
 
-                    /* Consumer name */
+                    /* 消费者名称 */
                     addReplyBulkCString(c,"name");
                     addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
 
-                    /* Seen-time */
+                    /* seen-time */
                     addReplyBulkCString(c,"seen-time");
                     addReplyLongLong(c,consumer->seen_time);
 
-                    /* Active-time */
+                    /* active-time */
                     addReplyBulkCString(c,"active-time");
                     addReplyLongLong(c,consumer->active_time);
 
-                    /* Consumer PEL count */
+                    /* 消费者 PEL 计数 */
                     addReplyBulkCString(c,"pel-count");
                     addReplyLongLong(c,raxSize(consumer->pel));
 
-                    /* Consumer PEL */
+                    /* 消费者 PEL */
                     addReplyBulkCString(c,"pending");
                     long long arraylen_cpel = 0;
                     void *arrayptr_cpel = addReplyDeferredLen(c);
@@ -3834,15 +3638,15 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
                         streamNACK *nack = ri_cpel.data;
                         addReplyArrayLen(c,3);
 
-                        /* Entry ID. */
+                        /* 条目 ID。*/
                         streamID id;
                         streamDecodeID(ri_cpel.key,&id);
                         addReplyStreamID(c,&id);
 
-                        /* Last delivery. */
+                        /* 最后投递时间。*/
                         addReplyLongLong(c,nack->delivery_time);
 
-                        /* Number of deliveries. */
+                        /* 投递次数。*/
                         addReplyLongLong(c,nack->delivery_count);
 
                         arraylen_cpel++;
@@ -3866,38 +3670,37 @@ void xinfoCommand(client *c) {
     char *opt;
     robj *key;
 
-    /* HELP is special. Handle it ASAP. */
+    /* HELP 比较特殊。尽快处理它。*/
     if (!strcasecmp(c->argv[1]->ptr,"HELP")) {
         const char *help[] = {
 "CONSUMERS <key> <groupname>",
-"    Show consumers of <groupname>.",
+"    显示 <groupname> 的消费者。",
 "GROUPS <key>",
-"    Show the stream consumer groups.",
+"    显示 stream 的消费者组。",
 "STREAM <key> [FULL [COUNT <count>]",
-"    Show information about the stream.",
+"    显示有关 stream 的信息。",
 NULL
         };
         addReplyHelp(c, help);
         return;
     }
 
-    /* With the exception of HELP handled before any other sub commands, all
-     * the ones are in the form of "<subcommand> <key>". */
+    /* 除了 HELP 在其他子命令之前处理外，所有子命令的形式都是
+     * "<subcommand> <key>"。*/
     opt = c->argv[1]->ptr;
     key = c->argv[2];
 
-    /* Lookup the key now, this is common for all the subcommands but HELP. */
+    /* 现在查找 key，这是除 HELP 之外的所有子命令共用的。*/
     robj *o = lookupKeyReadOrReply(c,key,shared.nokeyerr);
     if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
     s = o->ptr;
 
-    /* Dispatch the different subcommands. */
+    /* 分发不同的子命令。*/
     if (!strcasecmp(opt,"CONSUMERS") && c->argc == 4) {
-        /* XINFO CONSUMERS <key> <group>. */
+        /* XINFO CONSUMERS <key> <group>。*/
         streamCG *cg = streamLookupCG(s,c->argv[3]->ptr);
         if (cg == NULL) {
-            addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
-                                   "for key name '%s'",
+            addReplyErrorFormat(c, "-NOGROUP key '%s' 上不存在消费者组 '%s'",
                                    (char*)c->argv[3]->ptr, (char*)key->ptr);
             return;
         }
@@ -3925,7 +3728,7 @@ NULL
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"GROUPS") && c->argc == 3) {
-        /* XINFO GROUPS <key>. */
+        /* XINFO GROUPS <key>。*/
         if (s->cgroups == NULL) {
             addReplyArrayLen(c,0);
             return;
@@ -3957,33 +3760,33 @@ NULL
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"STREAM")) {
-        /* XINFO STREAM <key> [FULL [COUNT <count>]]. */
+        /* XINFO STREAM <key> [FULL [COUNT <count>]]。*/
         xinfoReplyWithStreamInfo(c,s);
     } else {
         addReplySubcommandSyntaxError(c);
     }
 }
 
-/* Validate the integrity stream listpack entries structure. Both in term of a
- * valid listpack, but also that the structure of the entries matches a valid
- * stream. return 1 if valid 0 if not valid. */
+/* 校验 stream listpack 条目结构的完整性。
+ * 既包括 listpack 本身的有效性，也包括条目结构是否符合有效的 stream。
+ * 有效返回 1，无效返回 0。*/
 int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep) {
     int valid_record;
     unsigned char *p, *next;
 
-    /* Since we don't want to run validation of all records twice, we'll
-     * run the listpack validation of just the header and do the rest here. */
+    /* 由于我们不想对所有记录运行两次校验，我们仅对 listpack 头进行
+     * listpack 校验，其余的在这里完成。*/
     if (!lpValidateIntegrity(lp, size, 0, NULL, NULL))
         return 0;
 
-    /* In non-deep mode we just validated the listpack header (encoded size) */
+    /* 在非深度模式下，我们只校验了 listpack 头（编码大小）*/
     if (!deep) return 1;
 
     next = p = lpValidateFirst(lp);
     if (!lpValidateNext(lp, &next, size)) return 0;
     if (!p) return 0;
 
-    /* entry count */
+    /* 条目计数 */
     int64_t entry_count = lpGetIntegerIfValid(p, &valid_record);
     if (!valid_record) return 0;
     p = next; if (!lpValidateNext(lp, &next, size)) return 0;
@@ -3998,12 +3801,12 @@ int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep) {
     if (!valid_record) return 0;
     p = next; if (!lpValidateNext(lp, &next, size)) return 0;
 
-    /* the field names */
+    /* 字段名 */
     for (int64_t j = 0; j < master_fields; j++) {
         p = next; if (!lpValidateNext(lp, &next, size)) return 0;
     }
 
-    /* the zero master entry terminator. */
+    /* master 条目的零终止符。*/
     int64_t zero = lpGetIntegerIfValid(p, &valid_record);
     if (!valid_record || zero != 0) return 0;
     p = next; if (!lpValidateNext(lp, &next, size)) return 0;
@@ -4030,7 +3833,7 @@ int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep) {
             if (!valid_record) return 0;
             p = next; if (!lpValidateNext(lp, &next, size)) return 0;
 
-            /* the field names */
+            /* 字段名 */
             for (int64_t j = 0; j < fields; j++) {
                 p = next; if (!lpValidateNext(lp, &next, size)) return 0;
             }
@@ -4038,7 +3841,7 @@ int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep) {
             extra_fields += fields + 1;
         }
 
-        /* the values */
+        /* 值 */
         for (int64_t j = 0; j < fields; j++) {
             p = next; if (!lpValidateNext(lp, &next, size)) return 0;
         }

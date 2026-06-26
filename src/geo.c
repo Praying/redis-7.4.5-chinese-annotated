@@ -33,34 +33,34 @@
 #include "debugmacro.h"
 #include "pqsort.h"
 
-/* Things exported from t_zset.c only for geo.c, since it is the only other
- * part of Redis that requires close zset introspection. */
+/* 从 t_zset.c 导出的符号仅供 geo.c 使用，
+ * 因为它是 Redis 中唯一需要对 zset 进行深入内省的部分。 */
 unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range);
 int zslValueLteMax(double value, zrangespec *spec);
 
 /* ====================================================================
- * This file implements the following commands:
+ * 本文件实现以下命令：
  *
- *   - geoadd - add coordinates for value to geoset
- *   - georadius - search radius by coordinates in geoset
- *   - georadiusbymember - search radius based on geoset member position
+ *   - geoadd - 向 geoset 中添加坐标
+ *   - georadius - 在 geoset 中按坐标搜索半径范围内的成员
+ *   - georadiusbymember - 根据 geoset 中某成员的位置搜索半径范围
  * ==================================================================== */
 
 /* ====================================================================
- * geoArray implementation
+ * geoArray 实现
  * ==================================================================== */
 
-/* Create a new array of geoPoints. */
+/* 创建一个新的 geoPoint 数组。 */
 geoArray *geoArrayCreate(void) {
     geoArray *ga = zmalloc(sizeof(*ga));
-    /* It gets allocated on first geoArrayAppend() call. */
+    /* 数组空间在第一次调用 geoArrayAppend() 时分配。 */
     ga->array = NULL;
     ga->buckets = 0;
     ga->used = 0;
     return ga;
 }
 
-/* Add and populate with data a new entry to the geoArray. */
+/* 向 geoArray 追加并填充一个新的条目。 */
 geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist,
                          double score, char *member)
 {
@@ -69,16 +69,16 @@ geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist,
         ga->array = zrealloc(ga->array,sizeof(geoPoint)*ga->buckets);
     }
     geoPoint *gp = ga->array+ga->used;
-    gp->longitude = xy[0];
-    gp->latitude = xy[1];
-    gp->dist = dist;
-    gp->member = member;
-    gp->score = score;
+    gp->longitude = xy[0];  // 经度
+    gp->latitude = xy[1];   // 纬度
+    gp->dist = dist;        // 距搜索中心的距离
+    gp->member = member;    // 成员名
+    gp->score = score;      // 对应的 zset 分数（geohash 编码）
     ga->used++;
     return gp;
 }
 
-/* Destroy a geoArray created with geoArrayCreate(). */
+/* 销毁由 geoArrayCreate() 创建的 geoArray。 */
 void geoArrayFree(geoArray *ga) {
     size_t i;
     for (i = 0; i < ga->used; i++) sdsfree(ga->array[i].member);
@@ -87,16 +87,20 @@ void geoArrayFree(geoArray *ga) {
 }
 
 /* ====================================================================
- * Helpers
+ * 辅助函数
  * ==================================================================== */
+/* 将 52 位 geohash 分数解码为 WGS84 经纬度坐标。
+ * 输入：bits - 编码后的 geohash 分数；xy - 输出经纬度数组（[0]=经度, [1]=纬度）。
+ * 返回：成功返回 C_OK，失败返回 C_ERR。 */
 int decodeGeohash(double bits, double *xy) {
     GeoHashBits hash = { .bits = (uint64_t)bits, .step = GEO_STEP_MAX };
     return geohashDecodeToLongLatWGS84(hash, xy);
 }
 
-/* Input Argument Helper */
-/* Take a pointer to the latitude arg then use the next arg for longitude.
- * On parse error C_ERR is returned, otherwise C_OK. */
+/* 输入参数辅助函数 */
+/* 从两个参数中提取经纬度。
+ * 取一个指向纬度参数的指针，然后使用下一个参数作为经度。
+ * 解析错误时返回 C_ERR，否则返回 C_OK。 */
 int extractLongLatOrReply(client *c, robj **argv, double *xy) {
     int i;
     for (i = 0; i < 2; i++) {
@@ -114,9 +118,9 @@ int extractLongLatOrReply(client *c, robj **argv, double *xy) {
     return C_OK;
 }
 
-/* Input Argument Helper */
-/* Decode lat/long from a zset member's score.
- * Returns C_OK on successful decoding, otherwise C_ERR is returned. */
+/* 输入参数辅助函数 */
+/* 从 zset 成员的分数中解码出经纬度。
+ * 成功解码返回 C_OK，否则返回 C_ERR。 */
 int longLatFromMember(robj *zobj, robj *member, double *xy) {
     double score = 0;
 
@@ -125,23 +129,21 @@ int longLatFromMember(robj *zobj, robj *member, double *xy) {
     return C_OK;
 }
 
-/* Check that the unit argument matches one of the known units, and returns
- * the conversion factor to meters (you need to divide meters by the conversion
- * factor to convert to the right unit).
+/* 检查单位参数是否与已知单位之一匹配，并返回到米的换算系数
+ * （你需要将米除以该换算系数才能转换为相应的单位）。
  *
- * If the unit is not valid, an error is reported to the client, and a value
- * less than zero is returned. */
+ * 如果单位无效，则向客户端报告错误，并返回小于零的值。 */
 double extractUnitOrReply(client *c, robj *unit) {
     char *u = unit->ptr;
 
     if (!strcasecmp(u, "m")) {
-        return 1;
+        return 1;          // 米：1 米
     } else if (!strcasecmp(u, "km")) {
-        return 1000;
+        return 1000;       // 千米
     } else if (!strcasecmp(u, "ft")) {
-        return 0.3048;
+        return 0.3048;     // 英尺
     } else if (!strcasecmp(u, "mi")) {
-        return 1609.34;
+        return 1609.34;    // 英里
     } else {
         addReplyError(c,
             "unsupported unit provided. please use M, KM, FT, MI");
@@ -149,10 +151,10 @@ double extractUnitOrReply(client *c, robj *unit) {
     }
 }
 
-/* Input Argument Helper.
- * Extract the distance from the specified two arguments starting at 'argv'
- * that should be in the form: <number> <unit>, and return C_OK or C_ERR means success or failure
- * *conversions is populated with the coefficient to use in order to convert meters to the unit.*/
+/* 输入参数辅助函数。
+ * 从 'argv' 开始的两个参数中提取距离，形式为：<数字> <单位>。
+ * 返回 C_OK 表示成功，返回 C_ERR 表示失败。
+ * *conversion 用于存放将米换算为对应单位的系数。 */
 int extractDistanceOrReply(client *c, robj **argv,
                               double *conversion, double *radius) {
     double distance;
@@ -176,10 +178,10 @@ int extractDistanceOrReply(client *c, robj **argv,
     return C_OK;
 }
 
-/* Input Argument Helper.
- * Extract height and width from the specified three arguments starting at 'argv'
- * that should be in the form: <number> <number> <unit>, and return C_OK or C_ERR means success or failure
- * *conversions is populated with the coefficient to use in order to convert meters to the unit.*/
+/* 输入参数辅助函数。
+ * 从 'argv' 开始的三个参数中提取高度和宽度，形式为：<数字> <数字> <单位>。
+ * 返回 C_OK 表示成功，返回 C_ERR 表示失败。
+ * *conversion 用于存放将米换算为对应单位的系数。 */
 int extractBoxOrReply(client *c, robj **argv, double *conversion,
                          double *width, double *height) {
     double h, w;
@@ -204,40 +206,41 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion,
     return C_OK;
 }
 
-/* The default addReplyDouble has too much accuracy.  We use this
- * for returning location distances. "5.2145 meters away" is nicer
- * than "5.2144992818115 meters away." We provide 4 digits after the dot
- * so that the returned value is decently accurate even when the unit is
- * the kilometer. */
+/* 默认的 addReplyDouble 精度太高。
+ * 我们使用本函数返回位置距离。"5.2145 meters away" 比
+ * "5.2144992818115 meters away" 更友好。我们在小数点后保留 4 位数字，
+ * 这样即使单位是千米，返回的值也足够精确。 */
 void addReplyDoubleDistance(client *c, double d) {
     char dbuf[128];
     const int dlen = fixedpoint_d2string(dbuf, sizeof(dbuf), d, 4);
     addReplyBulkCBuffer(c, dbuf, dlen);
 }
 
-/* Helper function for geoGetPointsInRange(): given a sorted set score
- * representing a point, and a GeoShape, checks if the point is within the search area.
+/* geoGetPointsInRange() 的辅助函数：给定表示点的 sorted set 分数
+ * 以及一个 GeoShape，检查该点是否在搜索区域内。
  *
- * shape: the rectangle
- * score: the encoded version of lat,long
- * xy: output variable, the decoded lat,long
- * distance: output variable, the distance between the center of the shape and the point
+ * shape: 矩形/圆形搜索区域
+ * score: 经纬度编码后的版本
+ * xy: 输出变量，解码后的经纬度
+ * distance: 输出变量，搜索区域中心到该点的距离
  *
- * Return values:
+ * 返回值：
  *
- * The return value is C_OK if the point is within search area, or C_ERR if it is outside.
- * "*xy" is populated with the decoded lat,long.
- * "*distance" is populated with the distance between the center of the shape and the point.
+ * 如果点在搜索区域内，返回 C_OK；如果点在区域外，返回 C_ERR。
+ * "*xy" 会被填充为解码后的经纬度。
+ * "*distance" 会被填充为搜索区域中心到该点的距离。
  */
 int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) {
-    if (!decodeGeohash(score,xy)) return C_ERR; /* Can't decode. */
-    /* Note that geohashGetDistanceIfInRadiusWGS84() takes arguments in
-     * reverse order: longitude first, latitude later. */
+    if (!decodeGeohash(score,xy)) return C_ERR; /* 无法解码。 */
+    /* 注意 geohashGetDistanceIfInRadiusWGS84() 的参数顺序相反：
+     * 先是经度，然后是纬度。 */
     if (shape->type == CIRCULAR_TYPE) {
+        // 圆形区域（半径搜索）
         if (!geohashGetDistanceIfInRadiusWGS84(shape->xy[0], shape->xy[1], xy[0], xy[1],
                                                shape->t.radius*shape->conversion, distance))
             return C_ERR;
     } else if (shape->type == RECTANGLE_TYPE) {
+        // 矩形区域（盒子搜索）
         if (!geohashGetDistanceIfInRectangle(shape->t.r.width * shape->conversion,
                                              shape->t.r.height * shape->conversion,
                                              shape->xy[0], shape->xy[1], xy[0], xy[1], distance))
@@ -246,24 +249,24 @@ int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) 
     return C_OK;
 }
 
-/* Query a Redis sorted set to extract all the elements between 'min' and
- * 'max', appending them into the array of geoPoint structures 'geoArray'.
- * The command returns the number of elements added to the array.
+/* 查询 Redis sorted set，提取 'min' 和 'max' 之间的所有元素，
+ * 将它们追加到 geoPoint 结构数组 'geoArray' 中。
+ * 返回追加到数组中的元素数量。
  *
- * Elements which are farther than 'radius' from the specified 'x' and 'y'
- * coordinates are not included.
+ * 距离指定 'x'、'y' 坐标超过 'radius' 的元素不会被包含。
  *
- * The ability of this function to append to an existing set of points is
- * important for good performances because querying by radius is performed
- * using multiple queries to the sorted set, that we later need to sort
- * via qsort. Similarly we need to be able to reject points outside the search
- * radius area ASAP in order to allocate and process more points than needed. */
+ * 本函数能够追加到现有结果集的能力对性能至关重要，
+ * 因为按半径查询是通过对 sorted set 进行多次查询来完成的，
+ * 之后还需要用 qsort 进行排序。
+ * 同样我们需要能够尽快剔除搜索半径之外的点，
+ * 以免分配和处理过多不需要的点。 */
 int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geoArray *ga, unsigned long limit) {
-    /* minex 0 = include min in range; maxex 1 = exclude max in range */
-    /* That's: min <= val < max */
+    /* minex 0 = 在范围内包含 min；maxex 1 = 在范围内排除 max */
+    /* 也就是说：min <= val < max */
     zrangespec range = { .min = min, .max = max, .minex = 0, .maxex = 1 };
     size_t origincount = ga->used;
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        // 处理 listpack 编码的 zset
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         unsigned char *vstr = NULL;
@@ -272,7 +275,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
         double score = 0;
 
         if ((eptr = zzlFirstInRange(zl, &range)) == NULL) {
-            /* Nothing exists starting at our min.  No results. */
+            /* 在我们的 min 处没有元素，没有结果。 */
             return 0;
         }
 
@@ -282,13 +285,13 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             double distance = 0;
             score = zzlGetScore(sptr);
 
-            /* If we fell out of range, break. */
+            /* 如果已经超出范围，则跳出循环。 */
             if (!zslValueLteMax(score, &range))
                 break;
 
             vstr = lpGetValue(eptr, &vlen, &vlong);
             if (geoWithinShape(shape, score, xy, &distance) == C_OK) {
-                /* Append the new element. */
+                /* 追加新元素。 */
                 char *member = (vstr == NULL) ? sdsfromlonglong(vlong) : sdsnewlen(vstr, vlen);
                 geoArrayAppend(ga, xy, distance, score, member);
             }
@@ -296,23 +299,24 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             zzlNext(zl, &eptr, &sptr);
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        // 处理 skiplist 编码的 zset
         zset *zs = zobj->ptr;
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
 
         if ((ln = zslNthInRange(zsl, &range, 0)) == NULL) {
-            /* Nothing exists starting at our min.  No results. */
+            /* 在我们的 min 处没有元素，没有结果。 */
             return 0;
         }
 
         while (ln) {
             double xy[2];
             double distance = 0;
-            /* Abort when the node is no longer in range. */
+            /* 当节点不再在范围内时中止。 */
             if (!zslValueLteMax(ln->score, &range))
                 break;
             if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
-                /* Append the new element. */
+                /* 追加新元素。 */
                 geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ln->ele));
             }
             if (ga->used && limit && ga->used >= limit) break;
@@ -322,38 +326,36 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
     return ga->used - origincount;
 }
 
-/* Compute the sorted set scores min (inclusive), max (exclusive) we should
- * query in order to retrieve all the elements inside the specified area
- * 'hash'. The two scores are returned by reference in *min and *max. */
+/* 计算应查询的 sorted set 分数范围 min（含）、max（不含），
+ * 以便检索出指定区域 'hash' 内的所有元素。
+ * 这两个分数通过引用在 *min 和 *max 中返回。 */
 void scoresOfGeoHashBox(GeoHashBits hash, GeoHashFix52Bits *min, GeoHashFix52Bits *max) {
-    /* We want to compute the sorted set scores that will include all the
-     * elements inside the specified Geohash 'hash', which has as many
-     * bits as specified by hash.step * 2.
+    /* 我们希望计算 sorted set 分数，使其包含指定 Geohash 'hash' 内的所有元素，
+     * 该 hash 的位数为 hash.step * 2。
      *
-     * So if step is, for example, 3, and the hash value in binary
-     * is 101010, since our score is 52 bits we want every element which
-     * is in binary: 101010?????????????????????????????????????????????
-     * Where ? can be 0 or 1.
+     * 例如，若 step = 3，hash 的二进制值为 101010，
+     * 由于我们的分数为 52 位，我们想要的每个元素的二进制形式为：
+     * 101010?????????????????????????????????????????????
+     * 其中 ? 可以是 0 或 1。
      *
-     * To get the min score we just use the initial hash value left
-     * shifted enough to get the 52 bit value. Later we increment the
-     * 6 bit prefix (see the hash.bits++ statement), and get the new
-     * prefix: 101011, which we align again to 52 bits to get the maximum
-     * value (which is excluded from the search). So we get everything
-     * between the two following scores (represented in binary):
+     * 为了得到 min 分数，我们只需要将初始 hash 值左移到
+     * 52 位即可。然后我们递增 6 位前缀（见 hash.bits++ 语句），
+     * 获得新的前缀：101011，再将其对齐到 52 位以获得最大值
+     * （该值在搜索中是被排除的）。于是我们得到下面两个分数
+     * （以二进制表示）之间的所有元素：
      *
-     * 1010100000000000000000000000000000000000000000000000 (included)
-     * and
-     * 1010110000000000000000000000000000000000000000000000 (excluded).
+     * 1010100000000000000000000000000000000000000000000000（包含）
+     * 与
+     * 1010110000000000000000000000000000000000000000000000（排除）。
      */
     *min = geohashAlign52Bits(hash);
     hash.bits++;
     *max = geohashAlign52Bits(hash);
 }
 
-/* Obtain all members between the min/max of this geohash bounding box.
- * Populate a geoArray of GeoPoints by calling geoGetPointsInRange().
- * Return the number of points added to the array. */
+/* 获取此 geohash 包围盒 min/max 之间的所有成员。
+ * 通过调用 geoGetPointsInRange() 将结果填充到 geoArray 的 GeoPoint 中。
+ * 返回添加到数组中的点的数量。 */
 int membersOfGeoHashBox(robj *zobj, GeoHashBits hash, geoArray *ga, GeoShape *shape, unsigned long limit) {
     GeoHashFix52Bits min, max;
 
@@ -361,38 +363,38 @@ int membersOfGeoHashBox(robj *zobj, GeoHashBits hash, geoArray *ga, GeoShape *sh
     return geoGetPointsInRange(zobj, min, max, shape, ga, limit);
 }
 
-/* Search all eight neighbors + self geohash box */
+/* 搜索自身及八个相邻的 geohash 包围盒 */
 int membersOfAllNeighbors(robj *zobj, const GeoHashRadius *n, GeoShape *shape, geoArray *ga, unsigned long limit) {
     GeoHashBits neighbors[9];
     unsigned int i, count = 0, last_processed = 0;
     int debugmsg = 0;
 
-    neighbors[0] = n->hash;
-    neighbors[1] = n->neighbors.north;
-    neighbors[2] = n->neighbors.south;
-    neighbors[3] = n->neighbors.east;
-    neighbors[4] = n->neighbors.west;
-    neighbors[5] = n->neighbors.north_east;
-    neighbors[6] = n->neighbors.north_west;
-    neighbors[7] = n->neighbors.south_east;
-    neighbors[8] = n->neighbors.south_west;
+    neighbors[0] = n->hash;              // 自身
+    neighbors[1] = n->neighbors.north;   // 北
+    neighbors[2] = n->neighbors.south;   // 南
+    neighbors[3] = n->neighbors.east;    // 东
+    neighbors[4] = n->neighbors.west;    // 西
+    neighbors[5] = n->neighbors.north_east;  // 东北
+    neighbors[6] = n->neighbors.north_west;  // 西北
+    neighbors[7] = n->neighbors.south_east;  // 东南
+    neighbors[8] = n->neighbors.south_west;  // 西南
 
-    /* For each neighbor (*and* our own hashbox), get all the matching
-     * members and add them to the potential result list. */
+    /* 对每个相邻区域（*以及* 自身的 hashbox），
+     * 获取所有匹配的成员并将它们添加到候选结果列表中。 */
     for (i = 0; i < sizeof(neighbors) / sizeof(*neighbors); i++) {
         if (HASHISZERO(neighbors[i])) {
             if (debugmsg) D("neighbors[%d] is zero",i);
             continue;
         }
 
-        /* Debugging info. */
+        /* 调试信息。 */
         if (debugmsg) {
             GeoHashRange long_range, lat_range;
             geohashGetCoordRange(&long_range,&lat_range);
             GeoHashArea myarea = {{0}};
             geohashDecode(long_range, lat_range, neighbors[i], &myarea);
 
-            /* Dump center square. */
+            /* 输出中心方块。 */
             D("neighbors[%d]:\n",i);
             D("area.longitude.min: %f\n", myarea.longitude.min);
             D("area.longitude.max: %f\n", myarea.longitude.max);
@@ -401,10 +403,9 @@ int membersOfAllNeighbors(robj *zobj, const GeoHashRadius *n, GeoShape *shape, g
             D("\n");
         }
 
-        /* When a huge Radius (in the 5000 km range or more) is used,
-         * adjacent neighbors can be the same, leading to duplicated
-         * elements. Skip every range which is the same as the one
-         * processed previously. */
+        /* 当使用很大的半径（5000 公里或更大）时，
+         * 相邻的区域可能是相同的，从而导致元素重复。
+         * 跳过与上一次处理的范围相同的范围。 */
         if (last_processed &&
             neighbors[i].bits == neighbors[last_processed].bits &&
             neighbors[i].step == neighbors[last_processed].step)
@@ -420,11 +421,12 @@ int membersOfAllNeighbors(robj *zobj, const GeoHashRadius *n, GeoShape *shape, g
     return count;
 }
 
-/* Sort comparators for qsort() */
+/* qsort() 的比较器 */
+/* 按距离升序排列的比较器 */
 static int sort_gp_asc(const void *a, const void *b) {
     const struct geoPoint *gpa = a, *gpb = b;
-    /* We can't do adist - bdist because they are doubles and
-     * the comparator returns an int. */
+    /* 我们不能直接做 adist - bdist，因为它们是 double 类型，
+     * 而比较器返回 int。 */
     if (gpa->dist > gpb->dist)
         return 1;
     else if (gpa->dist == gpb->dist)
@@ -433,37 +435,42 @@ static int sort_gp_asc(const void *a, const void *b) {
         return -1;
 }
 
+/* 按距离降序排列的比较器 */
 static int sort_gp_desc(const void *a, const void *b) {
     return -sort_gp_asc(a, b);
 }
 
 /* ====================================================================
- * Commands
+ * 命令
  * ==================================================================== */
 
-/* GEOADD key [CH] [NX|XX] long lat name [long2 lat2 name2 ... longN latN nameN] */
+/* GEOADD key [CH] [NX|XX] long lat name [long2 lat2 name2 ... longN latN nameN]
+ *
+ * 向地理空间索引添加一个或多个位置点（经度、纬度、成员名）。
+ * 实际通过将经纬度编码为 geohash 52 位分数后调用 ZADD 实现。
+ * 返回新添加的位置点数量（已存在则更新分数）。
+ * 时间复杂度：每对 (long, lat, name) 为 O(log(N))。 */
 void geoaddCommand(client *c) {
     int xx = 0, nx = 0, longidx = 2;
     int i;
 
-    /* Parse options. At the end 'longidx' is set to the argument position
-     * of the longitude of the first element. */
+    /* 解析选项。解析结束后 'longidx' 指向第一个元素的经度所在参数位置。 */
     while (longidx < c->argc) {
         char *opt = c->argv[longidx]->ptr;
         if (!strcasecmp(opt,"nx")) nx = 1;
         else if (!strcasecmp(opt,"xx")) xx = 1;
-        else if (!strcasecmp(opt,"ch")) { /* Handle in zaddCommand. */ }
+        else if (!strcasecmp(opt,"ch")) { /* 在 zaddCommand 中处理。 */ }
         else break;
         longidx++;
     }
 
     if ((c->argc - longidx) % 3 || (xx && nx)) {
-        /* Need an odd number of arguments if we got this far... */
+        /* 到这里之后还需要奇数个参数…… */
             addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
-    /* Set up the vector for calling ZADD. */
+    /* 构造用于调用 ZADD 的参数向量。 */
     int elements = (c->argc - longidx) / 3;
     int argc = longidx+elements*2; /* ZADD key [CH] [NX|XX] score ele ... */
     robj **argv = zcalloc(argc*sizeof(robj*));
@@ -473,9 +480,8 @@ void geoaddCommand(client *c) {
         incrRefCount(argv[i]);
     }
 
-    /* Create the argument vector to call ZADD in order to add all
-     * the score,value pairs to the requested zset, where score is actually
-     * an encoded version of lat,long. */
+    /* 创建调用 ZADD 的参数向量，以便向目标 zset 添加所有 score,value 对，
+     * 其中 score 实际上是 lat,long 的编码版本。 */
     for (i = 0; i < elements; i++) {
         double xy[2];
 
@@ -486,7 +492,7 @@ void geoaddCommand(client *c) {
             return;
         }
 
-        /* Turn the coordinates into the score of the element. */
+        /* 将经纬度转换为元素的分数。 */
         GeoHashBits hash;
         geohashEncodeWGS84(xy[0], xy[1], GEO_STEP_MAX, &hash);
         GeoHashFix52Bits bits = geohashAlign52Bits(hash);
@@ -497,20 +503,20 @@ void geoaddCommand(client *c) {
         incrRefCount(val);
     }
 
-    /* Finally call ZADD that will do the work for us. */
+    /* 最后调用 ZADD，让它为我们完成实际工作。 */
     replaceClientCommandVector(c,argc,argv);
     zaddCommand(c);
 }
 
-#define SORT_NONE 0
-#define SORT_ASC 1
-#define SORT_DESC 2
+#define SORT_NONE 0    /* 不排序 */
+#define SORT_ASC 1      /* 升序 */
+#define SORT_DESC 2     /* 降序 */
 
-#define RADIUS_COORDS (1<<0)    /* Search around coordinates. */
-#define RADIUS_MEMBER (1<<1)    /* Search around member. */
-#define RADIUS_NOSTORE (1<<2)   /* Do not accept STORE/STOREDIST option. */
-#define GEOSEARCH (1<<3)        /* GEOSEARCH command variant (different arguments supported) */
-#define GEOSEARCHSTORE (1<<4)   /* GEOSEARCHSTORE just accept STOREDIST option */
+#define RADIUS_COORDS (1<<0)    /* 围绕坐标搜索（GEORADIUS）。 */
+#define RADIUS_MEMBER (1<<1)    /* 围绕成员搜索（GEORADIUSBYMEMBER）。 */
+#define RADIUS_NOSTORE (1<<2)   /* 不接受 STORE/STOREDIST 选项（RO 变体）。 */
+#define GEOSEARCH (1<<3)        /* GEOSEARCH 命令变体（支持不同的参数） */
+#define GEOSEARCHSTORE (1<<4)   /* GEOSEARCHSTORE 仅接受 STOREDIST 选项 */
 
 /* GEORADIUS key x y radius unit [WITHDIST] [WITHHASH] [WITHCOORD] [ASC|DESC]
  *                               [COUNT count [ANY]] [STORE key|STOREDIST key]
@@ -519,30 +525,34 @@ void geoaddCommand(client *c) {
  *               [BYBOX width height unit] [WITHCOORD] [WITHDIST] [WITHASH] [COUNT count [ANY]] [ASC|DESC]
  * GEOSEARCHSTORE dest_key src_key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
  *               [BYBOX width height unit] [COUNT count [ANY]] [ASC|DESC] [STOREDIST]
- *  */
+ *
+ * GEORADIUS/GEORADIUSBYMEMBER/GEOSEARCH/GEOSEARCHSTORE 的通用实现。
+ * 负责解析参数、构造搜索形状、查询 zset、排序、返回结果或存储到目标 key。
+ * 时间复杂度：O(N+log(M))，其中 N 是中心点附近 geohash 邻域中的元素数，
+ * M 是结果数。 */
 void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     robj *storekey = NULL;
-    int storedist = 0; /* 0 for STORE, 1 for STOREDIST. */
+    int storedist = 0; /* 0 表示 STORE，1 表示 STOREDIST。 */
 
-    /* Look up the requested zset */
+    /* 查找请求的 zset */
     robj *zobj = lookupKeyRead(c->db, c->argv[srcKeyIndex]);
     if (checkType(c, zobj, OBJ_ZSET)) return;
 
-    /* Find long/lat to use for radius or box search based on inquiry type */
+    /* 根据查询类型找到用于半径或盒子搜索的经纬度 */
     int base_args;
     GeoShape shape = {0};
     if (flags & RADIUS_COORDS) {
-        /* GEORADIUS or GEORADIUS_RO */
+        /* GEORADIUS 或 GEORADIUS_RO */
         base_args = 6;
         shape.type = CIRCULAR_TYPE;
         if (extractLongLatOrReply(c, c->argv + 2, shape.xy) == C_ERR) return;
         if (extractDistanceOrReply(c, c->argv+base_args-2, &shape.conversion, &shape.t.radius) != C_OK) return;
     } else if ((flags & RADIUS_MEMBER) && !zobj) {
-        /* We don't have a source key, but we need to proceed with argument
-         * parsing, so we know which reply to use depending on the STORE flag. */
+        /* 没有源 key，但我们需要继续解析参数，
+         * 这样我们才能根据 STORE 标志知道使用哪种响应。 */
         base_args = 5;
     } else if (flags & RADIUS_MEMBER) {
-        /* GEORADIUSBYMEMBER or GEORADIUSBYMEMBER_RO */
+        /* GEORADIUSBYMEMBER 或 GEORADIUSBYMEMBER_RO */
         base_args = 5;
         shape.type = CIRCULAR_TYPE;
         robj *member = c->argv[2];
@@ -552,7 +562,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         }
         if (extractDistanceOrReply(c, c->argv+base_args-2, &shape.conversion, &shape.t.radius) != C_OK) return;
     } else if (flags & GEOSEARCH) {
-        /* GEOSEARCH or GEOSEARCHSTORE */
+        /* GEOSEARCH 或 GEOSEARCHSTORE */
         base_args = 2;
         if (flags & GEOSEARCHSTORE) {
             base_args = 3;
@@ -563,23 +573,27 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         return;
     }
 
-    /* Discover and populate all optional parameters. */
+    /* 发现并填充所有可选参数。 */
     int withdist = 0, withhash = 0, withcoords = 0;
     int frommember = 0, fromloc = 0, byradius = 0, bybox = 0;
     int sort = SORT_NONE;
-    int any = 0; /* any=1 means a limited search, stop as soon as enough results were found. */
-    long long count = 0;  /* Max number of results to return. 0 means unlimited. */
+    int any = 0; /* any=1 表示有限搜索，一旦找到足够结果就停止。 */
+    long long count = 0;  /* 返回结果的最大数量。0 表示无限制。 */
     if (c->argc > base_args) {
         int remaining = c->argc - base_args;
         for (int i = 0; i < remaining; i++) {
             char *arg = c->argv[base_args + i]->ptr;
             if (!strcasecmp(arg, "withdist")) {
+                // 同时返回距离
                 withdist = 1;
             } else if (!strcasecmp(arg, "withhash")) {
+                // 同时返回 geohash 整数
                 withhash = 1;
             } else if (!strcasecmp(arg, "withcoord")) {
+                // 同时返回经纬度坐标
                 withcoords = 1;
             } else if (!strcasecmp(arg, "any")) {
+                // 配合 COUNT 使用：尽快返回足够的结果
                 any = 1;
             } else if (!strcasecmp(arg, "asc")) {
                 sort = SORT_ASC;
@@ -598,6 +612,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                        !(flags & RADIUS_NOSTORE) &&
                        !(flags & GEOSEARCH))
             {
+                // STORE key：将结果以原 geohash 分数保存到目标 zset
                 storekey = c->argv[base_args+i+1];
                 storedist = 0;
                 i++;
@@ -606,6 +621,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                        !(flags & RADIUS_NOSTORE) &&
                        !(flags & GEOSEARCH))
             {
+                // STOREDIST key：将结果以距中心点的距离作为分数保存
                 storekey = c->argv[base_args+i+1];
                 storedist = 1;
                 i++;
@@ -613,13 +629,14 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                        (flags & GEOSEARCH) &&
                        (flags & GEOSEARCHSTORE))
             {
+                // GEOSEARCHSTORE 的 STOREDIST 形式：使用距离作为分数
                 storedist = 1;
             } else if (!strcasecmp(arg, "frommember") &&
                       (i+1) < remaining &&
                       flags & GEOSEARCH &&
                       !fromloc)
             {
-                /* No source key, proceed with argument parsing and return an error when done. */
+                /* 没有源 key 时，继续解析参数，待解析完成后返回错误。 */
                 if (zobj == NULL) {
                     frommember = 1;
                     i++;
@@ -667,7 +684,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         }
     }
 
-    /* Trap options not compatible with STORE and STOREDIST. */
+    /* 拦截与 STORE 和 STOREDIST 不兼容的选项。 */
     if (storekey && (withdist || withhash || withcoords)) {
         addReplyErrorFormat(c,
             "%s is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
@@ -694,10 +711,10 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         return;
     }
 
-    /* Return ASAP when src key does not exist. */
+    /* 源 key 不存在时立即返回。 */
     if (zobj == NULL) {
         if (storekey) {
-            /* store key is not NULL, try to delete it and return 0. */
+            /* store key 不为空，尝试删除它并返回 0。 */
             if (dbDelete(c->db, storekey)) {
                 signalModifiedKey(c, c->db, storekey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
@@ -705,26 +722,25 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             }
             addReply(c, shared.czero);
         } else {
-            /* Otherwise we return an empty array. */
+            /* 否则返回一个空数组。 */
             addReply(c, shared.emptyarray);
         }
         return;
     }
 
-    /* COUNT without ordering does not make much sense (we need to
-     * sort in order to return the closest N entries),
-     * force ASC ordering if COUNT was specified but no sorting was
-     * requested. Note that this is not needed for ANY option. */
+    /* 仅使用 COUNT 而不指定排序意义不大（我们需要排序才能返回
+     * 最近的 N 个条目），因此如果指定了 COUNT 但未请求排序，
+     * 强制使用 ASC 排序。注意 ANY 选项不需要这样处理。 */
     if (count != 0 && sort == SORT_NONE && !any) sort = SORT_ASC;
 
-    /* Get all neighbor geohash boxes for our radius search */
+    /* 获取半径搜索涉及的所有相邻 geohash 包围盒 */
     GeoHashRadius georadius = geohashCalculateAreasByShapeWGS84(&shape);
 
-    /* Search the zset for all matching points */
+    /* 在 zset 中搜索所有匹配的点 */
     geoArray *ga = geoArrayCreate();
     membersOfAllNeighbors(zobj, &georadius, &shape, ga, any ? count : 0);
 
-    /* If no matching results, the user gets an empty reply. */
+    /* 如果没有匹配结果，用户将收到空响应。 */
     if (ga->used == 0 && storekey == NULL) {
         addReply(c,shared.emptyarray);
         geoArrayFree(ga);
@@ -736,7 +752,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                           result_length : count;
     long option_length = 0;
 
-    /* Process [optional] requested sorting */
+    /* 处理[可选]的请求排序 */
     if (sort != SORT_NONE) {
         int (*sort_gp_callback)(const void *a, const void *b) = NULL;
         if (sort == SORT_ASC) {
@@ -748,16 +764,17 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         if (returned_items == result_length) {
             qsort(ga->array, result_length, sizeof(geoPoint), sort_gp_callback);
         } else {
+            // 部分排序：仅对前 returned_items 个元素排序
             pqsort(ga->array, result_length, sizeof(geoPoint), sort_gp_callback,
                 0, (returned_items - 1));
         }
     }
 
     if (storekey == NULL) {
-        /* No target key, return results to user. */
+        /* 没有目标 key，将结果返回给用户。 */
 
-        /* Our options are self-contained nested multibulk replies, so we
-         * only need to track how many of those nested replies we return. */
+        /* 我们的选项是自包含的嵌套 multi-bulk 响应，
+         * 因此我们只需要跟踪返回的嵌套响应的数量。 */
         if (withdist)
             option_length++;
 
@@ -767,21 +784,20 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         if (withhash)
             option_length++;
 
-        /* The array len we send is exactly result_length. The result is
-         * either all strings of just zset members  *or* a nested multi-bulk
-         * reply containing the zset member string _and_ all the additional
-         * options the user enabled for this request. */
+        /* 我们发送的数组长度恰好是 result_length。
+         * 结果要么是仅包含 zset 成员字符串的纯字符串数组，
+         * 要么是包含 zset 成员字符串_以及_用户为本次请求启用的
+         * 所有附加选项的嵌套 multi-bulk 响应。 */
         addReplyArrayLen(c, returned_items);
 
-        /* Finally send results back to the caller */
+        /* 最后将结果发回给调用者 */
         int i;
         for (i = 0; i < returned_items; i++) {
             geoPoint *gp = ga->array+i;
-            gp->dist /= shape.conversion; /* Fix according to unit. */
+            gp->dist /= shape.conversion; /* 根据单位修正。 */
 
-            /* If we have options in option_length, return each sub-result
-             * as a nested multi-bulk.  Add 1 to account for result value
-             * itself. */
+            /* 如果 option_length 不为零，将每个子结果作为
+             * 嵌套的 multi-bulk 返回。加 1 是为了计入结果值本身。 */
             if (option_length)
                 addReplyArrayLen(c, option_length + 1);
 
@@ -801,7 +817,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             }
         }
     } else {
-        /* Target key, create a sorted set with the results. */
+        /* 有目标 key，使用结果创建 sorted set。 */
         robj *zobj;
         zset *zs;
         int i;
@@ -815,7 +831,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         for (i = 0; i < returned_items; i++) {
             zskiplistNode *znode;
             geoPoint *gp = ga->array+i;
-            gp->dist /= shape.conversion; /* Fix according to unit. */
+            gp->dist /= shape.conversion; /* 根据单位修正。 */
             double score = storedist ? gp->dist : gp->score;
             size_t elelen = sdslen(gp->member);
 
@@ -843,68 +859,70 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     geoArrayFree(ga);
 }
 
-/* GEORADIUS wrapper function. */
+/* GEORADIUS 命令包装函数。 */
 void georadiusCommand(client *c) {
     georadiusGeneric(c, 1, RADIUS_COORDS);
 }
 
-/* GEORADIUSBYMEMBER wrapper function. */
+/* GEORADIUSBYMEMBER 命令包装函数。 */
 void georadiusbymemberCommand(client *c) {
     georadiusGeneric(c, 1, RADIUS_MEMBER);
 }
 
-/* GEORADIUS_RO wrapper function. */
+/* GEORADIUS_RO 命令包装函数（只读，不支持 STORE/STOREDIST）。 */
 void georadiusroCommand(client *c) {
     georadiusGeneric(c, 1, RADIUS_COORDS|RADIUS_NOSTORE);
 }
 
-/* GEORADIUSBYMEMBER_RO wrapper function. */
+/* GEORADIUSBYMEMBER_RO 命令包装函数（只读，不支持 STORE/STOREDIST）。 */
 void georadiusbymemberroCommand(client *c) {
     georadiusGeneric(c, 1, RADIUS_MEMBER|RADIUS_NOSTORE);
 }
 
+/* GEOSEARCH 命令实现。 */
 void geosearchCommand(client *c) {
     georadiusGeneric(c, 1, GEOSEARCH);
 }
 
+/* GEOSEARCHSTORE 命令实现。 */
 void geosearchstoreCommand(client *c) {
     georadiusGeneric(c, 2, GEOSEARCH|GEOSEARCHSTORE);
 }
 
 /* GEOHASH key ele1 ele2 ... eleN
  *
- * Returns an array with an 11 characters geohash representation of the
- * position of the specified elements. */
+ * 返回一个数组，其中包含指定元素位置的 11 字符串 geohash 表示。
+ * 缺失的元素使用 NULL bulk 响应填充。
+ * 时间复杂度：每个请求元素为 O(log(N))。 */
 void geohashCommand(client *c) {
     char *geoalphabet= "0123456789bcdefghjkmnpqrstuvwxyz";
     int j;
 
-    /* Look up the requested zset */
+    /* 查找请求的 zset */
     robj *zobj = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c, zobj, OBJ_ZSET)) return;
 
-    /* Geohash elements one after the other, using a null bulk reply for
-     * missing elements. */
+    /* 依次处理每个 geohash 元素，对缺失元素使用 null bulk 响应。 */
     addReplyArrayLen(c,c->argc-2);
     for (j = 2; j < c->argc; j++) {
         double score;
         if (!zobj || zsetScore(zobj, c->argv[j]->ptr, &score) == C_ERR) {
             addReplyNull(c);
         } else {
-            /* The internal format we use for geocoding is a bit different
-             * than the standard, since we use as initial latitude range
-             * -85,85, while the normal geohashing algorithm uses -90,90.
-             * So we have to decode our position and re-encode using the
-             * standard ranges in order to output a valid geohash string. */
+            /* 我们用于地理编码的内部格式与标准略有不同，
+             * 因为我们使用的初始纬度范围是 -85,85，
+             * 而标准 geohash 算法使用 -90,90。
+             * 因此我们必须解码位置，然后使用标准范围重新编码，
+             * 以便输出有效的 geohash 字符串。 */
 
-            /* Decode... */
+            /* 解码…… */
             double xy[2];
             if (!decodeGeohash(score,xy)) {
                 addReplyNull(c);
                 continue;
             }
 
-            /* Re-encode */
+            /* 重新编码 */
             GeoHashRange r[2];
             GeoHashBits hash;
             r[0].min = -180;
@@ -918,9 +936,8 @@ void geohashCommand(client *c) {
             for (i = 0; i < 11; i++) {
                 int idx;
                 if (i == 10) {
-                    /* We have just 52 bits, but the API used to output
-                     * an 11 bytes geohash. For compatibility we assume
-                     * zero. */
+                    /* 我们只有 52 位，但该 API 历史上输出
+                     * 11 字节的 geohash。为了兼容性，我们假设为零。 */
                     idx = 0;
                 } else {
                     idx = (hash.bits >> (52-((i+1)*5))) & 0x1f;
@@ -935,24 +952,24 @@ void geohashCommand(client *c) {
 
 /* GEOPOS key ele1 ele2 ... eleN
  *
- * Returns an array of two-items arrays representing the x,y position of each
- * element specified in the arguments. For missing elements NULL is returned. */
+ * 返回一个数组，其中每个元素是表示参数中指定元素 x,y 位置的二元数组。
+ * 缺失的元素返回 NULL。
+ * 时间复杂度：每个请求元素为 O(log(N))。 */
 void geoposCommand(client *c) {
     int j;
 
-    /* Look up the requested zset */
+    /* 查找请求的 zset */
     robj *zobj = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c, zobj, OBJ_ZSET)) return;
 
-    /* Report elements one after the other, using a null bulk reply for
-     * missing elements. */
+    /* 依次报告每个元素，对缺失元素使用 null bulk 响应。 */
     addReplyArrayLen(c,c->argc-2);
     for (j = 2; j < c->argc; j++) {
         double score;
         if (!zobj || zsetScore(zobj, c->argv[j]->ptr, &score) == C_ERR) {
             addReplyNullArray(c);
         } else {
-            /* Decode... */
+            /* 解码…… */
             double xy[2];
             if (!decodeGeohash(score,xy)) {
                 addReplyNullArray(c);
@@ -967,13 +984,14 @@ void geoposCommand(client *c) {
 
 /* GEODIST key ele1 ele2 [unit]
  *
- * Return the distance, in meters by default, otherwise according to "unit",
- * between points ele1 and ele2. If one or more elements are missing NULL
- * is returned. */
+ * 返回点 ele1 和 ele2 之间的距离，默认以米为单位，
+ * 否则按 "unit" 参数指定的单位返回。
+ * 如果其中一个或两个元素不存在则返回 NULL。
+ * 时间复杂度：O(log(N))。 */
 void geodistCommand(client *c) {
     double to_meter = 1;
 
-    /* Check if there is the unit to extract, otherwise assume meters. */
+    /* 检查是否存在要提取的单位参数，否则默认使用米。 */
     if (c->argc == 5) {
         to_meter = extractUnitOrReply(c,c->argv[4]);
         if (to_meter < 0) return;
@@ -982,12 +1000,12 @@ void geodistCommand(client *c) {
         return;
     }
 
-    /* Look up the requested zset */
+    /* 查找请求的 zset */
     robj *zobj = NULL;
     if ((zobj = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp]))
         == NULL || checkType(c, zobj, OBJ_ZSET)) return;
 
-    /* Get the scores. We need both otherwise NULL is returned. */
+    /* 获取分数。我们需要同时获得两个分数，否则返回 NULL。 */
     double score1, score2, xyxy[4];
     if (zsetScore(zobj, c->argv[2]->ptr, &score1) == C_ERR ||
         zsetScore(zobj, c->argv[3]->ptr, &score2) == C_ERR)
@@ -996,7 +1014,7 @@ void geodistCommand(client *c) {
         return;
     }
 
-    /* Decode & compute the distance. */
+    /* 解码并计算距离。 */
     if (!decodeGeohash(score1,xyxy) || !decodeGeohash(score2,xyxy+2))
         addReplyNull(c);
     else
