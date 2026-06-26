@@ -23,13 +23,13 @@
 
 /* -------------------------------- Debugging ------------------------------ */
 
+/* 调试用：在标准输出中显示给定节点的信息。 */
 void raxDebugShowNode(const char *msg, raxNode *n);
 
-/* Turn debugging messages on/off by compiling with RAX_DEBUG_MSG macro on.
- * When RAX_DEBUG_MSG is defined by default Rax operations will emit a lot
- * of debugging info to the standard output, however you can still turn
- * debugging on/off in order to enable it only when you suspect there is an
- * operation causing a bug using the function raxSetDebugMsg(). */
+/* 通过编译时开启 RAX_DEBUG_MSG 宏来打开/关闭调试消息。
+ * 当 RAX_DEBUG_MSG 被定义时，默认情况下 Rax 操作会向标准输出打印大量的调试
+ * 信息；不过你仍然可以通过调用 raxSetDebugMsg() 动态地打开或关闭调试消息，
+ * 这样可以在你怀疑某个操作引发 bug 时再按需启用。 */
 #ifdef RAX_DEBUG_MSG
 #define debugf(...)                                                            \
     if (raxDebugMsg) {                                                         \
@@ -44,25 +44,22 @@ void raxDebugShowNode(const char *msg, raxNode *n);
 #define debugnode(msg,n)
 #endif
 
-/* By default log debug info if RAX_DEBUG_MSG is defined. */
+/* 如果定义了 RAX_DEBUG_MSG，默认会输出调试信息。 */
 static int raxDebugMsg = 1;
 
-/* When debug messages are enabled, turn them on/off dynamically. By
- * default they are enabled. Set the state to 0 to disable, and 1 to
- * re-enable. */
+/* 当调试消息被启用时，可以通过该函数动态地打开/关闭它们。默认状态下它们是
+ * 启用的；将状态置为 0 可以禁用，置为 1 重新启用。 */
 void raxSetDebugMsg(int onoff) {
     raxDebugMsg = onoff;
 }
 
 /* ------------------------- raxStack functions --------------------------
- * The raxStack is a simple stack of pointers that is capable of switching
- * from using a stack-allocated array to dynamic heap once a given number of
- * items are reached. It is used in order to retain the list of parent nodes
- * while walking the radix tree in order to implement certain operations that
- * need to navigate the tree upward.
+ * raxStack 是一个简单的指针栈，在元素数量达到一定阈值后，能够从栈上分配的
+ * 静态数组切换到动态堆分配。它用于在遍历基数树时保存父节点列表，从而实现
+ * 需要向上回溯树结构的某些操作。
  * ------------------------------------------------------------------------- */
 
-/* Initialize the stack. */
+/* 初始化栈。 */
 static inline void raxStackInit(raxStack *ts) {
     ts->stack = ts->static_items;
     ts->items = 0;
@@ -70,7 +67,7 @@ static inline void raxStackInit(raxStack *ts) {
     ts->oom = 0;
 }
 
-/* Push an item into the stack, returns 1 on success, 0 on out of memory. */
+/* 将一个元素压入栈中，成功返回 1，内存不足时返回 0。 */
 static inline int raxStackPush(raxStack *ts, void *ptr) {
     if (ts->items == ts->maxitems) {
         if (ts->stack == ts->static_items) {
@@ -98,22 +95,20 @@ static inline int raxStackPush(raxStack *ts, void *ptr) {
     return 1;
 }
 
-/* Pop an item from the stack, the function returns NULL if there are no
- * items to pop. */
+/* 从栈中弹出一个元素，如果没有元素可弹则返回 NULL。 */
 static inline void *raxStackPop(raxStack *ts) {
     if (ts->items == 0) return NULL;
     ts->items--;
     return ts->stack[ts->items];
 }
 
-/* Return the stack item at the top of the stack without actually consuming
- * it. */
+/* 返回栈顶元素，但并不实际弹出它。 */
 static inline void *raxStackPeek(raxStack *ts) {
     if (ts->items == 0) return NULL;
     return ts->stack[ts->items-1];
 }
 
-/* Free the stack in case we used heap allocation. */
+/* 若栈使用了堆分配，则释放该栈。 */
 static inline void raxStackFree(raxStack *ts) {
     if (ts->stack != ts->static_items) rax_free(ts->stack);
 }
@@ -122,14 +117,12 @@ static inline void raxStackFree(raxStack *ts) {
  * Radix tree implementation
  * --------------------------------------------------------------------------*/
 
-/* Return the padding needed in the characters section of a node having size
- * 'nodesize'. The padding is needed to store the child pointers to aligned
- * addresses. Note that we add 4 to the node size because the node has a four
- * bytes header. */
+/* 返回一个具有 'nodesize' 大小的节点其字符段所需的填充字节数。
+ * 这个填充是为了将子节点指针存储到对齐的地址上。注意我们在节点大小上加了 4，
+ * 因为节点带有 4 字节的头部。 */
 #define raxPadding(nodesize) ((sizeof(void*)-(((nodesize)+4) % sizeof(void*))) & (sizeof(void*)-1))
 
-/* Return the pointer to the last child pointer in a node. For the compressed
- * nodes this is the only child pointer. */
+/* 返回节点中最后一个子节点指针的地址。对于压缩节点，这就是唯一的子节点指针。 */
 #define raxNodeLastChildPtr(n) ((raxNode**) ( \
     ((char*)(n)) + \
     raxNodeCurrentLength(n) - \
@@ -137,15 +130,14 @@ static inline void raxStackFree(raxStack *ts) {
     (((n)->iskey && !(n)->isnull) ? sizeof(void*) : 0) \
 ))
 
-/* Return the pointer to the first child pointer. */
+/* 返回第一个子节点指针的地址。 */
 #define raxNodeFirstChildPtr(n) ((raxNode**) ( \
     (n)->data + \
     (n)->size + \
     raxPadding((n)->size)))
 
-/* Return the current total size of the node. Note that the second line
- * computes the padding after the string of characters, needed in order to
- * save pointers to aligned addresses. */
+/* 返回节点当前的总长度。注意其中第二行计算的是字符数组之后的填充，
+ * 这部分填充是为了让指针存储在对齐的地址上。 */
 #define raxNodeCurrentLength(n) ( \
     sizeof(raxNode)+(n)->size+ \
     raxPadding((n)->size)+ \
@@ -153,10 +145,9 @@ static inline void raxStackFree(raxStack *ts) {
     (((n)->iskey && !(n)->isnull)*sizeof(void*)) \
 )
 
-/* Allocate a new non compressed node with the specified number of children.
- * If datafield is true, the allocation is made large enough to hold the
- * associated data pointer.
- * Returns the new node pointer. On out of memory NULL is returned. */
+/* 分配一个新的非压缩节点，并指定其子节点数量。
+ * 如果 datafield 为 true，则分配的空间也会大到足以容纳关联的数据指针。
+ * 返回新节点的指针。内存不足时返回 NULL。 */
 raxNode *raxNewNode(size_t children, int datafield) {
     size_t nodesize = sizeof(raxNode)+children+raxPadding(children)+
                       sizeof(raxNode*)*children;
@@ -170,13 +161,12 @@ raxNode *raxNewNode(size_t children, int datafield) {
     return node;
 }
 
-/* Allocate a new rax and return its pointer. On out of memory the function
- * returns NULL. */
+/* 分配一个新的 rax（基数树）并返回其指针。内存不足时函数返回 NULL。 */
 rax *raxNew(void) {
     return raxNewWithMetadata(0);
 }
 
-/* Allocate a new rax with metadata */
+/* 分配一个带有自定义元数据的新 rax。 */
 rax *raxNewWithMetadata(int metaSize) {
     rax *rax = rax_malloc(sizeof(*rax) + metaSize);
     if (rax == NULL) return NULL;
@@ -191,15 +181,15 @@ rax *raxNewWithMetadata(int metaSize) {
     }
 }
 
-/* realloc the node to make room for auxiliary data in order
- * to store an item in that node. On out of memory NULL is returned. */
+/* 重新分配节点的空间，以容纳用于存储项的辅助数据字段。
+ * 内存不足时返回 NULL。 */
 raxNode *raxReallocForData(raxNode *n, void *data) {
-    if (data == NULL) return n; /* No reallocation needed, setting isnull=1 */
+    if (data == NULL) return n; /* 不需要重新分配，只需将 isnull 设为 1 */
     size_t curlen = raxNodeCurrentLength(n);
     return rax_realloc(n,curlen+sizeof(void*));
 }
 
-/* Set the node auxiliary data to the specified pointer. */
+/* 将节点的辅助数据设置为指定的指针。 */
 void raxSetData(raxNode *n, void *data) {
     n->iskey = 1;
     if (data != NULL) {
@@ -212,7 +202,7 @@ void raxSetData(raxNode *n, void *data) {
     }
 }
 
-/* Get the node auxiliary data. */
+/* 获取节点的辅助数据。 */
 void *raxGetData(raxNode *n) {
     if (n->isnull) return NULL;
     void **ndata =(void**)((char*)n+raxNodeCurrentLength(n)-sizeof(void*));
@@ -221,15 +211,12 @@ void *raxGetData(raxNode *n) {
     return data;
 }
 
-/* Add a new child to the node 'n' representing the character 'c' and return
- * its new pointer, as well as the child pointer by reference. Additionally
- * '***parentlink' is populated with the raxNode pointer-to-pointer of where
- * the new child was stored, which is useful for the caller to replace the
- * child pointer if it gets reallocated.
+/* 向节点 'n' 添加一个表示字符 'c' 的新子节点，并通过引用返回它的新指针
+ * 以及子节点指针。此外，'***parentlink' 会被填充为指向新子节点存储位置的
+ * raxNode 二级指针，这对于在子节点被重新分配时让调用者替换子节点指针非常有用。
  *
- * On success the new parent node pointer is returned (it may change because
- * of the realloc, so the caller should discard 'n' and use the new value).
- * On out of memory NULL is returned, and the old node is still valid. */
+ * 成功时返回新的父节点指针（由于 realloc 它可能会改变，因此调用者应丢弃 'n'
+ * 并使用新返回值）。内存不足时返回 NULL，并且原节点仍然有效。 */
 raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink) {
     assert(n->iscompr == 0);
 
@@ -363,14 +350,12 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
     return n;
 }
 
-/* Turn the node 'n', that must be a node without any children, into a
- * compressed node representing a set of nodes linked one after the other
- * and having exactly one child each. The node can be a key or not: this
- * property and the associated value if any will be preserved.
+/* 将节点 'n'（必须是一个没有任何子节点的节点）转换为一个压缩节点，该压缩
+ * 节点表示一串逐个链接、且每个节点恰好只有一个子节点的节点序列。节点可以
+ * 是一个 key，也可以不是：它的这个属性以及可能存在的关联值都会被保留。
  *
- * The function also returns a child node, since the last node of the
- * compressed chain cannot be part of the chain: it has zero children while
- * we can only compress inner nodes with exactly one child each. */
+ * 该函数还会返回一个子节点，因为压缩链的最后一个节点不能属于压缩链本身：
+ * 它没有子节点，而我们只能压缩恰好只有一个子节点的中间节点。 */
 raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **child) {
     assert(n->size == 0 && n->iscompr == 0);
     void *data = NULL; /* Initialized only to avoid warnings. */
@@ -404,35 +389,25 @@ raxNode *raxCompressNode(raxNode *n, unsigned char *s, size_t len, raxNode **chi
     return n;
 }
 
-/* Low level function that walks the tree looking for the string
- * 's' of 'len' bytes. The function returns the number of characters
- * of the key that was possible to process: if the returned integer
- * is the same as 'len', then it means that the node corresponding to the
- * string was found (however it may not be a key in case the node->iskey is
- * zero or if simply we stopped in the middle of a compressed node, so that
- * 'splitpos' is non zero).
+/* 底层函数：在树中查找长度为 'len' 字节的字符串 's'。函数返回已经处理过的
+ * key 字符数：如果返回值等于 'len'，则表示已找到对应字符串所在的节点
+ * （但该节点未必是 key——比如当 node->iskey 为 0，或者我们停在压缩节点
+ *  中间位置导致 'splitpos' 不为零时）。
  *
- * Otherwise if the returned integer is not the same as 'len', there was an
- * early stop during the tree walk because of a character mismatch.
+ * 如果返回值不等于 'len'，则表示在遍历过程中因为字符不匹配而提前终止。
  *
- * The node where the search ended (because the full string was processed
- * or because there was an early stop) is returned by reference as
- * '*stopnode' if the passed pointer is not NULL. This node link in the
- * parent's node is returned as '*plink' if not NULL. Finally, if the
- * search stopped in a compressed node, '*splitpos' returns the index
- * inside the compressed node where the search ended. This is useful to
- * know where to split the node for insertion.
+ * 搜索终止时所在的节点（无论是因为完整处理完字符串还是因为提前终止）
+ * 会通过引用方式由 '*stopnode' 返回（当传入的指针非 NULL 时）。该节点
+ * 在其父节点中的指针链接通过 '*plink' 返回（当非 NULL 时）。最后，如果
+ * 搜索在压缩节点中终止，'*splitpos' 会返回终止位置在压缩节点中的下标，
+ * 这对于在插入时知道从何处分裂节点非常有用。
  *
- * Note that when we stop in the middle of a compressed node with
- * a perfect match, this function will return a length equal to the
- * 'len' argument (all the key matched), and will return a *splitpos which is
- * always positive (that will represent the index of the character immediately
- * *after* the last match in the current compressed node).
+ * 注意，当我们因为完全匹配而停在压缩节点中间位置时，本函数会返回一个
+ * 等于 'len' 的长度（key 的全部字符都匹配了），同时返回一个始终为正的
+ * *splitpos（表示当前压缩节点中最后一个匹配字符之后紧邻的字符的下标）。
  *
- * When instead we stop at a compressed node and *splitpos is zero, it
- * means that the current node represents the key (that is, none of the
- * compressed node characters are needed to represent the key, just all
- * its parents nodes). */
+ * 而当我们停在压缩节点但 *splitpos 为零时，则表示当前节点本身就表示该
+ * key（即不需要压缩节点中的任何字符来表示该 key，仅其全部父节点即可）。 */
 static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts) {
     raxNode *h = rax->head;
     raxNode **parentlink = &rax->head;
@@ -476,12 +451,10 @@ static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode 
     return i;
 }
 
-/* Insert the element 's' of size 'len', setting as auxiliary data
- * the pointer 'data'. If the element is already present, the associated
- * data is updated (only if 'overwrite' is set to 1), and 0 is returned,
- * otherwise the element is inserted and 1 is returned. On out of memory the
- * function returns 0 as well but sets errno to ENOMEM, otherwise errno will
- * be set to 0.
+/* 插入大小为 'len' 的元素 's'，并将指针 'data' 作为其辅助数据。
+ * 如果元素已经存在，则仅当 'overwrite' 设为 1 时才会更新其关联数据，
+ * 并返回 0；否则将元素插入并返回 1。内存不足时函数也返回 0，但同时将
+ * errno 设为 ENOMEM；其他情况下 errno 会被置为 0。
  */
 int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite) {
     size_t i;
@@ -876,22 +849,21 @@ oom:
     return 0;
 }
 
-/* Overwriting insert. Just a wrapper for raxGenericInsert() that will
- * update the element if there is already one for the same key. */
+/* 覆盖式插入：仅是 raxGenericInsert() 的一个包装，当存在相同 key 时
+ * 会更新元素。 */
 int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
     return raxGenericInsert(rax,s,len,data,old,1);
 }
 
-/* Non overwriting insert function: if an element with the same key
- * exists, the value is not updated and the function returns 0.
- * This is just a wrapper for raxGenericInsert(). */
+/* 非覆盖式插入函数：当存在相同 key 的元素时，不会更新其值，且函数返回 0。
+ * 同样只是 raxGenericInsert() 的一个包装。 */
 int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old) {
     return raxGenericInsert(rax,s,len,data,old,0);
 }
 
-/* Find a key in the rax: return 1 if the item is found, 0 otherwise.
- * If there is an item and 'value' is passed in a non-NULL pointer,
- * the value associated with the item is set at that address. */
+/* 在 rax 中查找某个 key：找到则返回 1，否则返回 0。
+ * 如果找到对应项且传入的 'value' 是非 NULL 指针，则会在该地址写入与
+ * 该 key 关联的值。 */
 int raxFind(rax *rax, unsigned char *s, size_t len, void **value) {
     raxNode *h;
 
@@ -904,11 +876,9 @@ int raxFind(rax *rax, unsigned char *s, size_t len, void **value) {
     return 1;
 }
 
-/* Return the memory address where the 'parent' node stores the specified
- * 'child' pointer, so that the caller can update the pointer with another
- * one if needed. The function assumes it will find a match, otherwise the
- * operation is an undefined behavior (it will continue scanning the
- * memory without any bound checking). */
+/* 返回 'parent' 节点中存储指定 'child' 指针的内存地址，以便调用者在需要时
+ * 用另一个指针更新它。该函数假定能够找到匹配项，否则属于未定义行为（它将
+ * 在没有任何边界检查的情况下继续扫描内存）。 */
 raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
     raxNode **cp = raxNodeFirstChildPtr(parent);
     raxNode *c;
@@ -920,10 +890,9 @@ raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
     return cp;
 }
 
-/* Low level child removal from node. The new node pointer (after the child
- * removal) is returned. Note that this function does not fix the pointer
- * of the parent node in its parent, so this task is up to the caller.
- * The function never fails for out of memory. */
+/* 底层的子节点移除函数。返回移除子节点之后的节点指针。注意本函数不会
+ * 修复父节点在其祖父节点中的指针，因此这一任务由调用者负责。
+ * 该函数永远不会因内存不足而失败。 */
 raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
     debugnode("raxRemoveChild before", parent);
     /* If parent is a compressed node (having a single child, as for definition
@@ -995,8 +964,7 @@ raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
     return newnode ? newnode : parent;
 }
 
-/* Remove the specified item. Returns 1 if the item was found and
- * deleted, 0 otherwise. */
+/* 删除指定的项。如果该项被找到并删除则返回 1，否则返回 0。 */
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
     raxNode *h;
     raxStack ts;
@@ -1196,8 +1164,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
     return 1;
 }
 
-/* This is the core of raxFree(): performs a depth-first scan of the
- * tree and releases all the nodes found. */
+/* raxFree() 的核心：以深度优先的方式扫描树，并释放所有找到的节点。 */
 void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void*)) {
     debugnode("free traversing",n);
     int numchildren = n->iscompr ? 1 : n->size;
@@ -1215,7 +1182,7 @@ void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void*)) {
     rax->numnodes--;
 }
 
-/* Same as raxRecursiveFree() with context argument */
+/* 与 raxRecursiveFree() 相同，但带有 context 参数。 */
 void raxRecursiveFreeWithCtx(rax *rax, raxNode *n,
                             void (*free_callback)(void *item, void *ctx), void *ctx) {
     debugnode("free traversing",n);
@@ -1234,16 +1201,14 @@ void raxRecursiveFreeWithCtx(rax *rax, raxNode *n,
     rax->numnodes--;
 }
 
-/* Free a whole radix tree, calling the specified callback in order to
- * free the auxiliary data. */
+/* 释放整棵基数树，并通过指定的回调函数来释放关联的辅助数据。 */
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void*)) {
     raxRecursiveFree(rax,rax->head,free_callback);
     assert(rax->numnodes == 0);
     rax_free(rax);
 }
 
-/* Free a whole radix tree, calling the specified callback in order to
- * free the auxiliary data. */
+/* 释放整棵基数树，并通过指定的回调函数来释放关联的辅助数据。 */
 void raxFreeWithCbAndContext(rax *rax,
                              void (*free_callback)(void *item, void *ctx), void *ctx) {
     raxRecursiveFreeWithCtx(rax,rax->head,free_callback,ctx);
@@ -1251,16 +1216,15 @@ void raxFreeWithCbAndContext(rax *rax,
     rax_free(rax);
 }
 
-/* Free a whole radix tree. */
+/* 释放整棵基数树。 */
 void raxFree(rax *rax) {
     raxFreeWithCallback(rax,NULL);
 }
 
 /* ------------------------------- Iterator --------------------------------- */
 
-/* Initialize a Rax iterator. This call should be performed a single time
- * to initialize the iterator, and must be followed by a raxSeek() call,
- * otherwise the raxPrev()/raxNext() functions will just return EOF. */
+/* 初始化一个 Rax 迭代器。该调用应当只执行一次以完成迭代器的初始化，并且
+ * 必须紧跟着调用一次 raxSeek()，否则 raxPrev()/raxNext() 只会返回 EOF。 */
 void raxStart(raxIterator *it, rax *rt) {
     it->flags = RAX_ITER_EOF; /* No crash if the iterator is not seeked. */
     it->rt = rt;
@@ -1272,9 +1236,8 @@ void raxStart(raxIterator *it, rax *rt) {
     raxStackInit(&it->stack);
 }
 
-/* Append characters at the current key string of the iterator 'it'. This
- * is a low level function used to implement the iterator, not callable by
- * the user. Returns 0 on out of memory, otherwise 1 is returned. */
+/* 在迭代器 'it' 的当前 key 字符串末尾追加若干字符。这是用于实现迭代器的
+ * 底层函数，不对用户开放。内存不足时返回 0，否则返回 1。 */
 int raxIteratorAddChars(raxIterator *it, unsigned char *s, size_t len) {
     if (len == 0) return 1;
     if (it->key_max < it->key_len+len) {
@@ -1297,26 +1260,21 @@ int raxIteratorAddChars(raxIterator *it, unsigned char *s, size_t len) {
     return 1;
 }
 
-/* Remove the specified number of chars from the right of the current
- * iterator key. */
+/* 从迭代器当前 key 的右侧移除指定数量的字符。 */
 void raxIteratorDelChars(raxIterator *it, size_t count) {
     it->key_len -= count;
 }
 
-/* Do an iteration step towards the next element. At the end of the step the
- * iterator key will represent the (new) current key. If it is not possible
- * to step in the specified direction since there are no longer elements, the
- * iterator is flagged with RAX_ITER_EOF.
+/* 向下一个元素执行一次迭代步骤。步骤结束时，迭代器的 key 将表示新的当前 key。
+ * 如果由于已没有更多元素而无法再向指定方向前进，则将迭代器标记为 RAX_ITER_EOF。
  *
- * If 'noup' is true the function starts directly scanning for the next
- * lexicographically smaller children, and the current node is already assumed
- * to be the parent of the last key node, so the first operation to go back to
- * the parent will be skipped. This option is used by raxSeek() when
- * implementing seeking a non existing element with the ">" or "<" options:
- * the starting node is not a key in that particular case, so we start the scan
- * from a node that does not represent the key set.
+ * 如果 'noup' 为 true，函数会直接从当前节点开始扫描字典序更小的子节点，
+ * 并假定当前节点已经是最后一个 key 节点的父节点，因此会跳过第一次回到
+ * 父节点的操作。该选项被 raxSeek() 在使用 ">" 或 "<" 操作符定位一个
+ * 不存在的元素时使用：在那种情况下起始节点并不是一个 key，因此我们从一个
+ * 不表示已设置 key 的节点开始扫描。
  *
- * The function returns 1 on success or 0 on out of memory. */
+ * 函数成功时返回 1，内存不足时返回 0。 */
 int raxIteratorNextStep(raxIterator *it, int noup) {
     if (it->flags & RAX_ITER_EOF) {
         return 1;
@@ -1415,9 +1373,8 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
     }
 }
 
-/* Seek the greatest key in the subtree at the current node. Return 0 on
- * out of memory, otherwise 1. This is a helper function for different
- * iteration functions below. */
+/* 在当前节点所在的子树中查找最大的 key。内存不足时返回 0，否则返回 1。
+ * 这是下方不同迭代函数的辅助函数。 */
 int raxSeekGreatest(raxIterator *it) {
     while(it->node->size) {
         if (it->node->iscompr) {
@@ -1434,9 +1391,8 @@ int raxSeekGreatest(raxIterator *it) {
     return 1;
 }
 
-/* Like raxIteratorNextStep() but implements an iteration step moving
- * to the lexicographically previous element. The 'noup' option has a similar
- * effect to the one of raxIteratorNextStep(). */
+/* 类似 raxIteratorNextStep()，但实现的是向字典序前一个元素迭代的步骤。
+ * 'noup' 选项的效果与 raxIteratorNextStep() 中类似。 */
 int raxIteratorPrevStep(raxIterator *it, int noup) {
     if (it->flags & RAX_ITER_EOF) {
         return 1;
@@ -1510,10 +1466,9 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
     }
 }
 
-/* Seek an iterator at the specified element.
- * Return 0 if the seek failed for syntax error or out of memory. Otherwise
- * 1 is returned. When 0 is returned for out of memory, errno is set to
- * the ENOMEM value. */
+/* 将迭代器定位到指定元素处。
+ * 如果因为语法错误或内存不足导致定位失败则返回 0，否则返回 1。
+ * 当因为内存不足而返回 0 时，errno 会被设置为 ENOMEM。 */
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
     int eq = 0, lt = 0, gt = 0, first = 0, last = 0;
 
@@ -1675,9 +1630,9 @@ int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
     return 1;
 }
 
-/* Go to the next element in the scope of the iterator 'it'.
- * If EOF (or out of memory) is reached, 0 is returned, otherwise 1 is
- * returned. In case 0 is returned because of OOM, errno is set to ENOMEM. */
+/* 在迭代器 'it' 范围内前进到下一个元素。
+ * 如果达到 EOF（或内存不足），则返回 0，否则返回 1。
+ * 如果是因为 OOM 而返回 0，则 errno 会被设置为 ENOMEM。 */
 int raxNext(raxIterator *it) {
     if (!raxIteratorNextStep(it,0)) {
         errno = ENOMEM;
@@ -1690,9 +1645,9 @@ int raxNext(raxIterator *it) {
     return 1;
 }
 
-/* Go to the previous element in the scope of the iterator 'it'.
- * If EOF (or out of memory) is reached, 0 is returned, otherwise 1 is
- * returned. In case 0 is returned because of OOM, errno is set to ENOMEM. */
+/* 在迭代器 'it' 范围内回退到上一个元素。
+ * 如果达到 EOF（或内存不足），则返回 0，否则返回 1。
+ * 如果是因为 OOM 而返回 0，则 errno 会被设置为 ENOMEM。 */
 int raxPrev(raxIterator *it) {
     if (!raxIteratorPrevStep(it,0)) {
         errno = ENOMEM;
@@ -1705,18 +1660,15 @@ int raxPrev(raxIterator *it) {
     return 1;
 }
 
-/* Perform a random walk starting in the current position of the iterator.
- * Return 0 if the tree is empty or on out of memory. Otherwise 1 is returned
- * and the iterator is set to the node reached after doing a random walk
- * of 'steps' steps. If the 'steps' argument is 0, the random walk is performed
- * using a random number of steps between 1 and two times the logarithm of
- * the number of elements.
+/* 从迭代器当前位置开始执行一次随机游走。
+ * 如果树为空或内存不足则返回 0；否则返回 1，并将迭代器设置为经过 'steps'
+ * 步随机游走后到达的节点。如果 'steps' 参数为 0，则随机游走的步数会取
+ * 一个介于 1 到元素数量对数的两倍之间的随机值。
  *
- * NOTE: if you use this function to generate random elements from the radix
- * tree, expect a disappointing distribution. A random walk produces good
- * random elements if the tree is not sparse, however in the case of a radix
- * tree certain keys will be reported much more often than others. At least
- * this function should be able to explore every possible element eventually. */
+ * 注意：如果用此函数从基数树中生成随机元素，期望分布可能并不理想。当树
+ * 不稀疏时，随机游走可以产生较好的随机元素，但对于基数树而言，某些 key
+ * 出现的频率会比其他 key 高得多。不过至少该函数最终应当能够遍历到每一个
+ * 可能的元素。 */
 int raxRandomWalk(raxIterator *it, size_t steps) {
     if (it->rt->numele == 0) {
         it->flags |= RAX_ITER_EOF;
@@ -1757,9 +1709,8 @@ int raxRandomWalk(raxIterator *it, size_t steps) {
     return 1;
 }
 
-/* Compare the key currently pointed by the iterator to the specified
- * key according to the specified operator. Returns 1 if the comparison is
- * true, otherwise 0 is returned. */
+/* 根据指定的操作符，将迭代器当前指向的 key 与指定 key 进行比较。
+ * 如果比较结果为真则返回 1，否则返回 0。 */
 int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key_len) {
     int eq = 0, lt = 0, gt = 0;
 
@@ -1788,53 +1739,50 @@ int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key
     }
 }
 
-/* Free the iterator. */
+/* 释放迭代器。 */
 void raxStop(raxIterator *it) {
     if (it->key != it->key_static_string) rax_free(it->key);
     raxStackFree(&it->stack);
 }
 
-/* Return if the iterator is in an EOF state. This happens when raxSeek()
- * failed to seek an appropriate element, so that raxNext() or raxPrev()
- * will return zero, or when an EOF condition was reached while iterating
- * with raxNext() and raxPrev(). */
+/* 返回迭代器是否处于 EOF 状态。当 raxSeek() 未能定位到合适的元素（导致
+ * raxNext() 或 raxPrev() 将返回 0），或者在使用 raxNext()/raxPrev() 迭代
+ * 过程中到达 EOF 条件时，就会处于该状态。 */
 int raxEOF(raxIterator *it) {
     return it->flags & RAX_ITER_EOF;
 }
 
-/* Return the number of elements inside the radix tree. */
+/* 返回基数树中保存的元素数量。 */
 uint64_t raxSize(rax *rax) {
     return rax->numele;
 }
 
 /* ----------------------------- Introspection ------------------------------ */
 
-/* This function is mostly used for debugging and learning purposes.
- * It shows an ASCII representation of a tree on standard output, outline
- * all the nodes and the contained keys.
+/* 该函数主要用于调试和学习目的。它会将一棵树以 ASCII 表示输出到标准输出，
+ * 列出所有节点以及其中包含的 key。
  *
- * The representation is as follow:
+ * 表示形式如下：
  *
- *  "foobar" (compressed node)
- *  [abc] (normal node with three children)
- *  [abc]=0x12345678 (node is a key, pointing to value 0x12345678)
- *  [] (a normal empty node)
+ *  "foobar" （压缩节点）
+ *  [abc] （带有三个子节点的普通节点）
+ *  [abc]=0x12345678 （节点是 key，指向 value 0x12345678）
+ *  [] （普通的空节点）
  *
- *  Children are represented in new indented lines, each children prefixed by
- *  the "`-(x)" string, where "x" is the edge byte.
+ *  子节点会按缩进换行的形式展示，每个子节点以 "`-(x)" 作为前缀，其中
+ *  "x" 是边上的字节。
  *
  *  [abc]
  *   `-(a) "ladin"
  *   `-(b) [kj]
  *   `-(c) []
  *
- *  However when a node has a single child the following representation
- *  is used instead:
+ *  不过当节点只有一个子节点时，会改用如下表示：
  *
  *  [abc] -> "ladin" -> []
  */
 
-/* The actual implementation of raxShow(). */
+/* raxShow() 的实际实现。 */
 void raxRecursiveShow(int level, int lpad, raxNode *n) {
     char s = n->iscompr ? '"' : '[';
     char e = n->iscompr ? '"' : ']';
@@ -1868,13 +1816,13 @@ void raxRecursiveShow(int level, int lpad, raxNode *n) {
     }
 }
 
-/* Show a tree, as outlined in the comment above. */
+/* 展示一棵树，其格式如上方注释所述。 */
 void raxShow(rax *rax) {
     raxRecursiveShow(0,0,rax->head);
     putchar('\n');
 }
 
-/* Used by debugnode() macro to show info about a given node. */
+/* 由 debugnode() 宏调用，用于展示给定节点的信息。 */
 void raxDebugShowNode(const char *msg, raxNode *n) {
     if (raxDebugMsg == 0) return;
     printf("%s: %p [%.*s] key:%u size:%u children:",
@@ -1891,22 +1839,18 @@ void raxDebugShowNode(const char *msg, raxNode *n) {
     fflush(stdout);
 }
 
-/* Touch all the nodes of a tree returning a check sum. This is useful
- * in order to make Valgrind detect if there is something wrong while
- * reading the data structure.
+/* 遍历访问树中的所有节点并返回一个校验和。这对于让 Valgrind 在读取数据
+ * 结构时检测是否存在错误非常有用。
  *
- * This function was used in order to identify Rax bugs after a big refactoring
- * using this technique:
+ * 该函数曾经在一次较大的重构之后被用来定位 Rax 中的 bug，所采用的方法如下：
  *
- * 1. The rax-test is executed using Valgrind, adding a printf() so that for
- *    the fuzz tester we see what iteration in the loop we are in.
- * 2. After every modification of the radix tree made by the fuzz tester
- *    in rax-test.c, we add a call to raxTouch().
- * 3. Now as soon as an operation will corrupt the tree, raxTouch() will
- *    detect it (via Valgrind) immediately. We can add more calls to narrow
- *    the state.
- * 4. At this point a good idea is to enable Rax debugging messages immediately
- *    before the moment the tree is corrupted, to see what happens.
+ * 1. 在 Valgrind 下运行 rax-test，并增加一个 printf()，以便我们能从模糊
+ *    测试器中看到当前正处于循环的哪一次迭代。
+ * 2. 在 rax-test.c 中由模糊测试器修改基数树之后，每处都调用一次 raxTouch()。
+ * 3. 这样一旦某个操作破坏了树，raxTouch() 会立刻（通过 Valgrind）检测到。
+ *    我们可以添加更多调用来缩小出错时的状态范围。
+ * 4. 此时一个比较好的做法是在树被破坏的那一刻之前立即启用 Rax 的调试消息，
+ *    以观察究竟发生了什么。
  */
 unsigned long raxTouch(raxNode *n) {
     debugf("Touching %p\n", (void*)n);

@@ -12,12 +12,11 @@
 
 #include <stdint.h>
 
-/* Representation of a radix tree as implemented in this file, that contains
- * the strings "foo", "foobar" and "footer" after the insertion of each
- * word. When the node represents a key inside the radix tree, we write it
- * between [], otherwise it is written between ().
+/* 如下是本文件所实现的基数树（radix tree）表示，在依次插入字符串 "foo"、
+ * "foobar" 和 "footer" 之后形成的结构。当节点表示基数树中的某个 key 时，
+ * 我们用 [] 将其括起来，否则用 () 括起来。
  *
- * This is the vanilla representation:
+ * 这是原始（未压缩）的表示形式：
  *
  *              (f) ""
  *                \
@@ -33,12 +32,9 @@
  *              /             \
  *    "footer" []             [] "foobar"
  *
- * However, this implementation implements a very common optimization where
- * successive nodes having a single child are "compressed" into the node
- * itself as a string of characters, each representing a next-level child,
- * and only the link to the node representing the last character node is
- * provided inside the representation. So the above representation is turned
- * into:
+ * 然而，本实现采用了一种非常常见的优化：连续的、只有一个子节点的节点会被
+ * "压缩" 到节点本身中，作为一个字符串，每个字符代表下一级子节点，而只提供
+ * 指向表示最后一个字符的节点的链接。因此上面的表示会被转换成：
  *
  *                  ["foo"] ""
  *                     |
@@ -48,11 +44,9 @@
  *                 /          \
  *       "footer" []          [] "foobar"
  *
- * However this optimization makes the implementation a bit more complex.
- * For instance if a key "first" is added in the above radix tree, a
- * "node splitting" operation is needed, since the "foo" prefix is no longer
- * composed of nodes having a single child one after the other. This is the
- * above tree and the resulting node splitting after this event happens:
+ * 不过这种优化也让实现变得稍微复杂一些。例如在上面的基数树中再加入 key
+ * "first" 时，就需要执行 "节点分裂"（node splitting）操作，因为 "foo" 前缀
+ * 不再是由一个个单子节点连续组成的。下面是该事件发生后产生的节点分裂结果：
  *
  *
  *                    (f) ""
@@ -67,105 +61,96 @@
  *                    /          \
  *          "footer" []          [] "foobar"
  *
- * Similarly after deletion, if a new chain of nodes having a single child
- * is created (the chain must also not include nodes that represent keys),
- * it must be compressed back into a single node.
+ * 类似地，在删除之后，如果又产生了一条只有一个子节点的节点链（该链还不能
+ * 包含表示 key 的节点），就必须将其再次压缩回单个节点。
  *
  */
 
+/* 单个 rax 节点允许的最大 size（用于压缩字符串长度） */
 #define RAX_NODE_MAX_SIZE ((1<<29)-1)
+/* rax 树节点结构体 */
 typedef struct raxNode {
-    uint32_t iskey:1;     /* Does this node contain a key? */
-    uint32_t isnull:1;    /* Associated value is NULL (don't store it). */
-    uint32_t iscompr:1;   /* Node is compressed. */
-    uint32_t size:29;     /* Number of children, or compressed string len. */
-    /* Data layout is as follows:
+    uint32_t iskey:1;     /* 该节点是否包含一个 key */
+    uint32_t isnull:1;    /* 关联的 value 是否为 NULL（不存储 value） */
+    uint32_t iscompr:1;   /* 该节点是否为压缩节点 */
+    uint32_t size:29;     /* 子节点数量，或压缩字符串的长度 */
+    /* 数据布局如下：
      *
-     * If node is not compressed we have 'size' bytes, one for each children
-     * character, and 'size' raxNode pointers, point to each child node.
-     * Note how the character is not stored in the children but in the
-     * edge of the parents:
+     * 如果节点未被压缩，则有 'size' 个字节（每个子节点字符一个）以及 'size'
+     * 个 raxNode 指针（每个指向一个子节点）。注意字符并不存储在子节点中，
+     * 而是存储在父节点的边上：
      *
      * [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)
      *
-     * if node is compressed (iscompr bit is 1) the node has 1 children.
-     * In that case the 'size' bytes of the string stored immediately at
-     * the start of the data section, represent a sequence of successive
-     * nodes linked one after the other, for which only the last one in
-     * the sequence is actually represented as a node, and pointed to by
-     * the current compressed node.
+     * 如果节点是压缩的（iscompr 位为 1），则该节点只有一个子节点。在这种情况下，
+     * 数据段起始处的 'size' 个字节表示一串连续链接的节点序列，但序列中只
+     * 有最后一个节点真正被表示为一个节点，并由当前压缩节点指向它。
      *
      * [header iscompr=1][xyz][z-ptr](value-ptr?)
      *
-     * Both compressed and not compressed nodes can represent a key
-     * with associated data in the radix tree at any level (not just terminal
-     * nodes).
+     * 压缩与非压缩节点都可以在基数树的任意层级表示一个带有关联数据的 key
+     *（而不只是终端节点）。
      *
-     * If the node has an associated key (iskey=1) and is not NULL
-     * (isnull=0), then after the raxNode pointers pointing to the
-     * children, an additional value pointer is present (as you can see
-     * in the representation above as "value-ptr" field).
+     * 如果节点关联了一个 key（iskey=1）且 value 不为 NULL（isnull=0），那么
+     * 在指向子节点的 raxNode 指针之后，还会有一个额外的 value 指针（如上面
+     * 表示中所示的 "value-ptr" 字段）。
      */
     unsigned char data[];
 } raxNode;
 
+/* rax 基数树根结构体 */
 typedef struct rax {
-    raxNode *head;
-    uint64_t numele;
-    uint64_t numnodes;
-    void *metadata[];
+    raxNode *head;       /* 头节点（根节点） */
+    uint64_t numele;      /* 树中保存的 key 数量 */
+    uint64_t numnodes;    /* 树中节点总数 */
+    void *metadata[];     /* 用户自定义的元数据 */
 } rax;
 
-/* Stack data structure used by raxLowWalk() in order to, optionally, return
- * a list of parent nodes to the caller. The nodes do not have a "parent"
- * field for space concerns, so we use the auxiliary stack when needed. */
+/* raxLowWalk() 使用的栈数据结构，用于（可选地）向调用者返回父节点列表。
+ * 为了节省空间，节点中并不保存 "parent" 字段，因此需要时使用这个辅助栈。 */
 #define RAX_STACK_STATIC_ITEMS 32
+/* rax 栈结构体 */
 typedef struct raxStack {
-    void **stack; /* Points to static_items or an heap allocated array. */
-    size_t items, maxitems; /* Number of items contained and total space. */
-    /* Up to RAXSTACK_STACK_ITEMS items we avoid to allocate on the heap
-     * and use this static array of pointers instead. */
+    void **stack; /* 指向 static_items 或堆上分配的数组 */
+    size_t items, maxitems; /* 已包含的元素数量与总容量 */
+    /* 最多 RAXSTACK_STACK_ITEMS 个元素时避免在堆上分配，改用这个静态指针数组 */
     void *static_items[RAX_STACK_STATIC_ITEMS];
-    int oom; /* True if pushing into this stack failed for OOM at some point. */
+    int oom; /* 在某次入栈时是否曾因 OOM（内存不足）而失败 */
 } raxStack;
 
-/* Optional callback used for iterators and be notified on each rax node,
- * including nodes not representing keys. If the callback returns true
- * the callback changed the node pointer in the iterator structure, and the
- * iterator implementation will have to replace the pointer in the radix tree
- * internals. This allows the callback to reallocate the node to perform
- * very special operations, normally not needed by normal applications.
+/* 迭代器使用的可选回调函数，用于在每个 rax 节点（包括不表示 key 的节点）
+ * 上得到通知。如果回调返回 true，表示回调已经修改了迭代器结构中的节点指针，
+ * 迭代器的实现需要在基数树内部替换该指针。这允许回调重新分配节点，以执行
+ * 普通应用通常不需要的非常特殊的操作。
  *
- * This callback is used to perform very low level analysis of the radix tree
- * structure, scanning each possible node (but the root node), or in order to
- * reallocate the nodes to reduce the allocation fragmentation (this is the
- * Redis application for this callback).
+ * 该回调用于对基数树结构进行非常底层的分析，扫描每一个可能的节点（根节点除外），
+ * 或者重新分配节点以减少内存分配的碎片化（这是 Redis 中该回调的应用场景）。
  *
- * This is currently only supported in forward iterations (raxNext) */
+ * 该回调目前仅在正向迭代（raxNext）中支持。 */
 typedef int (*raxNodeCallback)(raxNode **noderef);
 
-/* Radix tree iterator state is encapsulated into this data structure. */
+/* 基数树迭代器的状态被封装在该数据结构中 */
 #define RAX_ITER_STATIC_LEN 128
-#define RAX_ITER_JUST_SEEKED (1<<0) /* Iterator was just seeked. Return current
-                                       element for the first iteration and
-                                       clear the flag. */
-#define RAX_ITER_EOF (1<<1)    /* End of iteration reached. */
-#define RAX_ITER_SAFE (1<<2)   /* Safe iterator, allows operations while
-                                  iterating. But it is slower. */
+#define RAX_ITER_JUST_SEEKED (1<<0) /* 迭代器刚刚被 seek 过。第一次迭代返回当前
+                                       元素，然后清除该标志 */
+#define RAX_ITER_EOF (1<<1)    /* 已到达迭代末尾 */
+#define RAX_ITER_SAFE (1<<2)   /* 安全迭代器，允许在迭代过程中进行修改操作，
+                                  但速度较慢 */
+/* rax 迭代器结构体 */
 typedef struct raxIterator {
-    int flags;
-    rax *rt;                /* Radix tree we are iterating. */
-    unsigned char *key;     /* The current string. */
-    void *data;             /* Data associated to this key. */
-    size_t key_len;         /* Current key length. */
-    size_t key_max;         /* Max key len the current key buffer can hold. */
-    unsigned char key_static_string[RAX_ITER_STATIC_LEN];
-    raxNode *node;          /* Current node. Only for unsafe iteration. */
-    raxStack stack;         /* Stack used for unsafe iteration. */
-    raxNodeCallback node_cb; /* Optional node callback. Normally set to NULL. */
+    int flags;               /* 迭代器标志位 */
+    rax *rt;                 /* 正在迭代的基数树 */
+    unsigned char *key;      /* 当前 key 字符串 */
+    void *data;              /* 与当前 key 关联的数据 */
+    size_t key_len;          /* 当前 key 的长度 */
+    size_t key_max;          /* 当前 key 缓冲区可容纳的最大长度 */
+    unsigned char key_static_string[RAX_ITER_STATIC_LEN]; /* 静态 key 缓冲区 */
+    raxNode *node;           /* 当前节点，仅用于非安全迭代 */
+    raxStack stack;          /* 非安全迭代时使用的栈 */
+    raxNodeCallback node_cb; /* 可选的节点回调函数，通常为 NULL */
 } raxIterator;
 
-/* Exported API. */
+/* 导出的 API 接口 */
 rax *raxNew(void);
 rax *raxNewWithMetadata(int metaSize);
 int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
@@ -190,8 +175,7 @@ uint64_t raxSize(rax *rax);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
 
-/* Internal API. May be used by the node callback in order to access rax nodes
- * in a low level way, so this function is exported as well. */
+/* 内部 API：节点回调可能需要以底层方式访问 rax 节点，因此该函数也被导出。 */
 void raxSetData(raxNode *n, void *data);
 
 #endif
