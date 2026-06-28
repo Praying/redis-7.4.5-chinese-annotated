@@ -43,40 +43,55 @@
 
 #include <stdint.h>
 
+/* N = 16：线性同余生成器的状态位数（48 位） */
 #define N	16
+/* MASK = 0xFFFF：低 16 位的掩码 */
 #define MASK	((1 << (N - 1)) + (1 << (N - 1)) - 1)
+/* 取 x 的低 16 位 */
 #define LOW(x)	((unsigned)(x) & MASK)
+/* 取 x 右移 N 位后的低 16 位 */
 #define HIGH(x)	LOW((x) >> N)
+/* MUL：计算 x * y，将结果拆分为高低 16 位存入 z */
 #define MUL(x, y, z)	{ int32_t l = (long)(x) * (long)(y); \
 		(z)[0] = LOW(l); (z)[1] = HIGH(l); }
+/* CARRY：检测两个 16 位数相加是否产生进位 */
 #define CARRY(x, y)	((int32_t)(x) + (long)(y) > MASK)
+/* ADDEQU：将 y 加到 x，更新进位标志 z，返回低 16 位结果 */
 #define ADDEQU(x, y, z)	(z = CARRY(x, (y)), x = LOW(x + (y)))
-#define X0	0x330E
-#define X1	0xABCD
-#define X2	0x1234
-#define A0	0xE66D
-#define A1	0xDEEC
-#define A2	0x5
-#define C	0xB
+#define X0	0x330E   /* 初始状态分量 0 */
+#define X1	0xABCD   /* 初始状态分量 1 */
+#define X2	0x1234   /* 初始状态分量 2 */
+#define A0	0xE66D   /* 初始乘子分量 0 */
+#define A1	0xDEEC   /* 初始乘子分量 1 */
+#define A2	0x5      /* 初始乘子分量 2 */
+#define C	0xB      /* 初始加法常数 */
 #define SET3(x, x0, x1, x2)	((x)[0] = (x0), (x)[1] = (x1), (x)[2] = (x2))
 #define SETLOW(x, y, n) SET3(x, LOW((y)[n]), LOW((y)[(n)+1]), LOW((y)[(n)+2]))
 #define SEED(x0, x1, x2) (SET3(x, x0, x1, x2), SET3(a, A0, A1, A2), c = C)
 #define REST(v)	for (i = 0; i < 3; i++) { xsubi[i] = x[i]; x[i] = temp[i]; } \
 		return (v);
+/* 符号位：2*N-1 = 31 位处的进位标志 */
 #define HI_BIT	(1L << (2 * N - 1))
 
+/* 内部状态：x[3] 为 48 位线性同余状态，a[3] 为乘子，c 为加法常数 */
 static uint32_t x[3] = { X0, X1, X2 }, a[3] = { A0, A1, A2 }, c = C;
 static void next(void);
 
+/* redisLrand48 - 返回一个 31 位的伪随机整数（正数）
+ * 等价于标准 drand48() 的返回值 */
 int32_t redisLrand48(void) {
     next();
     return (((int32_t)x[2] << (N - 1)) + (x[1] >> 1));
 }
 
+/* redisSrand48 - 使用种子值初始化随机数生成器 */
 void redisSrand48(int32_t seedval) {
     SEED(X0, LOW(seedval), HIGH(seedval));
 }
 
+/* next - 线性同余生成器（LCG）的核心迭代函数
+ * 使用递推公式：X_n+1 = (a * X_n + c) mod m
+ * 其中 m = 2^48，a 和 c 为常数 */
 static void next(void) {
     uint32_t p[2], q[2], r[2], carry0, carry1;
 
@@ -86,6 +101,7 @@ static void next(void) {
     MUL(a[0], x[1], q);
     ADDEQU(p[1], q[0], carry0);
     MUL(a[1], x[0], r);
+    /* 组合多个乘积项得到新的状态 */
     x[2] = LOW(carry0 + carry1 + CARRY(p[1], r[0]) + q[1] + r[1] +
             a[0] * x[2] + a[1] * x[1] + a[2] * x[0]);
     x[1] = LOW(p[1] + r[0]);

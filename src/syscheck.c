@@ -40,8 +40,15 @@ static sds read_sysfs_line(char *path) {
     return res;
 }
 
-/* Verify our clocksource implementation doesn't go through a system call (uses vdso).
- * Going through a system call to check the time degrades Redis performance. */
+/* 检查系统时钟源是否使用 VDSO（虚拟动态共享对象）
+ *
+ * 验证时钟源实现是否通过系统调用来获取时间。
+ * 如果通过系统调用获取时间，会降低 Redis 性能。
+ * 使用 VDSO 可以避免系统调用开销。
+ *
+ * @param error_msg 输出参数，存储错误信息
+ * @return 检查通过返回 1，失败返回 -1，无法执行返回 0
+ */
 static int checkClocksource(sds *error_msg) {
     unsigned long test_time_us, system_hz;
     struct timespec ts;
@@ -94,9 +101,15 @@ static int checkClocksource(sds *error_msg) {
     }
 }
 
-/* Verify we're not using the `xen` clocksource. The xen hypervisor's default clocksource is slow and affects
- * Redis's performance. This has been measured on ec2 xen based instances. ec2 recommends using the non-default
- * tsc clock source for these instances. */
+/* 检查是否使用 Xen 时钟源
+ *
+ * Xen 虚拟机的默认时钟源较慢，会影响 Redis 性能。
+ * 这在 ec2 Xen 实例上已经过验证。
+ * ec2 推荐在这些实例上使用非默认的 tsc 时钟源。
+ *
+ * @param error_msg 输出参数，存储错误信息
+ * @return 检查通过返回 1，失败返回 -1，无法执行返回 0
+ */
 int checkXenClocksource(sds *error_msg) {
     sds curr = read_sysfs_line("/sys/devices/system/clocksource/clocksource0/current_clocksource");
     int res = 1;
@@ -113,10 +126,16 @@ int checkXenClocksource(sds *error_msg) {
     return res;
 }
 
-/* Verify overcommit is enabled.
- * When overcommit memory is disabled Linux will kill the forked child of a background save
- * if we don't have enough free memory to satisfy double the current memory usage even though
- * the forked child uses copy-on-write to reduce its actual memory usage. */
+/* 检查内存超额分配（overcommit）设置
+ *
+ * 验证是否启用了内存超额分配。
+ * 当 overcommit 被禁用时，如果可用内存不足以满足当前内存使用量的两倍，
+ * Linux 会终止后台保存或复制的 fork 子进程。
+ * 即使 fork 子进程使用写时复制（copy-on-write）来减少实际内存使用。
+ *
+ * @param error_msg 输出参数，存储错误信息
+ * @return 检查通过返回 1，失败返回 -1，无法执行返回 0
+ */
 int checkOvercommit(sds *error_msg) {
     FILE *fp = fopen("/proc/sys/vm/overcommit_memory","r");
     char buf[64];
@@ -142,8 +161,15 @@ int checkOvercommit(sds *error_msg) {
     }
 }
 
-/* Make sure transparent huge pages aren't always enabled. When they are this can cause copy-on-write logic
- * to consume much more memory and reduce performance during forks. */
+/* 检查透明大页（Transparent Huge Pages）设置
+ *
+ * 确保透明大页不是始终启用状态。
+ * 当透明大页始终启用时，会导致写时复制逻辑消耗更多内存，
+ * 并在 fork 期间降低性能。
+ *
+ * @param error_msg 输出参数，存储错误信息
+ * @return 检查通过返回 1，失败返回 -1，无法执行返回 0
+ */
 int checkTHPEnabled(sds *error_msg) {
     char buf[1024];
 
@@ -199,11 +225,15 @@ static int smapsGetSharedDirty(unsigned long addr) {
     return val;
 }
 
-/* Older arm64 Linux kernels have a bug that could lead to data corruption
- * during background save in certain scenarios. This function checks if the
- * kernel is affected.
- * The bug was fixed in commit ff1712f953e27f0b0718762ec17d0adb15c9fd0b
- * titled: "arm64: pgtable: Ensure dirty bit is preserved across pte_wrprotect()"
+/* 检查 ARM64 Linux 内核的 madvise(MADV_FREE) fork bug
+ *
+ * 较旧的 ARM64 Linux 内核存在一个 bug，可能在某些情况下
+ * 导致后台保存期间的数据损坏。此函数检查内核是否受影响。
+ * 该 bug 在 commit ff1712f953e27f0b0718762ec17d0adb15c9fd0b 中修复，
+ * 标题为: "arm64: pgtable: Ensure dirty bit is preserved across pte_wrprotect()"
+ *
+ * @param error_msg 输出参数，存储错误信息
+ * @return 检查通过返回 1，失败返回 -1，无法执行返回 0
  */
 int checkLinuxMadvFreeForkBug(sds *error_msg) {
     int ret, pipefd[2] = { -1, -1 };
@@ -328,7 +358,17 @@ check checks[] = {
     {.name = NULL, .check_fn = NULL}
 };
 
-/* Performs various system checks, returns 0 if any check fails, 1 otherwise. */
+/* 执行各种系统检查
+ *
+ * 运行所有配置的系统检查，包括：
+ * - 时钟源检查 (slow-clocksource)
+ * - Xen 时钟源检查 (xen-clocksource)
+ * - 内存超额分配检查 (overcommit)
+ * - 透明大页检查 (THP)
+ * - ARM64 madvise-free fork bug 检查
+ *
+ * @return 所有检查通过返回 1，任何检查失败返回 0
+ */
 int syscheck(void) {
     check *cur_check = checks;
     int ret = 1;

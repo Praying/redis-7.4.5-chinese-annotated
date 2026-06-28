@@ -76,9 +76,22 @@ void memtest_progress_step(size_t curr, size_t size, char c) {
     fflush(stdout);
 }
 
-/* Test that addressing is fine. Every location is populated with its own
- * address, and finally verified. This test is very fast but may detect
- * ASAP big issues with the memory subsystem. */
+/* memtest_addressing - 地址寻址测试
+ *
+ * 测试内存寻址是否正确.
+ * 每个内存位置写入其自身的地址值,然后验证.
+ *
+ * 此测试非常快速,但能尽早检测出内存子系统的重大问题.
+ *
+ * 参数:
+ *   l         - 内存缓冲区指针
+ *   bytes     - 测试字节数
+ *   interactive - 是否交互式显示进度
+ *
+ * 返回:
+ *   0  无错误
+ *   1  发现内存错误
+ */
 int memtest_addressing(unsigned long *l, size_t bytes, int interactive) {
     unsigned long words = bytes/sizeof(unsigned long);
     unsigned long j, *p;
@@ -109,14 +122,17 @@ int memtest_addressing(unsigned long *l, size_t bytes, int interactive) {
     return 0;
 }
 
-/* Fill words stepping a single page at every write, so we continue to
- * touch all the pages in the smallest amount of time reducing the
- * effectiveness of caches, and making it hard for the OS to transfer
- * pages on the swap.
+/* memtest_fill_random - 随机填充测试
  *
- * In this test we can't call rand() since the system may be completely
- * unable to handle library calls, so we have to resort to our own
- * PRNG that only uses local state. We use an xorshift* PRNG. */
+ * 以页为单位跳跃写入,确保在最短时间内遍历所有内存页.
+ * 这种模式减少了缓存的影响,使操作系统难以将页面换出到 swap.
+ *
+ * 注意: 此测试不能调用 rand(),因为系统可能无法处理库调用.
+ * 因此使用自己的 PRNG(伪随机数生成器),这里采用 xorshift* 算法.
+ *
+ * xorshift64* 是一个高性能的 64 位伪随机数生成器,
+ * 具有良好的统计性能和很长的周期.
+ */
 #define xorshift64star_next() do { \
         rseed ^= rseed >> 12; \
         rseed ^= rseed << 25; \
@@ -147,8 +163,20 @@ void memtest_fill_random(unsigned long *l, size_t bytes, int interactive) {
     }
 }
 
-/* Like memtest_fill_random() but uses the two specified values to fill
- * memory, in an alternated way (v1|v2|v1|v2|...) */
+/* memtest_fill_value - 双值交替填充测试
+ *
+ * 类似 memtest_fill_random(), 但使用两个指定的值交替填充内存.
+ * 填充模式: v1|v2|v1|v2|...
+ *
+ * 这种模式可以检测位翻转(bit flip)和相邻位之间的干扰.
+ *
+ * 参数:
+ *   l         - 内存缓冲区指针
+ *   bytes    - 测试字节数
+ *   v1, v2   - 两个交替使用的填充值
+ *   sym      - 进度显示符号
+ *   interactive - 是否交互式显示进度
+ */
 void memtest_fill_value(unsigned long *l, size_t bytes, unsigned long v1,
                         unsigned long v2, char sym, int interactive)
 {
@@ -218,11 +246,27 @@ int memtest_compare_times(unsigned long *m, size_t bytes, int pass, int times,
     return errors;
 }
 
-/* Test the specified memory. The number of bytes must be multiple of 4096.
- * If interactive is true the program exists with an error and prints
- * ASCII arts to show progresses. Instead when interactive is 0, it can
- * be used as an API call, and returns 1 if memory errors were found or
- * 0 if there were no errors detected. */
+/* memtest_test - 综合内存测试
+ *
+ * 对指定内存区域进行全面的内存测试.
+ * 字节数必须是 4096 的倍数.
+ *
+ * 测试流程(每轮 pass):
+ *   1. 地址寻址测试 (memtest_addressing)
+ *   2. 随机填充测试 (memtest_fill_random) + 4次比较
+ *   3. 全1填充测试 (memtest_fill_value with 0 and -1) + 4次比较
+ *   4. 棋盘格填充测试 (memtest_fill_value with ULONG_ONEZERO and ULONG_ZEROONE) + 4次比较
+ *
+ * 参数:
+ *   m         - 内存缓冲区指针
+ *   bytes     - 测试字节数(必须为 4096 的倍数)
+ *   passes    - 测试轮数
+ *   interactive - true: 交互式显示进度; false: API调用模式
+ *
+ * 返回:
+ *   0  无错误
+ *   1  发现内存错误
+ */
 int memtest_test(unsigned long *m, size_t bytes, int passes, int interactive) {
     int pass = 0;
     int errors = 0;
@@ -252,19 +296,24 @@ int memtest_test(unsigned long *m, size_t bytes, int passes, int interactive) {
     return errors;
 }
 
-/* A version of memtest_test() that tests memory in small pieces
- * in order to restore the memory content at exit.
+/* memtest_preserving_test - 保留内存内容的测试版本
  *
- * One problem we have with this approach, is that the cache can avoid
- * real memory accesses, and we can't test big chunks of memory at the
- * same time, because we need to backup them on the stack (the allocator
- * may not be usable or we may be already in an out of memory condition).
- * So what we do is to try to trash the cache with useless memory accesses
- * between the fill and compare cycles. */
+ * 此函数分小块测试内存,以便在退出时恢复内存内容.
+ *
+ * 问题:
+ *   1. CPU 缓存可能导致测试不能真正访问内存
+ *   2. 无法同时测试大块内存,因为需要将数据备份到栈上
+ *      (分配器可能不可用或已处于内存不足状态)
+ *
+ * 解决方案:
+ *   在填充和比较周期之间,通过无用的内存访问"刷掉"缓存,
+ *   强制真正的内存访问.
+ *
+ * 测试以 1024*1024/sizeof(long) 个 unsigned long 为单位进行备份.
+ */
 #define MEMTEST_BACKUP_WORDS (1024*(1024/sizeof(long)))
-/* Random accesses of MEMTEST_DECACHE_SIZE are performed at the start and
- * end of the region between fill and compare cycles in order to trash
- * the cache. */
+/* 在填充和比较周期开始和结束时,访问 MEMTEST_DECACHE_SIZE 大小的内存
+ * 区域,以刷掉 CPU 缓存,确保测试真正访问主内存而非缓存. */
 #define MEMTEST_DECACHE_SIZE (1024*8)
 
 NO_SANITIZE("undefined")
@@ -337,6 +386,19 @@ void memtest_alloc_and_test(size_t megabytes, int passes) {
     free(m);
 }
 
+/* memtest - 交互式内存测试入口函数
+ *
+ * 分配指定大小的内存并进行全面测试.
+ * 这是一个交互式程序,会显示进度并打印 ASCII 艺术.
+ *
+ * 测试完成后会显示推荐工具:
+ *   - memtest86: http://www.memtest86.com/
+ *   - memtester: http://pyropus.ca/software/memtester/
+ *
+ * 参数:
+ *   megabytes - 要测试的内存大小(兆字节)
+ *   passes    - 每轮测试的次数
+ */
 void memtest(size_t megabytes, int passes) {
 #if !defined(__HAIKU__)
     if (ioctl(1, TIOCGWINSZ, &ws) == -1) {

@@ -1,8 +1,9 @@
-/* redisassert.c -- Implement the default _serverAssert and _serverPanic which 
- * simply print stack trace to standard error stream.
- * 
- * This file is shared by those modules that try to print some logs about stack trace 
- * but don't have their own implementations of functions in redisassert.h.
+/* redisassert.c -- Redis 断言和 panic 处理默认实现
+ *
+ * 本文件实现了默认的 _serverAssert 和 _serverPanic 函数，
+ * 用于在断言失败或 panic 时向标准错误流打印堆栈跟踪信息。
+ *
+ * 被那些需要打印堆栈信息但自己没有实现 redisassert.h 中函数的模块共享使用。
  *
  * ----------------------------------------------------------------------------
  *
@@ -39,12 +40,19 @@
 #include <stdlib.h>
 #include <signal.h>
 
+/* _serverAssert - 断言失败处理函数
+ * estr: 断言表达式字符串
+ * file: 断言失败所在的源文件
+ * line: 断言失败所在的行号
+ * 发送 SIGSEGV 信号以生成核心转储（core dump） */
 void _serverAssert(const char *estr, const char *file, int line) {
     fprintf(stderr, "=== ASSERTION FAILED ===");
     fprintf(stderr, "==> %s:%d '%s' is not true",file,line,estr);
     raise(SIGSEGV);
 }
 
+/* _serverPanic - 严重错误（panic）处理函数
+ * 打印错误信息后调用 abort() 终止程序 */
 void _serverPanic(const char *file, int line, const char *msg, ...) {
     fprintf(stderr, "------------------------------------------------");
     fprintf(stderr, "!!! Software Failure. Press left mouse button to continue");

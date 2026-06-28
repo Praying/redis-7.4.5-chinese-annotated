@@ -1,7 +1,11 @@
 /* ==========================================================================
- * setcpuaffinity.c - Linux/BSD setcpuaffinity.
+ * setcpuaffinity.c - CPU 亲和性设置工具
  * --------------------------------------------------------------------------
- * Copyright (C) 2020  zhenwei pi
+ * 功能: 设置进程/线程运行的 CPU 核心,实现 CPU 绑定的功能
+ * 支持: Linux、FreeBSD、DragonFly、NetBSD
+ *
+ * 版权:
+ *   Copyright (C) 2020  zhenwei pi
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
@@ -67,9 +71,21 @@ static int next_num(const char *str, char **end, int *result) {
     return 0;
 }
 
-/* set current thread cpu affinity to cpu list, this function works like
- * taskset command (actually cpulist parsing logic reference to util-linux).
- * example of this function: "0,2,3", "0,2-3", "0-20:2". */
+/* setcpuaffinity - 设置当前线程的 CPU 亲和性
+ *
+ * 将当前线程绑定到指定的 CPU 核心集合.
+ * 功能类似于 Linux 的 taskset 命令.
+ *
+ * cpulist 格式说明:
+ *   "0,2,3"   - 逗号分隔: 使用 CPU 0, 2, 3
+ *   "0,2-3"   - 连字符范围: 使用 CPU 0, 2, 3
+ *   "0-20:2"  - 冒号步进: 使用 CPU 0, 2, 4, 6, ... 20
+ *
+ * 解析逻辑参考 util-linux 的 taskset 命令实现.
+ *
+ * 参数:
+ *   cpulist - CPU 列表字符串,如 "0,2,3" 或 "0-3"
+ */
 void setcpuaffinity(const char *cpulist) {
     const char *p, *q;
     char *end = NULL;

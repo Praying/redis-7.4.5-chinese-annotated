@@ -43,6 +43,9 @@
 # define SET_ERRNO(n) errno = (n)
 #endif
 
+/* USE_REP_MOVSB: 是否使用 x86 的 rep movsb 指令优化字节复制
+ * 在 AMD 处理器上有小幅度提升, 但在 Intel 处理器上可能有负面影响 */
+
 #if USE_REP_MOVSB /* small win on amd, big loss on intel */
 #if (__i386 || __amd64) && __GNUC__ >= 3
 # define lzf_movsb(dst, src, len)                \
@@ -56,6 +59,24 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #endif
+
+/* LZF 解压缩算法核心函数
+ *
+ * 参数:
+ *   in_data  - 压缩数据缓冲区
+ *   in_len   - 压缩数据长度
+ *   out_data - 输出缓冲区(解压缩后)
+ *   out_len  - 输出缓冲区长度
+ *
+ * 返回值:
+ *   成功返回解压缩后数据长度, 失败返回0
+ *
+ * 算法概述:
+ *   1. 读取控制字节(ctrl)判断是字面量还是回引
+ *   2. 字面量: 直接复制后续字节
+ *   3. 回引: 根据偏移量和长度从已解压数据中复制
+ *   4. 重复直到处理完所有压缩数据
+ */
 size_t
 lzf_decompress (const void *const in_data,  size_t in_len,
                 void             *out_data, size_t out_len)
@@ -68,12 +89,14 @@ lzf_decompress (const void *const in_data,  size_t in_len,
   while (ip < in_end)
     {
       unsigned int ctrl;
-      ctrl = *ip++;
+      ctrl = *ip++; /* 读取控制字节 */
 
+      /* 高5位为0表示字面量编码: 000LLLLL <L+1> */
       if (ctrl < (1 << 5)) /* literal run */
         {
-          ctrl++;
+          ctrl++; /* 实际长度为 ctrl+1, 范围 1~32 */
 
+          /* 检查输出缓冲区是否有足够空间 */
           if (op + ctrl > out_end)
             {
               SET_ERRNO (E2BIG);
@@ -81,6 +104,7 @@ lzf_decompress (const void *const in_data,  size_t in_len,
             }
 
 #if CHECK_INPUT
+          /* 检查输入数据是否有足够字节 */
           if (ip + ctrl > in_end)
             {
               SET_ERRNO (EINVAL);
@@ -89,8 +113,10 @@ lzf_decompress (const void *const in_data,  size_t in_len,
 #endif
 
 #ifdef lzf_movsb
+          /* 使用优化的 rep movsb 指令复制 */
           lzf_movsb (op, ip, ctrl);
 #else
+          /* 使用 switch 展开循环, 避免循环开销 */
           switch (ctrl)
             {
               case 32: *op++ = *ip++; case 31: *op++ = *ip++; case 30: *op++ = *ip++; case 29: *op++ = *ip++;
@@ -104,10 +130,12 @@ lzf_decompress (const void *const in_data,  size_t in_len,
             }
 #endif
         }
-      else /* back reference */
+      else /* 回引编码: 根据长度判断短格式或长格式 */
         {
+          /* 从控制字节高5位提取长度基数 */
           unsigned int len = ctrl >> 5;
 
+          /* 计算回引目标位置: ref = op - (ctrl低5位 << 8) - 1 - ip低8位 */
           u8 *ref = op - ((ctrl & 0x1f) << 8) - 1;
 
 #if CHECK_INPUT
@@ -117,6 +145,7 @@ lzf_decompress (const void *const in_data,  size_t in_len,
               return 0;
             }
 #endif
+          /* 长格式回引: 需要额外读取一字节扩展长度 */
           if (len == 7)
             {
               len += *ip++;
@@ -129,14 +158,17 @@ lzf_decompress (const void *const in_data,  size_t in_len,
 #endif
             }
 
+          /* 读取偏移量低8位并计算完整回引目标 */
           ref -= *ip++;
 
+          /* 检查输出缓冲区空间: len + 2字节(基础长度) */
           if (op + len + 2 > out_end)
             {
               SET_ERRNO (E2BIG);
               return 0;
             }
 
+          /* 检查回引目标是否在有效范围内 */
           if (ref < (u8 *)out_data)
             {
               SET_ERRNO (EINVAL);
@@ -150,8 +182,9 @@ lzf_decompress (const void *const in_data,  size_t in_len,
           switch (len)
             {
               default:
-                len += 2;
+                len += 2; /* 基础长度2字节加上提取的长度值 */
 
+                /* 非重叠区域: 使用 memcpy 高效复制 */
                 if (op >= ref + len)
                   {
                     /* disjunct areas */
@@ -160,6 +193,7 @@ lzf_decompress (const void *const in_data,  size_t in_len,
                   }
                 else
                   {
+                    /* 重叠区域: 必须逐字节复制以避免数据损坏 */
                     /* overlapping, use octte by octte copying */
                     do
                       *op++ = *ref++;
@@ -168,6 +202,7 @@ lzf_decompress (const void *const in_data,  size_t in_len,
 
                 break;
 
+              /* 小长度值使用展开的 case 语句避免循环开销 */
               case 9: *op++ = *ref++; /* fall-thru */
               case 8: *op++ = *ref++; /* fall-thru */
               case 7: *op++ = *ref++; /* fall-thru */
@@ -184,7 +219,7 @@ lzf_decompress (const void *const in_data,  size_t in_len,
         }
     }
 
-  return op - (u8 *)out_data;
+  return op - (u8 *)out_data; /* 返回解压缩后数据长度 */
 }
 #if defined(__GNUC__) && __GNUC__ >= 5
 #pragma GCC diagnostic pop

@@ -1,5 +1,11 @@
-/* CLI (command line interface) common methods
- * 
+/* CLI（命令行接口）公共函数
+ *
+ * 本文件包含 Redis CLI 工具的通用功能函数，包括：
+ * - TLS/SSL 安全连接配置
+ * - URI 连接信息解析
+ * - JSON 字符串转义
+ * - 版本信息获取
+ *
  * Copyright (c) 2020-Present, Redis Ltd.
  * All rights reserved.
  *
@@ -16,8 +22,10 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <hiredis.h>
-#include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
-#include <sds.h> /* use sds.h from hiredis, so that only one set of sds functions will be present in the binary */
+/* 使用 hiredis 的 sds 兼容头文件，将 sds 调用映射到 hi_ 变体 */
+#include <sdscompat.h>
+/* 使用 hiredis 的 sds.h，使二进制文件中只有一组 sds 函数 */
+#include <sds.h>
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
@@ -32,9 +40,9 @@
 char *redisGitSHA1(void);
 char *redisGitDirty(void);
 
-/* Wrapper around redisSecureConnection to avoid hiredis_ssl dependencies if
- * not building with TLS support.
- */
+/* redisSecureConnection 的包装函数
+ *
+ * 在未启用 TLS 支持编译时，避免对 hiredis_ssl 的依赖 */
 int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) {
 #ifdef USE_OPENSSL
     static SSL_CTX *ssl_ctx = NULL;
@@ -48,6 +56,7 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
         SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
         SSL_CTX_set_verify(ssl_ctx, config.skip_cert_verify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, NULL);
 
+        /* 加载 CA 证书或使用默认路径 */
         if (config.cacert || config.cacertdir) {
             if (!SSL_CTX_load_verify_locations(ssl_ctx, config.cacert, config.cacertdir)) {
                 *err = "Invalid CA Certificate File/Directory";
@@ -60,20 +69,24 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
             }
         }
 
+        /* 加载客户端证书 */
         if (config.cert && !SSL_CTX_use_certificate_chain_file(ssl_ctx, config.cert)) {
             *err = "Invalid client certificate";
             goto error;
         }
 
+        /* 加载客户端私钥 */
         if (config.key && !SSL_CTX_use_PrivateKey_file(ssl_ctx, config.key, SSL_FILETYPE_PEM)) {
             *err = "Invalid private key";
             goto error;
         }
+        /* 设置加密套件 */
         if (config.ciphers && !SSL_CTX_set_cipher_list(ssl_ctx, config.ciphers)) {
             *err = "Error while configuring ciphers";
             goto error;
         }
 #ifdef TLS1_3_VERSION
+        /* 设置 TLS 1.3 加密套件 */
         if (config.ciphersuites && !SSL_CTX_set_ciphersuites(ssl_ctx, config.ciphersuites)) {
             *err = "Error while setting cypher suites";
             goto error;
@@ -87,6 +100,7 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
         return REDIS_ERR;
     }
 
+    /* 配置 SNI（Server Name Indication） */
     if (config.sni && !SSL_set_tlsext_host_name(ssl, config.sni)) {
         *err = "Failed to configure SNI";
         SSL_free(ssl);
@@ -107,35 +121,27 @@ error:
 #endif
 }
 
-/* Wrapper around hiredis to allow arbitrary reads and writes.
+/* 基于 hiredis 的包装函数，支持任意读写操作
  *
- * We piggybacks on top of hiredis to achieve transparent TLS support,
- * and use its internal buffers so it can co-exist with commands
- * previously/later issued on the connection.
+ * 我们在 hiredis 之上实现透明 TLS 支持，并使用其内部缓冲区，
+ * 以便与之前/之后在连接上发出的命令共存。
  *
- * Interface is close to enough to read()/write() so things should mostly
- * work transparently.
- */
+ * 接口与 read()/write() 足够接近，大部分操作应该能透明工作。 */
 
-/* Write a raw buffer through a redisContext. If we already have something
- * in the buffer (leftovers from hiredis operations) it will be written
- * as well.
- */
+/* 通过 redisContext 写入原始缓冲区
+ *
+ * 若缓冲区中已有数据（来自 hiredis 操作的残留），也会一并写入 */
 ssize_t cliWriteConn(redisContext *c, const char *buf, size_t buf_len)
 {
     int done = 0;
 
-    /* Append data to buffer which is *usually* expected to be empty
-     * but we don't assume that, and write.
-     */
+    /* 将数据追加到缓冲区（通常应为空，但不假设），然后写入 */
     c->obuf = sdscatlen(c->obuf, buf, buf_len);
     if (redisBufferWrite(c, &done) == REDIS_ERR) {
         if (!(c->flags & REDIS_BLOCK))
             errno = EAGAIN;
 
-        /* On error, we assume nothing was written and we roll back the
-         * buffer to its original state.
-         */
+        /* 发生错误时，假设未写入任何数据，将缓冲区回滚到原始状态 */
         if (sdslen(c->obuf) > buf_len)
             sdsrange(c->obuf, 0, -(buf_len+1));
         else
@@ -144,37 +150,29 @@ ssize_t cliWriteConn(redisContext *c, const char *buf, size_t buf_len)
         return -1;
     }
 
-    /* If we're done, free up everything. We may have written more than
-     * buf_len (if c->obuf was not initially empty) but we don't have to
-     * tell.
-     */
+    /* 若写入完成，释放所有内容。可能已写入超过 buf_len 的数据
+     *（若 c->obuf 最初不为空），但我们不需要报告这一点 */
     if (done) {
         sdsclear(c->obuf);
         return buf_len;
     }
 
-    /* Write was successful but we have some leftovers which we should
-     * remove from the buffer.
+    /* 写入成功但有残留数据需要从缓冲区移除
      *
-     * Do we still have data that was there prior to our buf? If so,
-     * restore buffer to it's original state and report no new data was
-     * written.
-     */
+     * 检查是否仍有在我们的 buf 之前存在的数据？
+     * 若是，恢复缓冲区到原始状态并报告未写入新数据 */
     if (sdslen(c->obuf) > buf_len) {
         sdsrange(c->obuf, 0, -(buf_len+1));
         return 0;
     }
 
-    /* At this point we're sure no prior data is left. We flush the buffer
-     * and report how much we've written.
-     */
+    /* 此时确信没有之前的数据残留。刷新缓冲区并报告写入的数据量 */
     size_t left = sdslen(c->obuf);
     sdsclear(c->obuf);
     return buf_len - left;
 }
 
-/* Wrapper around OpenSSL (libssl and libcrypto) initialisation
- */
+/* OpenSSL（libssl 和 libcrypto）初始化包装函数 */
 int cliSecureInit(void)
 {
 #ifdef USE_OPENSSL
@@ -185,7 +183,7 @@ int cliSecureInit(void)
     return REDIS_OK;
 }
 
-/* Create an sds from stdin */
+/* 从标准输入创建 sds 字符串 */
 sds readArgFromStdin(void) {
     char buf[1024];
     sds arg = sdsempty();
@@ -203,13 +201,12 @@ sds readArgFromStdin(void) {
     return arg;
 }
 
-/* Create an sds array from argv, either as-is or by dequoting every
- * element. When quoted is non-zero, may return a NULL to indicate an
- * invalid quoted string.
+/* 从 argv 创建 sds 数组
  *
- * The caller should free the resulting array of sds strings with
- * sdsfreesplitres().
- */
+ * 可以原样返回，也可以对每个元素进行去引号处理。
+ * 当 quoted 非零时，若遇到无效的引号字符串则返回 NULL。
+ *
+ * 调用者应使用 sdsfreesplitres() 释放返回的 sds 字符串数组。 */
 sds *getSdsArrayFromArgv(int argc,char **argv, int quoted) {
     sds *res = sds_malloc(sizeof(sds) * argc);
 
@@ -230,7 +227,7 @@ sds *getSdsArrayFromArgv(int argc,char **argv, int quoted) {
     return res;
 }
 
-/* Unquote a null-terminated string and return it as a binary-safe sds. */
+/* 对以 null 结尾的字符串进行去引号处理，返回二进制安全的 sds */
 sds unquoteCString(char *str) {
     int count;
     sds *unquoted = sdssplitargs(str, &count);
@@ -248,11 +245,14 @@ sds unquoteCString(char *str) {
 }
 
 
-/* URL-style percent decoding. */
+/* URL 风格的百分号解码（Percent decoding） */
 #define isHexChar(c) (isdigit(c) || ((c) >= 'a' && (c) <= 'f'))
 #define decodeHexChar(c) (isdigit(c) ? (c) - '0' : (c) - 'a' + 10)
 #define decodeHex(h, l) ((decodeHexChar(h) << 4) + decodeHexChar(l))
 
+/* 百分号解码实现
+ *
+ * 将 %XX 格式的编码字符串解码为原始字节 */
 static sds percentDecode(const char *pe, size_t len) {
     const char *end = pe + len;
     sds ret = sdsempty();
@@ -282,9 +282,9 @@ static sds percentDecode(const char *pe, size_t len) {
     return ret;
 }
 
-/* Parse a URI and extract the server connection information.
- * URI scheme is based on the provisional specification[1] excluding support
- * for query parameters. Valid URIs are:
+/* 解析 URI 并提取服务器连接信息
+ *
+ * URI 格式基于临时规范[1]，不支持查询参数。有效 URI 格式：
  *   scheme:    "redis://"
  *   authority: [[<username> ":"] <password> "@"] [<hostname> [":" <port>]]
  *   path:      ["/" [<db>]]
@@ -303,7 +303,7 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     const char *end = uri + strlen(uri);
     const char *userinfo, *username, *port, *host, *path;
 
-    /* URI must start with a valid scheme. */
+    /* URI 必须以有效 scheme 开头 */
     if (!strncasecmp(tlsscheme, curr, strlen(tlsscheme))) {
 #ifdef USE_OPENSSL
         *tls_flag = 1;
@@ -320,7 +320,7 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     }
     if (curr == end) return;
 
-    /* Extract user info. */
+    /* 提取用户信息（username:password） */
     if ((userinfo = strchr(curr,'@'))) {
         if ((username = strchr(curr, ':')) && username < userinfo) {
             connInfo->user = percentDecode(curr, username - curr);
@@ -332,11 +332,12 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     }
     if (curr == end) return;
 
-    /* Extract host and port. */
+    /* 提取主机和端口 */
     path = strchr(curr, '/');
     if (*curr != '/') {
         host = path ? path - 1 : end;
         if (*curr == '[') {
+            /* IPv6 地址格式 [...] */
             curr += 1;
             if ((port = strchr(curr, ']'))) {
                 if (*(port+1) == ':') {
@@ -356,20 +357,21 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     curr = path ? path + 1 : end;
     if (curr == end) return;
 
-    /* Extract database number. */
+    /* 提取数据库编号 */
     connInfo->input_dbnum = atoi(curr);
 }
 
+/* 释放 cliConnInfo 结构体中的动态分配内存 */
 void freeCliConnInfo(cliConnInfo connInfo){
     if (connInfo.hostip) sdsfree(connInfo.hostip);
     if (connInfo.auth) sdsfree(connInfo.auth);
     if (connInfo.user) sdsfree(connInfo.user);
 }
 
-/*
- * Escape a Unicode string for JSON output (--json), following RFC 7159:
- * https://datatracker.ietf.org/doc/html/rfc7159#section-7
-*/
+/* JSON 输出字符串转义
+ *
+ * 按照 RFC 7159 规范对 Unicode 字符串进行转义：
+ * https://datatracker.ietf.org/doc/html/rfc7159#section-7 */
 sds escapeJsonString(sds s, const char *p, size_t len) {
     s = sdscatlen(s,"\"",1);
     while(len--) {
@@ -391,10 +393,13 @@ sds escapeJsonString(sds s, const char *p, size_t len) {
     return sdscatlen(s,"\"",1);
 }
 
+/* 获取 CLI 版本字符串
+ *
+ * 包含 Redis 版本、Git commit SHA1 以及工作区状态（若可用） */
 sds cliVersion(void) {
     sds version = sdscatprintf(sdsempty(), "%s", REDIS_VERSION);
 
-    /* Add git commit and working tree status when available. */
+    /* 当 Git 信息可用时，添加 Git commit 和工作区状态 */
     if (strtoll(redisGitSHA1(),NULL,16)) {
         version = sdscatprintf(version, " (git:%s", redisGitSHA1());
         if (strtoll(redisGitDirty(),NULL,10))
@@ -404,7 +409,9 @@ sds cliVersion(void) {
     return version;
 }
 
-/* This is a wrapper to call redisConnect or redisConnectWithTimeout. */
+/* redisConnect 或 redisConnectWithTimeout 的包装函数
+ *
+ * 若超时时间为零则使用无超时版本 */
 redisContext *redisConnectWrapper(const char *ip, int port, const struct timeval tv) {
     if (tv.tv_sec == 0 && tv.tv_usec == 0) {
         return redisConnect(ip, port);
@@ -413,7 +420,9 @@ redisContext *redisConnectWrapper(const char *ip, int port, const struct timeval
     }
 }
 
-/* This is a wrapper to call redisConnectUnix or redisConnectUnixWithTimeout. */
+/* redisConnectUnix 或 redisConnectUnixWithTimeout 的包装函数
+ *
+ * 若超时时间为零则使用无超时版本 */
 redisContext *redisConnectUnixWrapper(const char *path, const struct timeval tv) {
     if (tv.tv_sec == 0 && tv.tv_usec == 0) {
         return redisConnectUnix(path);

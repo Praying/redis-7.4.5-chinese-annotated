@@ -57,19 +57,18 @@
 #include "mt19937-64.h"
 #include <stdio.h>
 
-#define NN 312
-#define MM 156
-#define MATRIX_A 0xB5026F5AA96619E9ULL
-#define UM 0xFFFFFFFF80000000ULL /* Most significant 33 bits */
-#define LM 0x7FFFFFFFULL /* Least significant 31 bits */
+#define NN 312        /* 状态向量长度（梅森素数 2^312-1） */
+#define MM 156        /* Tempering 参数（NN/2） */
+#define MATRIX_A 0xB5026F5AA96619E9ULL   /* 矩阵 A 的常数 */
+#define UM 0xFFFFFFFF80000000ULL /* 最高 33 位（全 1），用于掩码 */
+#define LM 0x7FFFFFFFULL /* 最低 31 位（全 1），用于掩码 */
 
-
-/* The array for the state vector */
+/* 状态向量数组 */
 static unsigned long long mt[NN];
-/* mti==NN+1 means mt[NN] is not initialized */
+/* mti==NN+1 表示状态尚未初始化 */
 static int mti=NN+1;
 
-/* initializes mt[NN] with a seed */
+/* init_genrand64 - 使用单个种子值初始化状态向量 */
 void init_genrand64(unsigned long long seed)
 {
     mt[0] = seed;
@@ -77,9 +76,9 @@ void init_genrand64(unsigned long long seed)
         mt[mti] =  (6364136223846793005ULL * (mt[mti-1] ^ (mt[mti-1] >> 62)) + mti);
 }
 
-/* initialize by an array with array-length */
-/* init_key is the array for initializing keys */
-/* key_length is its length */
+/* init_by_array64 - 使用字节数组初始化状态向量
+ * init_key: 初始化密钥数组
+ * key_length: 密钥长度 */
 void init_by_array64(unsigned long long init_key[],
                      unsigned long long key_length)
 {
@@ -88,6 +87,7 @@ void init_by_array64(unsigned long long init_key[],
     i=1; j=0;
     k = (NN>key_length ? NN : key_length);
     for (; k; k--) {
+        /* 使用线性同余和密钥混合初始化（非线性） */
         mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 62)) * 3935559000370003845ULL))
           + init_key[j] + j; /* non linear */
         i++; j++;
@@ -95,16 +95,17 @@ void init_by_array64(unsigned long long init_key[],
         if (j>=key_length) j=0;
     }
     for (k=NN-1; k; k--) {
+        /* 进一步的混合（递减以消除初始线性） */
         mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 62)) * 2862933555777941757ULL))
           - i; /* non linear */
         i++;
         if (i>=NN) { mt[0] = mt[NN-1]; i=1; }
     }
 
-    mt[0] = 1ULL << 63; /* MSB is 1; assuring non-zero initial array */
+    mt[0] = 1ULL << 63; /* 确保最高位为 1，避免初始状态为零 */
 }
 
-/* generates a random number on [0, 2^64-1]-interval */
+/* genrand64_int64 - 生成 [0, 2^64-1] 范围内的 64 位无符号随机整数 */
 unsigned long long genrand64_int64(void)
 {
     int i;
@@ -142,25 +143,25 @@ unsigned long long genrand64_int64(void)
     return x;
 }
 
-/* generates a random number on [0, 2^63-1]-interval */
+/* genrand64_int63 - 生成 [0, 2^63-1] 范围内的 63 位有符号随机整数 */
 long long genrand64_int63(void)
 {
     return (long long)(genrand64_int64() >> 1);
 }
 
-/* generates a random number on [0,1]-real-interval */
+/* genrand64_real1 - 生成 [0,1] 范围内的双精度浮点数（闭区间） */
 double genrand64_real1(void)
 {
     return (genrand64_int64() >> 11) * (1.0/9007199254740991.0);
 }
 
-/* generates a random number on [0,1)-real-interval */
+/* genrand64_real2 - 生成 [0,1) 范围内的双精度浮点数（左闭右开） */
 double genrand64_real2(void)
 {
     return (genrand64_int64() >> 11) * (1.0/9007199254740992.0);
 }
 
-/* generates a random number on (0,1)-real-interval */
+/* genrand64_real3 - 生成 (0,1) 范围内的双精度浮点数（开区间） */
 double genrand64_real3(void)
 {
     return ((genrand64_int64() >> 12) + 0.5) * (1.0/4503599627370496.0);

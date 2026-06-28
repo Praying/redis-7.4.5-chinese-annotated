@@ -40,12 +40,11 @@
  */
 
 /*
- *  Keep just enough bytes of bucket-key, taking into consideration configured
- *  EB_BUCKET_KEY_PRECISION, and ignoring LSB bits that has no impact.
+ *  根据配置的 EB_BUCKET_KEY_PRECISION 保留足够的 bucket-key 字节数，
+ *  忽略没有影响的 LSB 位。
  *
- * The main motivation is that since the bucket-key size determines the maximum
- * depth of the rax tree, then we can prune the tree to be more shallow and thus
- * reduce the maintenance and traversal of each node in the B-tree.
+ * 主要动机是 bucket-key 大小决定了 rax 树的最大深度，
+ * 因此可以修剪树使其更浅，从而减少 B 树中每个节点的维护和遍历开销。
  */
 #if EB_BUCKET_KEY_PRECISION < 8
 #define EB_KEY_SIZE 6
@@ -56,16 +55,16 @@
 #endif
 
 /*
- * EB_SEG_MAX_ITEMS - Maximum number of items in rax-segment before trying to
- * split. To simplify, it has the same value as EB_LIST_MAX_ITEMS.
+ * EB_SEG_MAX_ITEMS - 分段中最大项目数，超过此值则尝试分裂。
+ * 为简化起见，它与 EB_LIST_MAX_ITEMS 值相同。
  */
 #define EB_SEG_MAX_ITEMS 16
 #define EB_LIST_MAX_ITEMS EB_SEG_MAX_ITEMS
 
-/* From expiration time to bucket-key */
+/* 从过期时间到 bucket-key */
 #define EB_BUCKET_KEY(exptime) ((exptime) >> EB_BUCKET_KEY_PRECISION)
 
- /* From bucket-key to expiration time */
+ /* 从 bucket-key 到过期时间 */
 #define EB_BUCKET_EXP_TIME(bucketKey) ((uint64_t)(bucketKey) << EB_BUCKET_KEY_PRECISION)
 
 /*** structs ***/
@@ -75,9 +74,9 @@ typedef struct CommonSegHdr {
 } CommonSegHdr;
 
 
-/* FirstSegHdr - Header of first segment of a bucket.
+/* FirstSegHdr - 桶的第一个分段的头部
  *
- * A bucket in rax tree with a single segment will be as follows:
+ * 单分段的 rax 树中桶的结构如下:
  *
  *            +-------------+     +------------+             +------------+
  *            | FirstSegHdr |     | eItem(1)   |             | eItem(N)   |
@@ -96,10 +95,10 @@ typedef struct FirstSegHdr {
     uint32_t numSegs;    /* number of segments in the bucket */
 } FirstSegHdr;
 
-/* NextSegHdr - Header of next segment in an extended-segment (bucket)
+/* NextSegHdr - 扩展分段桶中后续分段的头部
  *
- * Here is the layout of an extended-segment, after adding another item to a single,
- * full (EB_SEG_MAX_ITEMS=16), segment (all items must have same bucket-key value):
+ * 当向单个已满 (EB_SEG_MAX_ITEMS=16) 的分段添加另一个项目时，
+ * 扩展分段（桶）的布局如下（所有项目必须具有相同的 bucket-key 值）:
  *
  *            +-------------+     +------------+      +------------+     +------------+             +------------+
  *            | FirstSegHdr |     | eItem(17)  |      | NextSegHdr |     | eItem(1)   |             | eItem(16)  |
@@ -126,8 +125,11 @@ static_assert(offsetof(CommonSegHdr, head) == 0, "FirstSegHdr head is not aligne
 /* Verify attached metadata to rax is aligned */
 static_assert(offsetof(rax, metadata) % sizeof(void*) == 0, "metadata field is not aligned in rax");
 
-/* EBucketNew - Indicates the caller to create a new bucket following the addition
- * of another item to a bucket (either single-segment or extended-segment). */
+/* EBucketNew - 指示调用者创建新桶
+ *
+ * 当向桶（单分段或扩展分段）添加另一个项目后，
+ * 需要创建新桶时使用此结构。
+ */
 typedef struct EBucketNew {
     FirstSegHdr segment;
     ExpireMeta *mLast;  /* last item in the chain */
@@ -138,16 +140,16 @@ static void ebNewBucket(EbucketsType *type, EBucketNew *newBucket, eItem item, u
 static int ebBucketPrint(uint64_t bucketKey, EbucketsType *type, FirstSegHdr *firstSeg);
 static uint64_t *ebRaxNumItems(rax *rax);
 
-/*** Static functions ***/
+/*** 静态函数 ***/
 
-/* Extract pointer to list from ebuckets handler */
+/* 从 ebuckets 句柄中提取 rax 指针 */
 static inline rax *ebGetRaxPtr(ebuckets eb) { return (rax *)eb; }
 
-/* The lsb in ebuckets pointer determines whether the pointer points to rax or list. */
+/* ebuckets 指针中的 lsb 位决定指针指向 rax 还是列表 */
 static inline int ebIsList(ebuckets eb) {
     return (((uintptr_t)(void *)eb & 0x1) == 1);
 }
-/* set lsb in ebuckets pointer to 1 to mark it as list. Unless empty (NULL) */
+/* 设置 lsb 位为 1 以标记为列表，除非为空 (NULL) */
 static inline ebuckets ebMarkAsList(eItem item) {
     if (item == NULL) return item;
 
@@ -155,7 +157,7 @@ static inline ebuckets ebMarkAsList(eItem item) {
     return (void *) ((uintptr_t) item | 1);
 }
 
-/* Extract pointer to the list from ebuckets handler */
+/* 从 ebuckets 句柄中提取列表指针 */
 static inline eItem ebGetListPtr(EbucketsType *type, ebuckets eb) {
     /* if 'itemsAddrAreOdd' then no need to reset lsb bit */
     if (type->itemsAddrAreOdd)
@@ -164,10 +166,11 @@ static inline eItem ebGetListPtr(EbucketsType *type, ebuckets eb) {
         return (void*)((uintptr_t)(eb) & ~1);
 }
 
-/* Converts the logical starting time value of a given bucket-key to its equivalent
- * "physical" value in the context of an rax tree (rax-key). Although their values
- * are the same, their memory layouts differ. The raxKey layout orders bytes in
- * memory is from the MSB to the LSB, and the length of the key is EB_KEY_SIZE. */
+/* 将 bucket-key 的逻辑起始时间值转换为 rax 树中的"物理"值 (rax-key)
+ *
+ * 虽然它们的值相同，但内存布局不同。
+ * raxKey 按 MSB 到 LSB 的顺序排列字节，长度为 EB_KEY_SIZE。
+ */
 static inline void bucketKey2RaxKey(uint64_t bucketKey, unsigned char *raxKey) {
     for (int i = EB_KEY_SIZE-1; i >= 0; --i) {
         raxKey[i] = (unsigned char) (bucketKey & 0xFF);
@@ -175,11 +178,12 @@ static inline void bucketKey2RaxKey(uint64_t bucketKey, unsigned char *raxKey) {
     }
 }
 
-/* Converts the "physical" value of rax-key to its logical counterpart, representing
- * the starting time value of a bucket. The values are equivalent, but their memory
- * layouts differ. The raxKey is assumed to be ordered from the MSB to the LSB with
- * a length of EB_KEY_SIZE. The resulting bucket-key is the logical representation
- * with respect to ebuckets. */
+/* 将 rax-key 的"物理"值转换为其逻辑对应值
+ *
+ * 表示桶的起始时间值。值等价，但内存布局不同。
+ * 假设 raxKey 按 MSB 到 LSB 顺序排列，长度为 EB_KEY_SIZE。
+ * 结果 bucket-key 是 ebuckets 的逻辑表示。
+ */
 static inline uint64_t raxKey2BucketKey(unsigned char *raxKey) {
     uint64_t bucketKey = 0;
     for (int i = 0; i < EB_KEY_SIZE ; ++i)
@@ -187,17 +191,23 @@ static inline uint64_t raxKey2BucketKey(unsigned char *raxKey) {
     return bucketKey;
 }
 
-/* Add another item to a bucket that consists of extended-segments. In this
- * scenario, all items in the bucket share the same bucket-key value and the first
- * segment is already full (if not, the function ebSegAddAvail() would have being
- * called). This requires the creation of another segment. The layout of the
- * segments before and after the addition of the new item is as follows:
+/* 向扩展分段桶添加另一个项目
  *
- *  Before:                               [segHdr] -> {item1,..,item16} -> [..]
- *  After:   [segHdr] -> {newItem} -> [nextSegHdr] -> {item1,..,item16} -> [..]
+ * 在此场景中，桶中所有项目共享相同的 bucket-key 值，
+ * 第一个分段已满（如果不是，则会调用 ebSegAddAvail()）。
+ * 这需要创建另一个分段。新项目添加前后的分段布局如下:
  *
- *  Taken care to persist `segHdr` to be the same instance after the change.
- *  This is important because the rax tree is pointing to it. */
+ *  添加前:                               [segHdr] -> {item1,..,item16} -> [..]
+ *  添加后:   [segHdr] -> {newItem} -> [nextSegHdr] -> {item1,..,item16} -> [..]
+ *
+ * 注意确保 `segHdr` 在更改后保持相同实例。
+ * 这很重要，因为 rax 树指向它。
+ *
+ * @param type      Ebuckets 类型定义
+ * @param firstSegHdr  桶的第一个分段头
+ * @param newItem   要添加的新项目
+ * @return 成功返回 0
+ */
 static int ebSegAddExtended(EbucketsType *type, FirstSegHdr *firstSegHdr, eItem newItem) {
     /* Allocate nextSegHdr and let it take the items of first segment header */
     NextSegHdr *nextSegHdr = zmalloc(sizeof(NextSegHdr));
@@ -232,7 +242,7 @@ static int ebSegAddExtended(EbucketsType *type, FirstSegHdr *firstSegHdr, eItem 
     return 0;
 }
 
-/* Add another eItem to a segment with available space. Keep items sorted in ascending order */
+/* 向有可用空间的分段添加另一个 eItem，保持按过期时间升序排列 */
 static int ebSegAddAvail(EbucketsType *type, FirstSegHdr *seg, eItem item) {
     eItem head = seg->head;
     ExpireMeta *nextMeta;
@@ -281,8 +291,14 @@ static int ebSegAddAvail(EbucketsType *type, FirstSegHdr *seg, eItem item) {
     return 0;
 }
 
-/* Return 1 if split segment to two succeeded. Else, return 0. The only reason
- * the split can fail is that All the items in the segment have the same bucket-key */
+/* 尝试将分段分裂为两个分段
+ *
+ * @param type    Ebuckets 类型定义
+ * @param seg     要分裂的分段
+ * @param newBucket 输出参数，新的分段信息
+ * @return 分裂成功返回 1，失败返回 0
+ *       分裂失败的唯一原因是分段中所有项目具有相同的 bucket-key
+ */
 static int ebTrySegSplit(EbucketsType *type, FirstSegHdr *seg, EBucketNew *newBucket) {
     int minMidDist=(EB_SEG_MAX_ITEMS / 2), bestMiddleIndex = -1;
     uint64_t splitKey = -1;
@@ -352,7 +368,14 @@ static int ebTrySegSplit(EbucketsType *type, FirstSegHdr *seg, EBucketNew *newBu
     return 1;
 }
 
-/* Return 1 if managed to expire the entire segment. Returns 0 otherwise. */
+/* 单分段过期处理
+ *
+ * @param firstSegHdr 分段头
+ * @param type        Ebuckets 类型定义
+ * @param info        过期信息
+ * @param updateList  输出参数，需要更新过期时间的项目列表
+ * @return 成功过期整个分段返回 1，否则返回 0
+ */
 int ebSingleSegExpire(FirstSegHdr *firstSegHdr,
                              EbucketsType *type,
                              ExpireInfo *info,
@@ -417,7 +440,14 @@ int ebSingleSegExpire(FirstSegHdr *firstSegHdr,
     return 0;
 }
 
-/* return 1 if managed to expire the entire segment. Returns 0 otherwise. */
+/* 分段过期处理（支持扩展分段）
+ *
+ * @param firstSegHdr 分段头
+ * @param type        Ebuckets 类型定义
+ * @param info        过期信息
+ * @param updateList  输出参数，需要更新过期时间的项目列表
+ * @return 成功过期整个分段返回 1，否则返回 0
+ */
 static int ebSegExpire(FirstSegHdr *firstSegHdr,
                        EbucketsType *type,
                        ExpireInfo *info,
@@ -518,13 +548,13 @@ static int ebSegExpire(FirstSegHdr *firstSegHdr,
     return 1;
 }
 
-/*** Static functions of list ***/
+/*** 列表相关静态函数 ***/
 
-/* Convert a list to rax.
+/* 将列表转换为 rax
  *
- * To create a new rax, the function first converts the list to a segment by
- * allocating a segment header and attaching to it the already existing list.
- * Then, it adds the new segment to the rax as the first bucket. */
+ * 要创建新的 rax，函数首先通过分配分段头并附加现有列表
+ * 来将列表转换为分段。然后，它将新分段作为第一个桶添加到 rax。
+ */
 static rax *ebConvertListToRax(eItem listHead, EbucketsType *type) {
     FirstSegHdr *firstSegHdr = zmalloc(sizeof(FirstSegHdr));
     firstSegHdr->head = listHead;
@@ -767,7 +797,7 @@ static uint64_t *ebRaxNumItems(rax *rax) {
     return (uint64_t*) rax->metadata;
 }
 
-/* Allocate a single segment with a single item */
+/* 分配一个包含单个项目的分段 */
 static void ebNewBucket(EbucketsType *type, EBucketNew *newBucket, eItem item, uint64_t key) {
     ExpireMeta *mItem = type->getExpireMeta(item);
 
@@ -784,8 +814,8 @@ static void ebNewBucket(EbucketsType *type, EBucketNew *newBucket, eItem item, u
 }
 
 /*
- * ebBucketPrint - Prints all the segments in the bucket and time expiration
- * of each item in the following fashion:
+ * ebBucketPrint - 打印桶中所有分段和每个项目的过期时间
+ * 格式如下:
  *
  *      Bucket(tot=0008,sgs=0001) :    [11, 21, 26, 27, 29, 49, 59, 62]
  *      Bucket(tot=0007,sgs=0001) :    [67, 86, 90, 92, 115, 123, 126]
@@ -836,15 +866,14 @@ static int ebBucketPrint(uint64_t bucketKey, EbucketsType *type, FirstSegHdr *fi
     return 0;
 }
 
-/* Add another eItem to bucket. If needed return 'newBucket' for insertion in rax tree.
+/* 向桶添加另一个 eItem。如需要，返回 'newBucket' 以插入 rax 树
  *
- * 1) If the bucket is based on a single, not full segment, then add the item to the segment.
- * 2) If a single, full segment, then try to split it and then add the item.
- * 3) If failed to split, then all items in the bucket have the same bucket-key.
- *    - If the new item has the same bucket-key, then extend the segment to
- *      be an extended-segment, if not already, and add the item to it.
- *    - If the new item has a different bucket-key, then allocate a new bucket
- *      for it.
+ * 1) 如果桶基于单个未满分段，则将项目添加到分段中。
+ * 2) 如果是单个满分段，则尝试分裂它然后添加项目。
+ * 3) 如果分裂失败，则桶中所有项目具有相同的 bucket-key。
+ *    - 如果新项目具有相同的 bucket-key，则扩展分段
+ *      （如果不是扩展分段），并添加项目到其中。
+ *    - 如果新项目具有不同的 bucket-key，则为其分配新桶。
  */
 static int ebAddToBucket(EbucketsType *type,
                          FirstSegHdr *firstSegBkt,
@@ -927,15 +956,15 @@ static int ebAddToBucket(EbucketsType *type,
 }
 
 /*
- * Remove item from rax
+ * 从 rax 中移除项目
  *
- * Return 1 if removed. Otherwise, return 0
+ * @return 成功移除返回 1，否则返回 0
  *
- * Note: The function is optimized to remove items locally from segments without
- *       traversing rax tree or stepping long extended-segments. Therefore, it is
- *       assumed that the item is present in the bucket without verification.
+ * 注意: 该函数经过优化，可以从分段本地移除项目，
+ *       无需遍历 rax 树或跨越长的扩展分段。
+ *       因此，假设项目存在于桶中而不进行验证。
  *
- * TODO: Written straightforward. Should be optimized to merge small segments.
+ * TODO: 当前实现简单直接，未来可优化以合并小分段。
  */
 static int ebRemoveFromRax(ebuckets *eb, EbucketsType *type, eItem item) {
     ExpireMeta *mItem = type->getExpireMeta(item);
@@ -1184,7 +1213,7 @@ int ebAddToRax(ebuckets *eb, EbucketsType *type, eItem item, uint64_t bucketKeyI
     return 0;
 }
 
-/* Validate the general structure of the buckets in rax */
+/* 验证 rax 中桶的通用结构 */
 static void ebValidateRax(rax *rax, EbucketsType *type) {
     uint64_t numItemsTotal = 0;
     raxIterator raxIter;
@@ -1343,14 +1372,14 @@ static void _ebPrint(ebuckets eb, EbucketsType *type, int64_t usedMem, int print
     raxStop(&iter);
 }
 
-/*** API functions ***/
+/*** API 函数 ***/
 
 /**
- * Deletes all items from given ebucket, invoking optional item deletion callbacks.
+ * 删除给定 ebucket 中的所有项目，调用可选的项目删除回调。
  *
- * @param eb - The ebucket to be deleted.
- * @param type - Pointer to the EbucketsType structure defining the type of ebucket.
- * @param ctx - A context pointer that can be used in optional item deletion callbacks.
+ * @param eb   要删除的 ebucket
+ * @param type 指向定义 ebucket 类型的 EbucketsType 结构
+ * @param ctx  可选的项目删除回调中使用的上下文指针
  */
 void ebDestroy(ebuckets *eb, EbucketsType *type, void *ctx) {
     if (ebIsEmpty(*eb))

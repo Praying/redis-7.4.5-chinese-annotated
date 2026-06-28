@@ -57,8 +57,15 @@ const double MERCATOR_MIN = -20037726.37;
 static inline double deg_rad(double ang) { return ang * D_R; }
 static inline double rad_deg(double ang) { return ang / D_R; }
 
-/* This function is used in order to estimate the step (bits precision)
- * of the 9 search area boxes during radius queries. */
+/* 根据搜索半径估算 Geohash 精度步长
+ *
+ * 在半径查询时，估计 9 个搜索区域网格所需的精度位数。
+ * 精度越高，网格越小，搜索结果越精确，但需要检查的网格越多。
+ *
+ * @param range_meters 搜索半径（米）
+ * @param lat          当前纬度
+ * @return 估算的精度步长 (1-26)
+ */
 uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
     if (range_meters == 0) return 26;
     int step = 1;
@@ -82,18 +89,24 @@ uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
     return step;
 }
 
-/* Return the bounding box of the search area by shape (see geohash.h GeoShape)
- * bounds[0] - bounds[2] is the minimum and maximum longitude
- * while bounds[1] - bounds[3] is the minimum and maximum latitude.
- * since the higher the latitude, the shorter the arc length, the box shape is as follows
- * (left and right edges are actually bent), as shown in the following diagram:
+/* 返回搜索区域的边界框
+ *
+ * 根据搜索形状 (见 geohash.h GeoShape) 计算边界框。
+ * bounds[0] - bounds[2] 是经度的最小值和最大值
+ * bounds[1] - bounds[3] 是纬度的最小值和最大值。
+ * 由于纬度越高，弧长越短，边界框形状如下
+ * (左右边缘实际上是弯曲的)，如下图所示:
  *
  *    \-----------------/          --------               \-----------------/
  *     \               /         /          \              \               /
  *      \  (long,lat) /         / (long,lat) \              \  (long,lat) /
  *       \           /         /              \             /             \
- *         ---------          /----------------\           /---------------\
+ *         -----          /----------------\           /---------------\
  *  Northern Hemisphere       Southern Hemisphere         Around the equator
+ *
+ * @param shape  搜索形状 (圆形或矩形)
+ * @param bounds 输出数组，存储边界框坐标 [min_lon, min_lat, max_lon, max_lat]
+ * @return 成功返回 1，失败返回 0
  */
 int geohashBoundingBox(GeoShape *shape, double *bounds) {
     if (!bounds) return 0;
@@ -115,9 +128,15 @@ int geohashBoundingBox(GeoShape *shape, double *bounds) {
     return 1;
 }
 
-/* Calculate a set of areas (center + 8) that are able to cover a range query
- * for the specified position and shape (see geohash.h GeoShape).
- * the bounding box saved in shaple.bounds */
+/* 计算能够覆盖指定位置和形状范围内查询的一组区域
+ *
+ * 计算中心点及其周围 8 个相邻网格，形成 9 个网格来覆盖搜索区域。
+ * 搜索形状可以是圆形 (CIRCULAR_TYPE) 或矩形 (RECTANGLE_TYPE)。
+ * 边界框信息会保存在 shape->bounds 中。
+ *
+ * @param shape 输入的搜索形状，包含中心点坐标和形状参数
+ * @return GeoHashRadius 结构，包含编码哈希、相邻网格和覆盖区域
+ */
 GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
     GeoHashRange long_range, lat_range;
     GeoHashRadius radius;
@@ -210,22 +229,44 @@ GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
     return radius;
 }
 
+/* 将 Geohash 转换为 52 位定点数
+ *
+ * 用于与 Redis 内部存储格式兼容，将 Geohash 位值左移
+ * 到 52 位位置，以适配 double 精度的尾数部分。
+ *
+ * @param hash 输入的 Geohash 值
+ * @return 52 位定点数表示
+ */
 GeoHashFix52Bits geohashAlign52Bits(const GeoHashBits hash) {
     uint64_t bits = hash.bits;
     bits <<= (52 - hash.step * 2);
     return bits;
 }
 
-/* Calculate distance using simplified haversine great circle distance formula.
- * Given longitude diff is 0 the asin(sqrt(a)) on the haversine is asin(sin(abs(u))).
- * arcsin(sin(x)) equal to x when x ∈[−𝜋/2,𝜋/2]. Given latitude is between [−𝜋/2,𝜋/2]
- * we can simplify arcsin(sin(x)) to x.
+/* 使用简化的 haversine 大圆距离公式计算纬度距离
+ *
+ * 当两点经度相同时，可以简化 haversine 公式。
+ * 由于纬度范围在 [-π/2, π/2] 之间，asin(sin(x)) = x。
+ *
+ * @param lat1d 第一个点的纬度（度）
+ * @param lat2d 第二个点的纬度（度）
+ * @return 两点之间的距离（米）
  */
 double geohashGetLatDistance(double lat1d, double lat2d) {
     return EARTH_RADIUS_IN_METERS * fabs(deg_rad(lat2d) - deg_rad(lat1d));
 }
 
-/* Calculate distance using haversine great circle distance formula. */
+/* 使用 haversine 大圆距离公式计算两点之间的距离
+ *
+ * Haversine 公式用于计算球面上两点之间的最短距离。
+ * 适用于地球表面的近距离距离计算。
+ *
+ * @param lon1d 第一个点的经度（度）
+ * @param lat1d 第一个点的纬度（度）
+ * @param lon2d 第二个点的经度（度）
+ * @param lat2d 第二个点的纬度（度）
+ * @return 两点之间的距离（米）
+ */
 double geohashGetDistance(double lon1d, double lat1d, double lon2d, double lat2d) {
     double lat1r, lon1r, lat2r, lon2r, u, v, a;
     lon1r = deg_rad(lon1d);
@@ -241,6 +282,16 @@ double geohashGetDistance(double lon1d, double lat1d, double lon2d, double lat2d
     return 2.0 * EARTH_RADIUS_IN_METERS * asin(sqrt(a));
 }
 
+/* 检查点是否在指定半径范围内，若是则计算距离
+ *
+ * @param x1 第一个点的经度
+ * @param y1 第一个点的纬度
+ * @param x2 第二个点的经度
+ * @param y2 第二个点的纬度
+ * @param radius 指定半径
+ * @param distance 输出参数，计算得到的距离
+ * @return 点在半径内返回 1，否则返回 0
+ */
 int geohashGetDistanceIfInRadius(double x1, double y1,
                                  double x2, double y2, double radius,
                                  double *distance) {
@@ -249,19 +300,35 @@ int geohashGetDistanceIfInRadius(double x1, double y1,
     return 1;
 }
 
+/* 使用 WGS84 坐标系检查点是否在指定半径范围内
+ *
+ * @param x1 第一个点的经度
+ * @param y1 第一个点的纬度
+ * @param x2 第二个点的经度
+ * @param y2 第二个点的纬度
+ * @param radius 指定半径
+ * @param distance 输出参数，计算得到的距离
+ * @return 点在半径内返回 1，否则返回 0
+ */
 int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
                                       double y2, double radius,
                                       double *distance) {
     return geohashGetDistanceIfInRadius(x1, y1, x2, y2, radius, distance);
 }
 
-/* Judge whether a point is in the axis-aligned rectangle, when the distance
- * between a searched point and the center point is less than or equal to
- * height/2 or width/2 in height and width, the point is in the rectangle.
+/* 判断点是否在轴对齐的矩形内
  *
- * width_m, height_m: the rectangle
- * x1, y1 : the center of the box
- * x2, y2 : the point to be searched
+ * 当搜索点与中心点的纬度距离小于等于 height/2，
+ * 经度距离小于等于 width/2 时，点在矩形内。
+ *
+ * @param width_m  矩形宽度（米）
+ * @param height_m 矩形高度（米）
+ * @param x1       矩形中心经度
+ * @param y1       矩形中心纬度
+ * @param x2       待检测点经度
+ * @param y2       待检测点纬度
+ * @param distance 输出参数，两点间实际距离
+ * @return 点在矩形内返回 1，否则返回 0
  */
 int geohashGetDistanceIfInRectangle(double width_m, double height_m, double x1, double y1,
                                     double x2, double y2, double *distance) {

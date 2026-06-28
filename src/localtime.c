@@ -35,6 +35,10 @@ static int is_leap_year(time_t year) {
     else return 1;                  /* If div by 100 and 400 is leap. */
 }
 
+/* 无锁的 localtime 实现，将 time_t 时间戳转换为 tm 结构体。
+ * t: 自 1970-01-01 以来的秒数（UTC 时间）
+ * tz: 时区偏移秒数（如 UTC+8 则为 -28800）
+ * dst: 夏令时标志，1 表示启用夏令时 */
 void nolocks_localtime(struct tm *tmp, time_t t, time_t tz, int dst) {
     const time_t secs_min = 60;
     const time_t secs_hour = 3600;

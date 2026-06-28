@@ -1,4 +1,7 @@
-/*
+/* Redis 客户端超时管理
+ *
+ * 本文件处理客户端连接超时和阻塞操作超时的检测与管理。
+ *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
@@ -11,17 +14,19 @@
 
 #include <math.h>
 
-/* ========================== Clients timeouts ============================= */
+/* ========================== 客户端超时处理 ============================= */
 
-/* Check if this blocked client timedout (does nothing if the client is
- * not blocked right now). If so send a reply, unblock it, and return 1.
- * Otherwise 0 is returned and no operation is performed. */
+/* 检查阻塞客户端是否超时
+ *
+ * 若客户端当前未阻塞，则不执行任何操作，直接返回 0。
+ * 若超时则发送回复、解除阻塞并返回 1。
+ * 否则返回 0，不执行任何操作。 */
 int checkBlockedClientTimeout(client *c, mstime_t now) {
     if (c->flags & CLIENT_BLOCKED &&
         c->bstate.timeout != 0
         && c->bstate.timeout < now)
     {
-        /* Handle blocking operation specific timeout. */
+        /* 处理阻塞操作特有的超时 */
         unblockClientOnTimeout(c);
         return 1;
     } else {
@@ -29,27 +34,27 @@ int checkBlockedClientTimeout(client *c, mstime_t now) {
     }
 }
 
-/* Check for timeouts. Returns non-zero if the client was terminated.
- * The function gets the current time in milliseconds as argument since
- * it gets called multiple times in a loop, so calling gettimeofday() for
- * each iteration would be costly without any actual gain. */
+/* 检查客户端超时
+ *
+ * 若客户端被终止则返回非零值。
+ * 由于此函数在循环中会被多次调用，因此接收当前时间（毫秒）作为参数，
+ * 以避免每次迭代都调用 gettimeofday() 带来的性能开销。 */
 int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
     time_t now = now_ms/1000;
 
     if (server.maxidletime &&
-        /* This handles the idle clients connection timeout if set. */
-        !(c->flags & CLIENT_SLAVE) &&   /* No timeout for slaves and monitors */
-        !mustObeyClient(c) &&         /* No timeout for masters and AOF */
-        !(c->flags & CLIENT_BLOCKED) && /* No timeout for BLPOP */
-        !(c->flags & CLIENT_PUBSUB) &&  /* No timeout for Pub/Sub clients */
+        /* 处理空闲客户端连接超时（若已设置） */
+        !(c->flags & CLIENT_SLAVE) &&   /* 从节点和监控客户端不超时 */
+        !mustObeyClient(c) &&         /* 主节点和 AOF 客户端不超时 */
+        !(c->flags & CLIENT_BLOCKED) && /* BLPOP 客户端不超时 */
+        !(c->flags & CLIENT_PUBSUB) &&  /* Pub/Sub 客户端不超时 */
         (now - c->lastinteraction > server.maxidletime))
     {
         serverLog(LL_VERBOSE,"Closing idle client");
         freeClient(c);
         return 1;
     } else if (c->flags & CLIENT_BLOCKED) {
-        /* Cluster: handle unblock & redirect of clients blocked
-         * into keys no longer served by this server. */
+        /* Cluster 模式：处理被阻塞到不再由本服务器服务的键的客户端的解除阻塞和重定向 */
         if (server.cluster_enabled) {
             if (clusterRedirectBlockedClientIfNeeded(c))
                 unblockClientOnError(c, NULL);
@@ -58,40 +63,41 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
     return 0;
 }
 
-/* For blocked clients timeouts we populate a radix tree of 128 bit keys
- * composed as such:
+/* 阻塞客户端超时管理
  *
- *  [8 byte big endian expire time]+[8 byte client ID]
+ * 我们使用 Radix 树（基数树）存储 128 位键，格式如下：
+ *   [8 字节大端序过期时间] + [8 字节客户端 ID]
  *
- * We don't do any cleanup in the Radix tree: when we run the clients that
- * reached the timeout already, if they are no longer existing or no longer
- * blocked with such timeout, we just go forward.
+ * Radix 树中不做任何清理：当已超时的客户端被处理时，
+ * 若它们已不存在或不再以此超时阻塞，我们直接跳过。
  *
- * Every time a client blocks with a timeout, we add the client in
- * the tree. In beforeSleep() we call handleBlockedClientsTimeout() to run
- * the tree and unblock the clients. */
+ * 每次客户端以超时设置阻塞时，我们将其添加到树中。
+ * 在 beforeSleep() 中调用 handleBlockedClientsTimeout() 遍历树并解除客户端阻塞。 */
 
-#define CLIENT_ST_KEYLEN 16    /* 8 bytes mstime + 8 bytes client ID. */
+#define CLIENT_ST_KEYLEN 16    /* 8 字节 mstime + 8 字节 client ID */
 
-/* Given client ID and timeout, write the resulting radix tree key in buf. */
+/* 根据客户端 ID 和超时时间生成 Radix 树键
+ *
+ * 将 128 位键写入 buf 中 */
 void encodeTimeoutKey(unsigned char *buf, uint64_t timeout, client *c) {
     timeout = htonu64(timeout);
     memcpy(buf,&timeout,sizeof(timeout));
     memcpy(buf+8,&c,sizeof(c));
-    if (sizeof(c) == 4) memset(buf+12,0,4); /* Zero padding for 32bit target. */
+    if (sizeof(c) == 4) memset(buf+12,0,4); /* 32 位系统补零填充 */
 }
 
-/* Given a key encoded with encodeTimeoutKey(), resolve the fields and write
- * the timeout into *toptr and the client pointer into *cptr. */
+/* 解码由 encodeTimeoutKey() 编码的键
+ *
+ * 将超时时间写入 *toptr，客户端指针写入 *cptr */
 void decodeTimeoutKey(unsigned char *buf, uint64_t *toptr, client **cptr) {
     memcpy(toptr,buf,sizeof(*toptr));
     *toptr = ntohu64(*toptr);
     memcpy(cptr,buf+8,sizeof(*cptr));
 }
 
-/* Add the specified client id / timeout as a key in the radix tree we use
- * to handle blocked clients timeouts. The client is not added to the list
- * if its timeout is zero (block forever). */
+/* 将指定客户端 ID/超时时间添加到 Radix 树中
+ *
+ * 若超时时间为零（永久阻塞），则不添加该客户端 */
 void addClientToTimeoutTable(client *c) {
     if (c->bstate.timeout == 0) return;
     uint64_t timeout = c->bstate.timeout;
@@ -101,8 +107,7 @@ void addClientToTimeoutTable(client *c) {
         c->flags |= CLIENT_IN_TO_TABLE;
 }
 
-/* Remove the client from the table when it is unblocked for reasons
- * different than timing out. */
+/* 当客户端因超时以外的原因被解除阻塞时，从表中移除该客户端 */
 void removeClientFromTimeoutTable(client *c) {
     if (!(c->flags & CLIENT_IN_TO_TABLE)) return;
     c->flags &= ~CLIENT_IN_TO_TABLE;
@@ -112,8 +117,7 @@ void removeClientFromTimeoutTable(client *c) {
     raxRemove(server.clients_timeout_table,buf,sizeof(buf),NULL);
 }
 
-/* This function is called in beforeSleep() in order to unblock clients
- * that are waiting in blocking operations with a timeout set. */
+/* 在 beforeSleep() 中调用，解除等待超时阻塞的客户端 */
 void handleBlockedClientsTimeout(void) {
     if (raxSize(server.clients_timeout_table) == 0) return;
     uint64_t now = mstime();
@@ -125,7 +129,7 @@ void handleBlockedClientsTimeout(void) {
         uint64_t timeout;
         client *c;
         decodeTimeoutKey(ri.key,&timeout,&c);
-        if (timeout >= now) break; /* All the timeouts are in the future. */
+        if (timeout >= now) break; /* 所有超时时间都在未来 */
         c->flags &= ~CLIENT_IN_TO_TABLE;
         checkBlockedClientTimeout(c,now);
         raxRemove(server.clients_timeout_table,ri.key,ri.key_len,NULL);
@@ -134,14 +138,12 @@ void handleBlockedClientsTimeout(void) {
     raxStop(&ri);
 }
 
-/* Get a timeout value from an object and store it into 'timeout'.
- * The final timeout is always stored as milliseconds as a time where the
- * timeout will expire, however the parsing is performed according to
- * the 'unit' that can be seconds or milliseconds.
+/* 从对象中获取超时值并存储到 'timeout'
  *
- * Note that if the timeout is zero (usually from the point of view of
- * commands API this means no timeout) the value stored into 'timeout'
- * is zero. */
+ * 最终超时值始终以毫秒为单位存储（表示超时将在何时过期），
+ * 但解析根据 'unit' 参数进行，可以是秒或毫秒。
+ *
+ * 注意：若超时为零（通常表示 API 中无超时），则存储到 'timeout' 的值也为零。 */
 int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit) {
     long long tval;
     long double ftval;
@@ -152,7 +154,7 @@ int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int 
             "timeout is not a float or out of range") != C_OK)
             return C_ERR;
 
-        ftval *= 1000.0;  /* seconds => millisec */
+        ftval *= 1000.0;  /* 秒 => 毫秒 */
         if (ftval > LLONG_MAX) {
             addReplyError(c, "timeout is out of range");
             return C_ERR;
@@ -171,7 +173,7 @@ int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int 
 
     if (tval > 0) {
         if  (tval > LLONG_MAX - now) {
-            addReplyError(c,"timeout is out of range"); /* 'tval+now' would overflow */
+            addReplyError(c,"timeout is out of range"); /* 'tval+now' 会溢出 */
             return C_ERR;
         }
         tval += now;

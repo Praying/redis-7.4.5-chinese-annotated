@@ -1,9 +1,12 @@
 /* ==========================================================================
- * setproctitle.c - Linux/Darwin setproctitle.
+ * setproctitle.c - 进程标题设置工具 (Linux/Darwin)
  * --------------------------------------------------------------------------
- * Copyright (C) 2010  William Ahern
- * Copyright (C) 2013-current  Redis Ltd.
- * Copyright (C) 2013  Stam He
+ * 功能: 允许程序修改其在 ps、top 等命令中显示的进程名称
+ *
+ * 版权:
+ *   Copyright (C) 2010  William Ahern
+ *   Copyright (C) 2013-current  Redis Ltd.
+ *   Copyright (C) 2013  Stam He
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
@@ -56,6 +59,18 @@
 
 extern char **environ;
 
+/* SPT 结构体 - setproctitle 内部状态
+ *
+ * 用于跟踪进程标题空间的可用范围和状态
+ *
+ * 字段说明:
+ *   arg0  - argv[0] 的原始值副本
+ *   base  - 可用于写入标题的内存起始位置
+ *   end   - 可用内存的结束位置
+ *   nul   - 原始 argv[0] 字符串结束符的位置
+ *   reset - 是否已执行过第一次标题设置
+ *   error - 最近一次错误的错误码
+ */
 static struct {
 	/* original value */
 	const char *arg0;
@@ -178,15 +193,20 @@ static int spt_copyargs(int argc, char *argv[]) {
 	return 0;
 } /* spt_copyargs() */
 
-/* Initialize and populate SPT to allow a future setproctitle()
- * call.
+/* spt_init - 初始化 setproctitle 机制
  *
- * As setproctitle() basically needs to overwrite argv[0], we're
- * trying to determine what is the largest contiguous block
- * starting at argv[0] we can use for this purpose.
+ * 初始化 SPT 结构体,使后续的 setproctitle() 调用能够修改进程标题.
  *
- * As this range will overwrite some or all of the argv and environ
- * strings, a deep copy of these two arrays is performed.
+ * 实现原理:
+ *   setproctitle() 基本上是覆盖 argv[0] 所在的内存区域.
+ *   我们尝试找出从 argv[0] 开始的最大连续可用内存块.
+ *
+ * 由于这个范围可能会覆盖 argv 和 environ 字符串,
+ * 函数会执行 argv[] 和 environ 的深度拷贝以保存原始值.
+ *
+ * 参数:
+ *   argc - main 函数的 argc
+ *   argv - main 函数的 argv
  */
 void spt_init(int argc, char *argv[]) {
         char **envp = environ;
@@ -272,6 +292,21 @@ error:
 #define SPT_MAXTITLE 255
 #endif
 
+/* setproctitle - 设置进程标题
+ *
+ * 修改进程在 ps、top 等系统监控工具中显示的名称.
+ *
+ * 参数:
+ *   fmt - 格式字符串,类似 printf
+ *   ... - 可变参数
+ *
+ * 使用方式:
+ *   setproctitle("redis-server: main process");  // 只显示进程名
+ *   setproctitle("redis-server %s:%d", host, port); // 带参数
+ *
+ * 注意:
+ *   如果 fmt 为 NULL,则恢复为原始的 argv[0]
+ */
 void setproctitle(const char *fmt, ...) {
 	char buf[SPT_MAXTITLE + 1]; /* use buffer in case argv[0] is passed */
 	va_list ap;

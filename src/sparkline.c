@@ -1,7 +1,10 @@
-/* sparkline.c -- ASCII Sparklines
- * This code is modified from http://github.com/antirez/aspark and adapted
- * in order to return SDS strings instead of outputting directly to
- * the terminal.
+/* sparkline.c -- ASCII 迷你图生成器
+ *
+ * 本代码修改自 http://github.com/antirez/aspark,
+ * 适配为返回 SDS 字符串而不是直接输出到终端.
+ *
+ * 迷你图(Sparkline)是一种极简的、数据密集的、字符合成的图表,
+ * 适合在命令行或纯文本环境中展示数据趋势.
  *
  * ---------------------------------------------------------------------------
  *
@@ -16,22 +19,38 @@
 
 #include <math.h>
 
-/* This is the charset used to display the graphs, but multiple rows are used
- * to increase the resolution. */
+/* 迷你图的字符集定义
+ *
+ * charset:     普通模式使用的字符,按从低到高的顺序排列
+ * charset_fill: 填充模式使用的字符,按从低到高的顺序排列
+ *
+ * 字符集对应关系:
+ *   低值 -> 高值
+ *   普通: _  -  `  (3级高度)
+ *   填充: _  o  #  (3级高度,填充模式用不同字符)
+ *
+ * 多个行叠加使用以增加垂直分辨率.
+ */
 static char charset[] = "_-`";
 static char charset_fill[] = "_o#";
 static int charset_len = sizeof(charset)-1;
-static int label_margin_top = 1;
+static int label_margin_top = 1; /* 标签与图表之间的行间距 */
 
 /* ----------------------------------------------------------------------------
- * Sequences are arrays of samples we use to represent data to turn
- * into sparklines. This is the API in order to generate a sparkline:
+ * Sparkline API 使用示例:
  *
+ * // 创建序列
  * struct sequence *seq = createSparklineSequence();
- * sparklineSequenceAddSample(seq, 10, NULL);
- * sparklineSequenceAddSample(seq, 20, NULL);
- * sparklineSequenceAddSample(seq, 30, "last sample label");
+ *
+ * // 添加数据样本
+ * sparklineSequenceAddSample(seq, 10, NULL);           // 无标签
+ * sparklineSequenceAddSample(seq, 20, NULL);           // 无标签
+ * sparklineSequenceAddSample(seq, 30, "last sample label"); // 带标签
+ *
+ * // 渲染迷你图(80列宽, 4行高, 填充模式)
  * sds output = sparklineRender(sdsempty(), seq, 80, 4, SPARKLINE_FILL);
+ *
+ * // 释放资源
  * freeSparklineSequence(seq);
  * ------------------------------------------------------------------------- */
 
@@ -76,9 +95,22 @@ void freeSparklineSequence(struct sequence *seq) {
  * ASCII rendering of sequence
  * ------------------------------------------------------------------------- */
 
-/* Render part of a sequence, so that render_sequence() call call this function
- * with different parts in order to create the full output without overflowing
- * the current terminal columns. */
+/* sparklineRenderRange - 渲染序列的一部分
+ *
+ * 渲染序列的一个子区间,用于生成分段输出以避免超出终端列宽.
+ * sparklineRender() 会多次调用此函数,每次处理不同的区间.
+ *
+ * 参数:
+ *   output - 输出的 SDS 字符串(追加模式)
+ *   seq    - 数据序列
+ *   rows   - 垂直行数(高度)
+ *   offset - 序列起始偏移
+ *   len    - 要渲染的样本数量
+ *   flags  - 渲染标志(SPARKLINE_FILL, SPARKLINE_LOG_SCALE 等)
+ *
+ * 返回:
+ *   追加了渲染结果的新 SDS 字符串
+ */
 sds sparklineRenderRange(sds output, struct sequence *seq, int rows, int offset, int len, int flags) {
     int j;
     double relmax = seq->max - seq->min;
@@ -146,7 +178,23 @@ sds sparklineRenderRange(sds output, struct sequence *seq, int rows, int offset,
     return output;
 }
 
-/* Turn a sequence into its ASCII representation */
+/* sparklineRender - 将数据序列渲染为 ASCII 迷你图
+ *
+ * 将数据序列转换为 ASCII 字符图形表示.
+ * 如果序列长度超过列数,会分多行渲染.
+ *
+ * 参数:
+ *   output  - 输出的 SDS 字符串(追加模式)
+ *   seq     - 数据序列
+ *   columns - 水平列数(宽度)
+ *   rows    - 垂直行数(高度)
+ *   flags   - 渲染标志
+ *     SPARKLINE_FILL      - 使用填充字符模式
+ *     SPARKLINE_LOG_SCALE - 使用对数刻度
+ *
+ * 返回:
+ *   追加了迷你图的新 SDS 字符串
+ */
 sds sparklineRender(sds output, struct sequence *seq, int columns, int rows, int flags) {
     int j;
 

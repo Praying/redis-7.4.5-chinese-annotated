@@ -73,12 +73,15 @@ mstr mstrNew(const char *initStr, size_t lenStr, int trymalloc) {
     return s;
 }
 
-/* Creates mstr with given string. Reserve space for metadata.
+/* 创建带元数据的 mstr。
+ * kind:       mstr 类型描述（包含各元数据字段的大小信息）
+ * initStr:    初始字符串
+ * lenStr:     字符串长度
+ * metaFlags:  元数据标志位，用于指明需要分配哪些元数据字段
+ * trymalloc:  0 表示必须成功，1 表示失败时返回 NULL
  *
- * Note: mstrNew(s,l) and mstrNewWithMeta(s,l,0) are not the same. The first allocates
- * just string. The second allocates a string with flags (yet without any metadata
- * structures allocated).
- */
+ * 注意：mstrNew(s,l) 和 mstrNewWithMeta(s,l,0) 不同。前者仅分配字符串，
+ * 后者分配带标志位的字符串（但尚未分配具体元数据结构）。*/
 mstr mstrNewWithMeta(struct mstrKind *kind, const char *initStr, size_t lenStr, mstrFlags metaFlags, int trymalloc) {
     unsigned char *pInfo; /* pointer to mstr info field */
     char *allocMstr;
@@ -131,8 +134,12 @@ mstr mstrNewWithMeta(struct mstrKind *kind, const char *initStr, size_t lenStr, 
     return mstrPtr;
 }
 
-/* Create copy of mstr. Flags can be modified. For each metadata flag, if
- * same flag is set on both, then copy its metadata. */
+/* 创建 mstr 的副本。
+ * kind:      mstr 类型描述
+ * src:       源 mstr
+ * newFlags:  新标志位；如果某标志在源和目标中都设置，则复制对应的元数据
+ *
+ * 如果源 mstr 有元数据，且新标志与源标志有重叠，则选择性复制元数据。*/
 mstr mstrNewCopy(struct mstrKind *kind, mstr src, mstrFlags newFlags) {
     mstr dst;
 
@@ -170,16 +177,16 @@ mstr mstrNewCopy(struct mstrKind *kind, mstr src, mstrFlags newFlags) {
     return dst;
 }
 
-/* Free mstring. Note, mstrKind is required to eval sizeof metadata and find start
- * of allocation but if mstrIsMetaAttached(s) is false, you can pass NULL as well.
- */
+/* 释放 mstr 内存。
+ * kind: mstr 类型描述，用于计算元数据大小；若 mstr 无元数据，可传 NULL
+ * s:    要释放的 mstr 字符串指针 */
 void mstrFree(struct mstrKind *kind, mstr s) {
     if (s != NULL)
         s_free(mstrGetAllocPtr(kind, s));
 }
 
-/* return ref to metadata flags. Useful to modify directly flags which doesn't
- * include metadata payload */
+/* 返回指向 mstr 元数据标志位的指针。
+ * 可用于直接修改不包含元数据负载的标志位。*/
 mstrFlags *mstrFlagsRef(mstr s) {
     switch(s[-1]&MSTR_TYPE_MASK) {
         case MSTR_TYPE_5:
@@ -193,11 +200,11 @@ mstrFlags *mstrFlagsRef(mstr s) {
     }
 }
 
-/* Return a reference to corresponding metadata of the specified metadata flag
- * index (flagIdx). If the metadata doesn't exist, it still returns a reference
- * to the starting location where it would have been written among other metadatas.
- * To verify if `flagIdx` of some metadata is attached, use `mstrGetFlag(s, flagIdx)`.
- */
+/* 返回指定元数据标志索引对应的元数据引用。
+ * flagIdx: 元数据标志索引
+ *
+ * 如果该元数据不存在，仍会返回它本应写入的起始位置引用。
+ * 要判断某个 flagIdx 的元数据是否已附加，使用 mstrGetFlag(s, flagIdx)。*/
 void *mstrMetaRef(mstr s, struct mstrKind *kind, int flagIdx) {
     int metaOffset = 0;
     /* start iterating from flags backward */
@@ -211,7 +218,8 @@ void *mstrMetaRef(mstr s, struct mstrKind *kind, int flagIdx) {
     return ((char *)pFlags) - metaOffset;
 }
 
-/* mstr layout: [meta-data#N]...[meta-data#0][mstrFlags][mstrhdr][string][null] */
+/* mstr 内存布局: [meta-data#N]...[meta-data#0][mstrFlags][mstrhdr][string][null]
+ * 返回指向 malloc 分配起始位置的指针。*/
 void *mstrGetAllocPtr(struct mstrKind *kind, mstr str) {
     if (!mstrIsMetaAttached(str))
         return (char*)str - mstrHdrSize(str[-1]);
@@ -220,10 +228,12 @@ void *mstrGetAllocPtr(struct mstrKind *kind, mstr str) {
     return (char*)str - mstrHdrSize(str[-1]) - sizeof(mstrFlags) - totalMetaLen;
 }
 
-/* Prints in the following fashion:
+/* 打印 mstr 的调试信息。
+ * verbose: 是否打印详细元数据内容
+ *
+ * 输出格式示例：
  *   [0x7f8bd8816017] my_mstr: foo (strLen=3, mstrLen=11, isMeta=1, metaFlags=0x1)
- *   [0x7f8bd8816010] >> meta[0]: 0x78 0x56 0x34 0x12 (metaLen=4)
- */
+ *   [0x7f8bd8816010] >> meta[0]: 0x78 0x56 0x34 0x12 (metaLen=4) */
 void mstrPrint(mstr s, struct mstrKind *kind, int verbose) {
     mstrFlags mflags, tmp;
     int isMeta = mstrIsMetaAttached(s);
@@ -255,7 +265,7 @@ void mstrPrint(mstr s, struct mstrKind *kind, int verbose) {
     }
 }
 
-/* return length of the string (ignoring metadata attached) */
+/* 返回 mstr 字符串长度（不包括元数据）。*/
 size_t mstrlen(const mstr s) {
     unsigned char info = s[-1];
     switch(info & MSTR_TYPE_MASK) {
@@ -270,8 +280,9 @@ size_t mstrlen(const mstr s) {
     }
 }
 
-/*** mstr internals ***/
+/*** mstr 内部函数 ***/
 
+/* 根据标志位计算元数据的总字节数。*/
 static inline int mstrSumMetaLen(mstrKind *k, mstrFlags flags) {
     int total = 0;
     int i = 0 ;
@@ -283,7 +294,8 @@ static inline int mstrSumMetaLen(mstrKind *k, mstrFlags flags) {
     return total;
 }
 
-/* mstrSumMetaLen() + sizeof(mstrFlags) + sizeof(mstrhdrX) + strlen + '\0' */
+/* 计算 mstr 的总分配长度：
+ * 头部 + 字符串长度 + '\0' + (元数据标志 + 元数据总长度，如果有元数据) */
 static inline size_t mstrAllocLen(const mstr s, struct mstrKind *kind) {
     int hdrlen;
     mstrFlags *pMetaFlags;
@@ -317,7 +329,7 @@ static inline size_t mstrAllocLen(const mstr s, struct mstrKind *kind) {
     return hdrlen + strlen + NULL_SIZE + ((isMeta) ? (mstrSumMetaLen(kind, *pMetaFlags) + sizeof(mstrFlags)) : 0);
 }
 
-/* returns pointer to the beginning of malloc() of mstr */
+/* 返回 mstr malloc 分配块的起始指针。*/
 void *mstrGetStartAlloc(mstr s, struct mstrKind *kind) {
     int hdrlen;
     mstrFlags *pMetaFlags;
@@ -345,6 +357,7 @@ void *mstrGetStartAlloc(mstr s, struct mstrKind *kind) {
     return (char *) s - hdrlen -  ((isMeta) ? (mstrSumMetaLen(kind, *pMetaFlags) + sizeof(mstrFlags)) : 0);
 }
 
+/* 根据 mstr 类型返回头部结构体大小。*/
 static inline int mstrHdrSize(char type) {
     switch(type&MSTR_TYPE_MASK) {
         case MSTR_TYPE_5:
@@ -359,6 +372,11 @@ static inline int mstrHdrSize(char type) {
     return 0;
 }
 
+/* 根据字符串长度返回所需的最小 mstr 类型。
+ * MSTR_TYPE_5:  < 32 字节
+ * MSTR_TYPE_8:  < 256 字节
+ * MSTR_TYPE_16: < 65536 字节
+ * MSTR_TYPE_64: 其他情况 */
 static inline char mstrReqType(size_t string_size) {
     if (string_size < 1<<5)
         return MSTR_TYPE_5;

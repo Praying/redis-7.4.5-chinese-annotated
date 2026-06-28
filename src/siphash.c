@@ -64,27 +64,30 @@ int siptlw(int c) {
 #define NO_SANITIZE(sanitizer)
 #endif
 
-/* Test of the CPU is Little Endian and supports not aligned accesses.
- * Two interesting conditions to speedup the function that happen to be
- * in most of x86 servers. */
+/* 检测 CPU 是否为小端序且支持非对齐内存访问。
+ * 满足这两个条件的平台（多为 x86 服务器）可以加速 siphash。 */
 #if defined(__X86_64__) || defined(__x86_64__) || defined (__i386__) \
 	|| defined (__aarch64__) || defined (__arm64__)
 #define UNALIGNED_LE_CPU
 #endif
 
+/* 循环左移 64 位 */
 #define ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
 
+/* 将 uint32_t 写入字节数组（小端序） */
 #define U32TO8_LE(p, v)                                                        \
     (p)[0] = (uint8_t)((v));                                                   \
     (p)[1] = (uint8_t)((v) >> 8);                                              \
     (p)[2] = (uint8_t)((v) >> 16);                                             \
     (p)[3] = (uint8_t)((v) >> 24);
 
+/* 将 uint64_t 写入字节数组（小端序） */
 #define U64TO8_LE(p, v)                                                        \
     U32TO8_LE((p), (uint32_t)((v)));                                           \
     U32TO8_LE((p) + 4, (uint32_t)((v) >> 32));
 
 #ifdef UNALIGNED_LE_CPU
+/* 直接通过指针解引用读取 64 位（小端序），要求内存对齐） */
 #define U8TO64_LE(p) (*((uint64_t*)(p)))
 #else
 #define U8TO64_LE(p)                                                           \
@@ -94,6 +97,7 @@ int siptlw(int c) {
      ((uint64_t)((p)[6]) << 48) | ((uint64_t)((p)[7]) << 56))
 #endif
 
+/* 大小写不敏感版本：将 8 字节读取为 uint64_t（小端序） */
 #define U8TO64_LE_NOCASE(p)                                                    \
     (((uint64_t)(siptlw((p)[0]))) |                                           \
      ((uint64_t)(siptlw((p)[1])) << 8) |                                      \
@@ -104,6 +108,7 @@ int siptlw(int c) {
      ((uint64_t)(siptlw((p)[6])) << 48) |                                              \
      ((uint64_t)(siptlw((p)[7])) << 56))
 
+/* SipHash-1-2 的一轮压缩操作（包含 6 次字混合和异或） */
 #define SIPROUND                                                               \
     do {                                                                       \
         v0 += v1;                                                              \
@@ -128,21 +133,25 @@ uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
     uint64_t hash;
     uint8_t *out = (uint8_t*) &hash;
 #endif
+    /* 初始化 4 个 64 位累加器（固定常量，与密钥异或） */
     uint64_t v0 = 0x736f6d6570736575ULL;
     uint64_t v1 = 0x646f72616e646f6dULL;
     uint64_t v2 = 0x6c7967656e657261ULL;
     uint64_t v3 = 0x7465646279746573ULL;
-    uint64_t k0 = U8TO64_LE(k);
-    uint64_t k1 = U8TO64_LE(k + 8);
+    uint64_t k0 = U8TO64_LE(k);   /* 密钥的前 8 字节 */
+    uint64_t k1 = U8TO64_LE(k + 8); /* 密钥的后 8 字节 */
     uint64_t m;
+    /* 按 8 字节（uint64_t）为单位处理数据 */
     const uint8_t *end = in + inlen - (inlen % sizeof(uint64_t));
-    const int left = inlen & 7;
-    uint64_t b = ((uint64_t)inlen) << 56;
+    const int left = inlen & 7; /* 不足 8 字节的尾部长度 */
+    uint64_t b = ((uint64_t)inlen) << 56; /* 将长度编码到消息末尾 */
+    /* 密钥参与到初始状态 */
     v3 ^= k1;
     v2 ^= k0;
     v1 ^= k1;
     v0 ^= k0;
 
+    /* 处理所有完整的 8 字节块 */
     for (; in != end; in += 8) {
         m = U8TO64_LE(in);
         v3 ^= m;
@@ -152,6 +161,7 @@ uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
         v0 ^= m;
     }
 
+    /* 处理最后一个不完整的块（0-7 字节） */
     switch (left) {
     case 7: b |= ((uint64_t)in[6]) << 48; /* fall-thru */
     case 6: b |= ((uint64_t)in[5]) << 40; /* fall-thru */
@@ -163,16 +173,18 @@ uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
     case 0: break;
     }
 
+    /* 最终压缩：消息尾部异或后执行两轮 SIPROUND */
     v3 ^= b;
 
     SIPROUND;
 
     v0 ^= b;
-    v2 ^= 0xff;
+    v2 ^= 0xff; /* 固定结束标记 */
 
     SIPROUND;
     SIPROUND;
 
+    /* 混合所有累加器得到最终哈希值 */
     b = v0 ^ v1 ^ v2 ^ v3;
 #ifndef UNALIGNED_LE_CPU
     U64TO8_LE(out, b);
@@ -182,6 +194,9 @@ uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
 #endif
 }
 
+/* siphash_nocase - 大小写不敏感的 64 位哈希函数
+ * 与 siphash 相同，但字符比较时不区分大小写。
+ * 用于哈希表键的比较（不区分大小写场景）。 */
 NO_SANITIZE("alignment")
 uint64_t siphash_nocase(const uint8_t *in, const size_t inlen, const uint8_t *k)
 {
@@ -244,7 +259,7 @@ uint64_t siphash_nocase(const uint8_t *in, const size_t inlen, const uint8_t *k)
 }
 
 
-/* --------------------------------- TEST ------------------------------------ */
+/* --------------------------------- 测试代码 --------------------------------- */
 
 #ifdef SIPHASH_TEST
 
@@ -316,12 +331,9 @@ const uint8_t vectors_sip64[64][8] = {
 };
 
 
-/* Test siphash using a test vector. Returns 0 if the function passed
- * all the tests, otherwise 1 is returned.
- *
- * IMPORTANT: The test vector is for SipHash 2-4. Before running
- * the test revert back the siphash() function to 2-4 rounds since
- * now it uses 1-2 rounds. */
+/* 使用测试向量验证 siphash 实现。
+ * 返回 0 表示测试通过，返回 1 表示失败。
+ * 注意：测试向量基于 SipHash 2-4 算法。 */
 int siphash_test(void) {
     uint8_t in[64], k[16];
     int i;

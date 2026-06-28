@@ -1,16 +1,18 @@
-/* The following is the NetBSD libc qsort implementation modified in order to
- * support partial sorting of ranges for Redis.
+/* pqsort.c - 支持局部排序范围的并行快速排序实现
+ *
+ * 本文件是 NetBSD libc qsort 实现的修改版本, 为 Redis 添加了局部排序支持.
+ *
+ * 原始版权声明见下方.
  *
  * Copyright(C) 2009-current Redis Ltd.. All rights reserved.
- *
- * The original copyright notice follows. */
+ */
 
 
-/*	$NetBSD: qsort.c,v 1.19 2009/01/30 23:38:44 lukem Exp $	*/
+/*  $NetBSD: qsort.c,v 1.19 2009/01/30 23:38:44 lukem Exp $   */
 
 /*-
  * Copyright (c) 1992, 1993
- *	The Regents of the University of California.  All rights reserved.
+ *      The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,7 +51,14 @@ static inline void	 swapfunc (char *, char *, size_t, int);
 #define min(a, b)	(a) < (b) ? a : b
 
 /*
- * Qsort routine from Bentley & McIlroy's "Engineering a Sort Function".
+ * Qsort 快速排序核心算法, 源自 Bentley & McIlroy 的
+ * "Engineering a Sort Function" 论文实现的 Med-3 切分策略
+ *
+ * 算法特点:
+ * - 使用三数取中(median-of-three)选择枢轴, 避免最坏情况
+ * - 对小数组(<7元素)使用插入排序优化
+ * - 对大数组使用多级三数取中提高枢轴质量
+ * - 支持局部范围排序(lrange, rrange参数)
  */
 #define swapcode(TYPE, parmi, parmj, n) { 		\
 	size_t i = (n) / sizeof (TYPE); 		\
@@ -85,6 +94,19 @@ swapfunc(char *a, char *b, size_t n, int swaptype)
 
 #define vecswap(a, b, n) if ((n) > 0) swapfunc((a), (b), (size_t)(n), swaptype)
 
+/* med3 - 三数取中函数, 返回三个数的中位数
+ *
+ * 参数:
+ *   a, b, c - 三个待比较的元素指针
+ *   cmp     - 比较函数
+ *
+ * 返回:
+ *   三个元素中比较结果居中的那个元素的指针
+ *
+ * 作用:
+ *   选择一个好的枢轴(pivot)用于快速排序的分区操作,
+ *   避免当数组已有序时退化为 O(n^2) 的最坏情况
+ */
 static inline char *
 med3(char *a, char *b, char *c,
     int (*cmp) (const void *, const void *))
@@ -95,6 +117,23 @@ med3(char *a, char *b, char *c,
               :(cmp(b, c) > 0 ? b : (cmp(a, c) < 0 ? a : c ));
 }
 
+/* _pqsort - 内部递归快速排序函数
+ *
+ * 参数:
+ *   a      - 待排序数组指针
+ *   n      - 数组元素个数
+ *   es     - 每个元素的大小(字节)
+ *   cmp    - 比较函数
+ *   lrange - 局部排序左边界(在此范围内的元素会被排序)
+ *   rrange - 局部排序右边界
+ *
+ * 算法步骤:
+ *   1. 小数组(n<7)使用插入排序
+ *   2. 选择枢轴: 大数组时使用三数取中策略
+ *   3. 分区: 将数组分为小于枢轴、等于枢轴、大于枢轴三部分
+ *   4. 递归排序左右两部分(仅在范围内)
+ *   5. 迭代而非递归以节省栈空间
+ */
 static void
 _pqsort(void *a, size_t n, size_t es,
     int (*cmp) (const void *, const void *), void *lrange, void *rrange)
@@ -176,6 +215,20 @@ loop:	SWAPINIT(a, es);
 /*		qsort(pn - r, r / es, es, cmp);*/
 }
 
+/* pqsort - 局部排序快速排序的对外接口
+ *
+ * 参数:
+ *   a      - 待排序数组指针
+ *   n      - 数组元素个数
+ *   es     - 每个元素的大小(字节)
+ *   cmp    - 比较函数
+ *   lrange - 局部排序的起始索引
+ *   rrange - 局部排序的结束索引
+ *
+ * 注意:
+ *   仅对 [lrange, rrange] 范围内的元素进行排序,
+ *   范围外的元素位置保持不变, 但可能作为排序过程中的临时位置
+ */
 void
 pqsort(void *a, size_t n, size_t es,
     int (*cmp) (const void *, const void *), size_t lrange, size_t rrange)
