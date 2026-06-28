@@ -26,12 +26,12 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 
-/* This macro is called when the internal RDB structure is corrupt */
+/* 当内部 RDB 结构损坏时调用此宏 */
 #define rdbReportCorruptRDB(...) rdbReportError(1, __LINE__,__VA_ARGS__)
-/* This macro is called when RDB read failed (possibly a short read) */
+/* 当 RDB 读取失败时（可能是短读）调用此宏 */
 #define rdbReportReadError(...) rdbReportError(0, __LINE__,__VA_ARGS__)
 
-/* This macro tells if we are in the context of a RESTORE command, and not loading an RDB or AOF. */
+/* 该宏用于判断当前是否处于 RESTORE 命令的上下文中，而非加载 RDB 或 AOF */
 #define isRestoreContext() \
     ((server.current_client == NULL || server.current_client->id == CLIENT_ID_AOF) ? 0 : 1)
 
@@ -56,29 +56,29 @@ void rdbReportError(int corruption_error, int linenum, char *reason, ...) {
     va_end(ap);
 
     if (isRestoreContext()) {
-        /* If we're in the context of a RESTORE command, just propagate the error. */
-        /* log in VERBOSE, and return (don't exit). */
+        /* 如果处于 RESTORE 命令上下文中，仅传递错误。
+         * 以 VERBOSE 级别记录日志并返回（不退出）。 */
         serverLog(LL_VERBOSE, "%s", msg);
         return;
     } else if (rdbCheckMode) {
-        /* If we're inside the rdb checker, let it handle the error. */
+        /* 如果处于 rdb 检查模式中，让检查器自行处理错误 */
         rdbCheckError("%s",msg);
     } else if (rdbFileBeingLoaded) {
-        /* If we're loading an rdb file form disk, run rdb check (and exit) */
+        /* 如果正在从磁盘加载 rdb 文件，则运行 rdb 检查（并退出） */
         serverLog(LL_WARNING, "%s", msg);
         char *argv[2] = {"",rdbFileBeingLoaded};
         if (anetIsFifo(argv[1])) {
-            /* Cannot check RDB FIFO because we cannot reopen the FIFO and check already streamed data. */
+            /* 无法检查 RDB FIFO，因为我们无法重新打开 FIFO 并检查已经流式传输的数据 */
             rdbCheckError("Cannot check RDB that is a FIFO: %s", argv[1]);
             return;
         }
         redis_check_rdb_main(2,argv,NULL);
     } else if (corruption_error) {
-        /* In diskless loading, in case of corrupt file, log and exit. */
+        /* 在无盘加载中，遇到文件损坏时，记录日志并退出 */
         serverLog(LL_WARNING, "%s. Failure loading rdb format", msg);
     } else {
-        /* In diskless loading, in case of a short read (not a corrupt
-         * file), log and proceed (don't exit). */
+        /* 在无盘加载中，遇到短读（非文件损坏），
+         * 记录日志后继续运行（不退出） */
         serverLog(LL_WARNING, "%s. Failure loading rdb format from socket, assuming connection error, resuming operation.", msg);
         return;
     }
@@ -86,92 +86,92 @@ void rdbReportError(int corruption_error, int linenum, char *reason, ...) {
     exit(1);
 }
 
+/* 将原始字节写入 RDB 流。
+ * 出错时返回 -1，成功时返回写入的字节数。 */
 ssize_t rdbWriteRaw(rio *rdb, void *p, size_t len) {
     if (rdb && rioWrite(rdb,p,len) == 0)
         return -1;
     return len;
 }
 
+/* 向 RDB 流写入一个"类型"字节（单字节无符号整数）。
+ * 成功返回写入字节数，失败返回 -1。 */
 int rdbSaveType(rio *rdb, unsigned char type) {
     return rdbWriteRaw(rdb,&type,1);
 }
 
-/* Load a "type" in RDB format, that is a one byte unsigned integer.
- * This function is not only used to load object types, but also special
- * "types" like the end-of-file type, the EXPIRE type, and so forth. */
+/* 从 RDB 格式中加载一个"类型"，即一个单字节无符号整数。
+ * 此函数不仅用于加载对象类型，还用于加载特殊的"类型"，
+ * 如文件结束类型、EXPIRE 类型等。 */
 int rdbLoadType(rio *rdb) {
     unsigned char type;
     if (rioRead(rdb,&type,1) == 0) return -1;
     return type;
 }
 
-/* This is only used to load old databases stored with the RDB_OPCODE_EXPIRETIME
- * opcode. New versions of Redis store using the RDB_OPCODE_EXPIRETIME_MS
- * opcode. On error -1 is returned, however this could be a valid time, so
- * to check for loading errors the caller should call rioGetReadError() after
- * calling this function. */
+/* 此函数仅用于加载使用 RDB_OPCODE_EXPIRETIME 操作码存储的旧数据库。
+ * 新版本 Redis 使用 RDB_OPCODE_EXPIRETIME_MS 操作码存储。
+ * 出错时返回 -1，但这本身可能是一个有效时间，因此
+ * 调用者应在调用此函数后通过 rioGetReadError() 检查读取错误。 */
 time_t rdbLoadTime(rio *rdb) {
     int32_t t32;
     if (rioRead(rdb,&t32,4) == 0) return -1;
     return (time_t)t32;
 }
 
+/* 以小端格式保存毫秒级时间戳（8 字节 int64_t）。 */
 ssize_t rdbSaveMillisecondTime(rio *rdb, long long t) {
     int64_t t64 = (int64_t) t;
     memrev64ifbe(&t64); /* Store in little endian. */
     return rdbWriteRaw(rdb,&t64,8);
 }
 
-/* This function loads a time from the RDB file. It gets the version of the
- * RDB because, unfortunately, before Redis 5 (RDB version 9), the function
- * failed to convert data to/from little endian, so RDB files with keys having
- * expires could not be shared between big endian and little endian systems
- * (because the expire time will be totally wrong). The fix for this is just
- * to call memrev64ifbe(), however if we fix this for all the RDB versions,
- * this call will introduce an incompatibility for big endian systems:
- * after upgrading to Redis version 5 they will no longer be able to load their
- * own old RDB files. Because of that, we instead fix the function only for new
- * RDB versions, and load older RDB versions as we used to do in the past,
- * allowing big endian systems to load their own old RDB files.
+/* 此函数从 RDB 文件中加载时间。它会读取 RDB 的版本，
+ * 因为在 Redis 5（RDB 版本 9）之前，此函数未能正确地在
+ * 大小端之间转换数据，因此带有过期键的 RDB 文件无法在
+ * 大端和小端系统之间共享（因为过期时间会完全错误）。
+ * 修复方法就是调用 memrev64ifbe()，但如果对所有 RDB 版本
+ * 都进行此修复，会对大端系统引入不兼容性：
+ * 升级到 Redis 5 后，大端系统将无法再加载它们自己的旧 RDB 文件。
+ * 因此，我们只对新 RDB 版本应用此修复，而旧 RDB 版本
+ * 仍按过去的方式加载，从而允许大端系统加载它们自己的旧 RDB 文件。
  *
- * On I/O error the function returns LLONG_MAX, however if this is also a
- * valid stored value, the caller should use rioGetReadError() to check for
- * errors after calling this function. */
+ * 发生 I/O 错误时函数返回 LLONG_MAX，但如果这本身也是一个
+ * 有效存储值，调用者应在调用此函数后使用 rioGetReadError() 检查错误。 */
 long long rdbLoadMillisecondTime(rio *rdb, int rdbver) {
     int64_t t64;
     if (rioRead(rdb,&t64,8) == 0) return LLONG_MAX;
-    if (rdbver >= 9) /* Check the top comment of this function. */
-        memrev64ifbe(&t64); /* Convert in big endian if the system is BE. */
+    if (rdbver >= 9) /* 参考本函数顶部的注释 */
+        memrev64ifbe(&t64); /* 如果系统是大端，则转换为大端 */
     return (long long)t64;
 }
 
-/* Saves an encoded length. The first two bits in the first byte are used to
- * hold the encoding type. See the RDB_* definitions for more information
- * on the types of encoding. */
+/* 以编码格式保存一个长度。第一个字节的高 2 位用于保存编码类型。
+ * 有关编码类型的更多信息，请参阅 RDB_* 定义。 */
 int rdbSaveLen(rio *rdb, uint64_t len) {
     unsigned char buf[2];
     size_t nwritten;
 
     if (len < (1<<6)) {
-        /* Save a 6 bit len */
+        /* 保存 6 位长度 */
         buf[0] = (len&0xFF)|(RDB_6BITLEN<<6);
         if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         nwritten = 1;
     } else if (len < (1<<14)) {
-        /* Save a 14 bit len */
+        /* 保存 14 位长度 */
         buf[0] = ((len>>8)&0xFF)|(RDB_14BITLEN<<6);
         buf[1] = len&0xFF;
         if (rdbWriteRaw(rdb,buf,2) == -1) return -1;
         nwritten = 2;
     } else if (len <= UINT32_MAX) {
-        /* Save a 32 bit len */
+        /* 保存 32 位长度 */
         buf[0] = RDB_32BITLEN;
         if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         uint32_t len32 = htonl(len);
         if (rdbWriteRaw(rdb,&len32,4) == -1) return -1;
         nwritten = 1+4;
     } else {
-        /* Save a 64 bit len */
+        /* 保存 64 位长度 */
         buf[0] = RDB_64BITLEN;
         if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         len = htonu64(len);
@@ -182,15 +182,13 @@ int rdbSaveLen(rio *rdb, uint64_t len) {
 }
 
 
-/* Load an encoded length. If the loaded length is a normal length as stored
- * with rdbSaveLen(), the read length is set to '*lenptr'. If instead the
- * loaded length describes a special encoding that follows, then '*isencoded'
- * is set to 1 and the encoding format is stored at '*lenptr'.
+/* 加载一个编码后的长度。如果加载到的长度是用 rdbSaveLen() 存储的普通长度，
+ * 则读取的长度设置到 '*lenptr'。如果加载到的长度描述的是后续的特殊编码，
+ * 则将 '*isencoded' 置为 1，并将编码格式存储到 '*lenptr'。
  *
- * See the RDB_ENC_* definitions in rdb.h for more information on special
- * encodings.
+ * 有关特殊编码的更多信息，请参阅 rdb.h 中的 RDB_ENC_* 定义。
  *
- * The function returns -1 on error, 0 on success. */
+ * 出错时函数返回 -1，成功时返回 0。 */
 int rdbLoadLenByRef(rio *rdb, int *isencoded, uint64_t *lenptr) {
     unsigned char buf[2];
     int type;
@@ -199,38 +197,36 @@ int rdbLoadLenByRef(rio *rdb, int *isencoded, uint64_t *lenptr) {
     if (rioRead(rdb,buf,1) == 0) return -1;
     type = (buf[0]&0xC0)>>6;
     if (type == RDB_ENCVAL) {
-        /* Read a 6 bit encoding type. */
+        /* 读取一个 6 位的编码类型 */
         if (isencoded) *isencoded = 1;
         *lenptr = buf[0]&0x3F;
     } else if (type == RDB_6BITLEN) {
-        /* Read a 6 bit len. */
+        /* 读取 6 位长度 */
         *lenptr = buf[0]&0x3F;
     } else if (type == RDB_14BITLEN) {
-        /* Read a 14 bit len. */
+        /* 读取 14 位长度 */
         if (rioRead(rdb,buf+1,1) == 0) return -1;
         *lenptr = ((buf[0]&0x3F)<<8)|buf[1];
     } else if (buf[0] == RDB_32BITLEN) {
-        /* Read a 32 bit len. */
+        /* 读取 32 位长度 */
         uint32_t len;
         if (rioRead(rdb,&len,4) == 0) return -1;
         *lenptr = ntohl(len);
     } else if (buf[0] == RDB_64BITLEN) {
-        /* Read a 64 bit len. */
+        /* 读取 64 位长度 */
         uint64_t len;
         if (rioRead(rdb,&len,8) == 0) return -1;
         *lenptr = ntohu64(len);
     } else {
         rdbReportCorruptRDB(
             "Unknown length encoding %d in rdbLoadLen()",type);
-        return -1; /* Never reached. */
+        return -1; /* 不会执行到这里 */
     }
     return 0;
 }
 
-/* This is like rdbLoadLenByRef() but directly returns the value read
- * from the RDB stream, signaling an error by returning RDB_LENERR
- * (since it is a too large count to be applicable in any Redis data
- * structure). */
+/* 该函数类似 rdbLoadLenByRef()，但直接返回从 RDB 流读取的值，
+ * 出错时返回 RDB_LENERR（因为这个值过大，无法应用于任何 Redis 数据结构）。 */
 uint64_t rdbLoadLen(rio *rdb, int *isencoded) {
     uint64_t len;
 
@@ -238,10 +234,9 @@ uint64_t rdbLoadLen(rio *rdb, int *isencoded) {
     return len;
 }
 
-/* Encodes the "value" argument as integer when it fits in the supported ranges
- * for encoded types. If the function successfully encodes the integer, the
- * representation is stored in the buffer pointer to by "enc" and the string
- * length is returned. Otherwise 0 is returned. */
+/* 当"value"参数可被编码类型的支持范围容纳时，将其编码为整数。
+ * 若成功编码整数，则表示存储到由 "enc" 指向的缓冲区中并返回字符串长度。
+ * 否则返回 0。 */
 int rdbEncodeInteger(long long value, unsigned char *enc) {
     if (value >= -(1<<7) && value <= (1<<7)-1) {
         enc[0] = (RDB_ENCVAL<<6)|RDB_ENC_INT8;
@@ -264,9 +259,8 @@ int rdbEncodeInteger(long long value, unsigned char *enc) {
     }
 }
 
-/* Loads an integer-encoded object with the specified encoding type "enctype".
- * The returned value changes according to the flags, see
- * rdbGenericLoadStringObject() for more info. */
+/* 加载一个以整数编码的对象，指定的编码类型为 "enctype"。
+ * 返回值根据 flags 而变化，详见 rdbGenericLoadStringObject()。 */
 void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
     int plainFlag = flags & RDB_LOAD_PLAIN;
     int sdsFlag = flags & RDB_LOAD_SDS;
@@ -316,9 +310,9 @@ void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
     }
 }
 
-/* String objects in the form "2391" "-100" without any space and with a
- * range of values that can fit in an 8, 16 or 32 bit signed value can be
- * encoded as integers to save space */
+/* 形如 "2391" "-100" 这种不带任何空格的字符串对象，
+ * 且取值范围可容纳在 8、16 或 32 位有符号整数内时，
+ * 可以被编码为整数以节省空间。 */
 int rdbTryIntegerEncoding(char *s, size_t len, unsigned char *enc) {
     long long value;
     if (string2ll(s, len, &value)) {
@@ -328,12 +322,15 @@ int rdbTryIntegerEncoding(char *s, size_t len, unsigned char *enc) {
     }
 }
 
+/* 将已压缩的 LZF 数据块写入 RDB 流。
+ * 写入格式：[ENC_LZF 类型][压缩长度][原始长度][压缩数据]
+ * 出错时返回 -1，成功时返回写入的字节数。 */
 ssize_t rdbSaveLzfBlob(rio *rdb, void *data, size_t compress_len,
                        size_t original_len) {
     unsigned char byte;
     ssize_t n, nwritten = 0;
 
-    /* Data compressed! Let's save it on disk */
+    /* 数据已被压缩！将其保存到磁盘上 */
     byte = (RDB_ENCVAL<<6)|RDB_ENC_LZF;
     if ((n = rdbWriteRaw(rdb,&byte,1)) == -1) goto writeerr;
     nwritten += n;
@@ -353,11 +350,14 @@ writeerr:
     return -1;
 }
 
+/* 尝试对字符串进行 LZF 压缩后保存到 RDB。
+ * 若字符串长度 <= 4 或压缩无效则返回 0，
+ * 成功时返回写入字节数，出错返回 -1。 */
 ssize_t rdbSaveLzfStringObject(rio *rdb, unsigned char *s, size_t len) {
     size_t comprlen, outlen;
     void *out;
 
-    /* We require at least four bytes compression for this to be worth it */
+    /* 我们要求至少能压缩 4 字节，否则压缩不值得 */
     if (len <= 4) return 0;
     outlen = len-4;
     if ((out = zmalloc(outlen+1)) == NULL) return 0;
@@ -371,9 +371,9 @@ ssize_t rdbSaveLzfStringObject(rio *rdb, unsigned char *s, size_t len) {
     return nwritten;
 }
 
-/* Load an LZF compressed string in RDB format. The returned value
- * changes according to 'flags'. For more info check the
- * rdbGenericLoadStringObject() function. */
+/* 从 RDB 格式中加载一个 LZF 压缩字符串。
+ * 返回值根据 'flags' 而变化，更多信息请参阅
+ * rdbGenericLoadStringObject() 函数。 */
 void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     int plainFlag = flags & RDB_LOAD_PLAIN;
     int sdsFlag = flags & RDB_LOAD_SDS;
@@ -391,7 +391,7 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
         goto err;
     }
 
-    /* Allocate our target according to the uncompressed size. */
+    /* 根据解压缩后的大小分配目标缓冲区 */
     if (plainFlag) {
         val = ztrymalloc(len);
     } else if (sdsFlag || robjFlag) {
@@ -407,7 +407,7 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
 
     if (lenptr) *lenptr = len;
 
-    /* Load the compressed representation and uncompress it to target. */
+    /* 加载压缩表示并将其解压缩到目标缓冲区 */
     if (rioRead(rdb,c,clen) == 0) goto err;
     if (lzf_decompress(c,clen,val,len) != len) {
         rdbReportCorruptRDB("Invalid LZF compressed string");
@@ -429,13 +429,13 @@ err:
     return NULL;
 }
 
-/* Save a string object as [len][data] on disk. If the object is a string
- * representation of an integer value we try to save it in a special form */
+/* 将字符串对象以 [len][data] 形式保存到磁盘。
+ * 如果该对象是整数值的字符串表示形式，则尝试以特殊形式保存 */
 ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
     int enclen;
     ssize_t n, nwritten = 0;
 
-    /* Try integer encoding */
+    /* 尝试整数编码 */
     if (len <= 11) {
         unsigned char buf[5];
         if ((enclen = rdbTryIntegerEncoding((char*)s,len,buf)) > 0) {
@@ -444,16 +444,16 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
         }
     }
 
-    /* Try LZF compression - under 20 bytes it's unable to compress even
-     * aaaaaaaaaaaaaaaaaa so skip it */
+    /* 尝试 LZF 压缩 - 20 字节以下即使压缩 aaaaaaaaaaaaaaaaaa 也无法成功，
+     * 因此跳过 */
     if (server.rdb_compression && len > 20) {
         n = rdbSaveLzfStringObject(rdb,s,len);
         if (n == -1) return -1;
         if (n > 0) return n;
-        /* Return value of 0 means data can't be compressed, save the old way */
+        /* 返回值为 0 表示数据无法压缩，按原方式保存 */
     }
 
-    /* Store verbatim */
+    /* 按原样存储 */
     if ((n = rdbSaveLen(rdb,len)) == -1) return -1;
     nwritten += n;
     if (len > 0) {
@@ -463,7 +463,7 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
     return nwritten;
 }
 
-/* Save a long long value as either an encoded string or a string. */
+/* 将一个 long long 值保存为编码字符串或普通字符串 */
 ssize_t rdbSaveLongLongAsStringObject(rio *rdb, long long value) {
     unsigned char buf[32];
     ssize_t n, nwritten = 0;
@@ -471,7 +471,7 @@ ssize_t rdbSaveLongLongAsStringObject(rio *rdb, long long value) {
     if (enclen > 0) {
         return rdbWriteRaw(rdb,buf,enclen);
     } else {
-        /* Encode as string */
+        /* 编码为字符串 */
         enclen = ll2string((char*)buf,32,value);
         serverAssert(enclen < 32);
         if ((n = rdbSaveLen(rdb,enclen)) == -1) return -1;
@@ -482,10 +482,9 @@ ssize_t rdbSaveLongLongAsStringObject(rio *rdb, long long value) {
     return nwritten;
 }
 
-/* Like rdbSaveRawString() gets a Redis object instead. */
+/* 类似 rdbSaveRawString()，但传入的是一个 Redis 对象 */
 ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
-    /* Avoid to decode the object, then encode it again, if the
-     * object is already integer encoded. */
+    /* 如果对象已经是整数编码，则避免先解码再重新编码 */
     if (obj->encoding == OBJ_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
     } else {
@@ -494,20 +493,19 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
     }
 }
 
-/* Load a string object from an RDB file according to flags:
+/* 根据 flags 从 RDB 文件中加载字符串对象：
  *
- * RDB_LOAD_NONE (no flags): load an RDB object, unencoded.
- * RDB_LOAD_ENC: If the returned type is a Redis object, try to
- *               encode it in a special way to be more memory
- *               efficient. When this flag is passed the function
- *               no longer guarantees that obj->ptr is an SDS string.
- * RDB_LOAD_PLAIN: Return a plain string allocated with zmalloc()
- *                 instead of a Redis object with an sds in it.
- * RDB_LOAD_SDS: Return an SDS string instead of a Redis object.
- * RDB_LOAD_HFLD: Return a hash field object (mstr)
- * RDB_LOAD_HFLD_TTL: Return a hash field with TTL metadata reserved
+ * RDB_LOAD_NONE (无标志)：加载一个未编码的 RDB 对象。
+ * RDB_LOAD_ENC: 如果返回类型是 Redis 对象，则尝试以特殊方式
+ *               编码以提高内存效率。当传入此标志时，函数不再
+ *               保证 obj->ptr 是 SDS 字符串。
+ * RDB_LOAD_PLAIN: 返回用 zmalloc() 分配的普通字符串，
+ *                 而不是包含 sds 的 Redis 对象。
+ * RDB_LOAD_SDS: 返回 SDS 字符串，而不是 Redis 对象。
+ * RDB_LOAD_HFLD: 返回 hash 字段对象 (mstr)
+ * RDB_LOAD_HFLD_TTL: 返回保留 TTL 元数据的 hash 字段
  *
- * On I/O error NULL is returned.
+ * 发生 I/O 错误时返回 NULL。
  */
 void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     void *buf;
@@ -536,7 +534,7 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         }
     }
 
-    /* return robj */
+    /* 返回 robj */
     if (robjFlag) {
         robj *o = tryCreateStringObject(SDS_NOINIT,len);
         if (!o) {
@@ -577,21 +575,22 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     return buf;
 }
 
+/* 从 RDB 加载字符串对象（未编码版本）。 */
 robj *rdbLoadStringObject(rio *rdb) {
     return rdbGenericLoadStringObject(rdb,RDB_LOAD_NONE,NULL);
 }
 
+/* 从 RDB 加载字符串对象（尝试使用特殊编码以节省内存）。 */
 robj *rdbLoadEncodedStringObject(rio *rdb) {
     return rdbGenericLoadStringObject(rdb,RDB_LOAD_ENC,NULL);
 }
 
-/* Save a double value. Doubles are saved as strings prefixed by an unsigned
- * 8 bit integer specifying the length of the representation.
- * This 8 bit integer has special values in order to specify the following
- * conditions:
- * 253: not a number
- * 254: + inf
- * 255: - inf
+/* 保存一个 double 值。double 值以前缀为一个 8 位无符号整数
+ * （指定表示长度）的字符串形式保存。
+ * 该 8 位整数具有特殊值以表示以下情况：
+ * 253：非数字 (NaN)
+ * 254：+inf
+ * 255：-inf
  */
 ssize_t rdbSaveDoubleValue(rio *rdb, double val) {
     unsigned char buf[128];
@@ -605,7 +604,7 @@ ssize_t rdbSaveDoubleValue(rio *rdb, double val) {
         buf[0] = (val < 0) ? 255 : 254;
     } else {
         long long lvalue;
-        /* Integer printing function is much faster, check if we can safely use it. */
+        /* 整数打印函数快得多，检查是否可以安全使用 */
         if (double2ll(val, &lvalue))
             ll2string((char*)buf+1,sizeof(buf)-1,lvalue);
         else {
@@ -618,7 +617,7 @@ ssize_t rdbSaveDoubleValue(rio *rdb, double val) {
     return rdbWriteRaw(rdb,buf,len);
 }
 
-/* For information about double serialization check rdbSaveDoubleValue() */
+/* 关于 double 序列化的详细信息，请参阅 rdbSaveDoubleValue() */
 int rdbLoadDoubleValue(rio *rdb, double *val) {
     char buf[256];
     unsigned char len;
@@ -636,38 +635,37 @@ int rdbLoadDoubleValue(rio *rdb, double *val) {
     }
 }
 
-/* Saves a double for RDB 8 or greater, where IE754 binary64 format is assumed.
- * We just make sure the integer is always stored in little endian, otherwise
- * the value is copied verbatim from memory to disk.
+/* 为 RDB 8 或更高版本保存 double 值，假定采用 IE754 binary64 格式。
+ * 我们只需确保始终以小端存储，否则直接将值从内存原样拷贝到磁盘。
  *
- * Return -1 on error, the size of the serialized value on success. */
+ * 出错时返回 -1，成功时返回序列化值的大小。 */
 int rdbSaveBinaryDoubleValue(rio *rdb, double val) {
     memrev64ifbe(&val);
     return rdbWriteRaw(rdb,&val,sizeof(val));
 }
 
-/* Loads a double from RDB 8 or greater. See rdbSaveBinaryDoubleValue() for
- * more info. On error -1 is returned, otherwise 0. */
+/* 从 RDB 8 或更高版本加载 double。更多信息请参阅 rdbSaveBinaryDoubleValue()。
+ * 出错时返回 -1，否则返回 0。 */
 int rdbLoadBinaryDoubleValue(rio *rdb, double *val) {
     if (rioRead(rdb,val,sizeof(*val)) == 0) return -1;
     memrev64ifbe(val);
     return 0;
 }
 
-/* Like rdbSaveBinaryDoubleValue() but single precision. */
+/* 类似 rdbSaveBinaryDoubleValue()，但使用单精度 */
 int rdbSaveBinaryFloatValue(rio *rdb, float val) {
     memrev32ifbe(&val);
     return rdbWriteRaw(rdb,&val,sizeof(val));
 }
 
-/* Like rdbLoadBinaryDoubleValue() but single precision. */
+/* 类似 rdbLoadBinaryDoubleValue()，但使用单精度 */
 int rdbLoadBinaryFloatValue(rio *rdb, float *val) {
     if (rioRead(rdb,val,sizeof(*val)) == 0) return -1;
     memrev32ifbe(val);
     return 0;
 }
 
-/* Save the object type of object "o". */
+/* 保存对象 "o" 的对象类型 */
 int rdbSaveObjectType(rio *rdb, robj *o) {
     switch (o->type) {
     case OBJ_STRING:
@@ -712,11 +710,11 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
     default:
         serverPanic("Unknown object type");
     }
-    return -1; /* avoid warning */
+    return -1; /* 避免编译器警告 */
 }
 
-/* Use rdbLoadType() to load a TYPE in RDB format, but returns -1 if the
- * type is not specifically a valid Object Type. */
+/* 使用 rdbLoadType() 从 RDB 格式加载一个 TYPE，但如果该类型
+ * 不是有效的对象类型，则返回 -1 */
 int rdbLoadObjectType(rio *rdb) {
     int type;
     if ((type = rdbLoadType(rdb)) == -1) return -1;
@@ -724,27 +722,25 @@ int rdbLoadObjectType(rio *rdb) {
     return type;
 }
 
-/* This helper function serializes a consumer group Pending Entries List (PEL)
- * into the RDB file. The 'nacks' argument tells the function if also persist
- * the information about the not acknowledged message, or if to persist
- * just the IDs: this is useful because for the global consumer group PEL
- * we serialized the NACKs as well, but when serializing the local consumer
- * PELs we just add the ID, that will be resolved inside the global PEL to
- * put a reference to the same structure. */
+/* 此辅助函数将消费者组的待处理条目列表 (PEL) 序列化到 RDB 文件。
+ * 'nacks' 参数告诉函数是否同时持久化未确认消息的信息，
+ * 还是仅持久化 ID：这是有用的，因为对于全局消费者组 PEL，
+ * 我们同时也序列化 NACK；而在序列化本地消费者 PEL 时仅添加 ID，
+ * 这些 ID 将在全局 PEL 内部被解析以引用同一结构。 */
 ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
     ssize_t n, nwritten = 0;
 
-    /* Number of entries in the PEL. */
+    /* PEL 中的条目数 */
     if ((n = rdbSaveLen(rdb,raxSize(pel))) == -1) return -1;
     nwritten += n;
 
-    /* Save each entry. */
+    /* 保存每个条目 */
     raxIterator ri;
     raxStart(&ri,pel);
     raxSeek(&ri,"^",NULL,0);
     while(raxNext(&ri)) {
-        /* We store IDs in raw form as 128 big big endian numbers, like
-         * they are inside the radix tree key. */
+        /* 我们以原始 128 位大端数形式存储 ID，
+         * 就像它们在 radix tree 键中那样。 */
         if ((n = rdbWriteRaw(rdb,ri.key,sizeof(streamID))) == -1) {
             raxStop(&ri);
             return -1;
@@ -763,57 +759,55 @@ ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
                 return -1;
             }
             nwritten += n;
-            /* We don't save the consumer name: we'll save the pending IDs
-             * for each consumer in the consumer PEL, and resolve the consumer
-             * at loading time. */
+            /* 我们不保存消费者名称：我们将在消费者 PEL 中保存
+             * 每个消费者的待处理 ID，并在加载时解析消费者。 */
         }
     }
     raxStop(&ri);
     return nwritten;
 }
 
-/* Serialize the consumers of a stream consumer group into the RDB. Helper
- * function for the stream data type serialization. What we do here is to
- * persist the consumer metadata, and it's PEL, for each consumer. */
+/* 将 stream 消费者组中的消费者序列化到 RDB。
+ * stream 数据类型序列化的辅助函数。此处我们对每个消费者
+ * 持久化其元数据及其 PEL。 */
 size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
     ssize_t n, nwritten = 0;
 
-    /* Number of consumers in this consumer group. */
+    /* 此消费者组中的消费者数量 */
     if ((n = rdbSaveLen(rdb,raxSize(cg->consumers))) == -1) return -1;
     nwritten += n;
 
-    /* Save each consumer. */
+    /* 保存每个消费者 */
     raxIterator ri;
     raxStart(&ri,cg->consumers);
     raxSeek(&ri,"^",NULL,0);
     while(raxNext(&ri)) {
         streamConsumer *consumer = ri.data;
 
-        /* Consumer name. */
+        /* 消费者名称 */
         if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) {
             raxStop(&ri);
             return -1;
         }
         nwritten += n;
 
-        /* Seen time. */
+        /* seen_time */
         if ((n = rdbSaveMillisecondTime(rdb,consumer->seen_time)) == -1) {
             raxStop(&ri);
             return -1;
         }
         nwritten += n;
 
-        /* Active time. */
+        /* active_time */
         if ((n = rdbSaveMillisecondTime(rdb,consumer->active_time)) == -1) {
             raxStop(&ri);
             return -1;
         }
         nwritten += n;
 
-        /* Consumer PEL, without the ACKs (see last parameter of the function
-         * passed with value of 0), at loading time we'll lookup the ID
-         * in the consumer group global PEL and will put a reference in the
-         * consumer local PEL. */
+        /* 消费者 PEL，不包含 ACK（请参见函数最后一个参数取值为 0），
+         * 在加载时我们将在消费者组的全局 PEL 中查找 ID，
+         * 并在消费者本地 PEL 中放置一个引用。 */
         if ((n = rdbSaveStreamPEL(rdb,consumer->pel,0)) == -1) {
             raxStop(&ri);
             return -1;
@@ -824,17 +818,17 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
     return nwritten;
 }
 
-/* Save a Redis object.
- * Returns -1 on error, number of bytes written on success. */
+/* 保存一个 Redis 对象。
+ * 出错时返回 -1，成功时返回写入的字节数。 */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
     ssize_t n = 0, nwritten = 0;
 
     if (o->type == OBJ_STRING) {
-        /* Save a string value */
+        /* 保存字符串值 */
         if ((n = rdbSaveStringObject(rdb,o)) == -1) return -1;
         nwritten += n;
     } else if (o->type == OBJ_LIST) {
-        /* Save a list value */
+        /* 保存列表值 */
         if (o->encoding == OBJ_ENCODING_QUICKLIST) {
             quicklist *ql = o->ptr;
             quicklistNode *node = ql->head;
@@ -860,7 +854,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *lp = o->ptr;
 
-            /* Save list listpack as a fake quicklist that only has a single node. */
+            /* 将 list listpack 存为只有一个节点的伪 quicklist */
             if ((n = rdbSaveLen(rdb,1)) == -1) return -1;
             nwritten += n;
             if ((n = rdbSaveLen(rdb,QUICKLIST_NODE_CONTAINER_PACKED)) == -1) return -1;
@@ -871,7 +865,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown list encoding");
         }
     } else if (o->type == OBJ_SET) {
-        /* Save a set value */
+        /* 保存集合值 */
         if (o->encoding == OBJ_ENCODING_HT) {
             dict *set = o->ptr;
             dictIterator *di = dictGetIterator(set);
@@ -907,7 +901,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown set encoding");
         }
     } else if (o->type == OBJ_ZSET) {
-        /* Save a sorted set value */
+        /* 保存有序集合值 */
         if (o->encoding == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char*)o->ptr);
 
@@ -920,12 +914,11 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             if ((n = rdbSaveLen(rdb,zsl->length)) == -1) return -1;
             nwritten += n;
 
-            /* We save the skiplist elements from the greatest to the smallest
-             * (that's trivial since the elements are already ordered in the
-             * skiplist): this improves the load process, since the next loaded
-             * element will always be the smaller, so adding to the skiplist
-             * will always immediately stop at the head, making the insertion
-             * O(1) instead of O(log(N)). */
+            /* 我们按从大到小的顺序保存 skiplist 元素
+             * （因为元素在 skiplist 中已经有序，所以这是显而易见的）：
+             * 这可以改进加载过程，因为接下来要加载的元素总是较小的，
+             * 因此向 skiplist 插入时总能立即停在表头，
+             * 使插入复杂度为 O(1) 而不是 O(log(N))。 */
             zskiplistNode *zn = zsl->tail;
             while (zn != NULL) {
                 if ((n = rdbSaveRawString(rdb,
@@ -943,14 +936,14 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown sorted set encoding");
         }
     } else if (o->type == OBJ_HASH) {
-        /* Save a hash value */
+        /* 保存哈希值 */
         if ((o->encoding == OBJ_ENCODING_LISTPACK) ||
             (o->encoding == OBJ_ENCODING_LISTPACK_EX))
         {
-            /* Save min/next HFE expiration time if needed */
+            /* 如果需要，保存 min/next HFE 过期时间 */
             if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
                 uint64_t minExpire = hashTypeGetMinExpire(o, 0);
-                /* if invalid time then save 0 */
+                /* 如果时间无效则保存 0 */
                 if (minExpire == EB_EXPIRE_TIME_INVALID)
                     minExpire = 0;
                 if (rdbSaveMillisecondTime(rdb, minExpire) == -1)
@@ -965,42 +958,41 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             int hashWithMeta = 0;  /* RDB_TYPE_HASH_METADATA */
             dictIterator *di = dictGetIterator(o->ptr);
             dictEntry *de;
-            /* Determine the hash layout to use based on the presence of at least
-             * one field with a valid TTL. If such a field exists, employ the
-             * RDB_TYPE_HASH_METADATA layout, including tuples of [ttl][field][value].
-             * Otherwise, use the standard RDB_TYPE_HASH layout containing only
-             * the tuples [field][value]. */
+            /* 根据是否存在至少一个带有效 TTL 的字段，
+             * 决定要使用的哈希布局。如果存在这样的字段，
+             * 则采用 RDB_TYPE_HASH_METADATA 布局，包含 [ttl][field][value] 元组。
+             * 否则使用标准的 RDB_TYPE_HASH 布局，仅包含 [field][value] 元组。 */
             uint64_t minExpire = hashTypeGetMinExpire(o, 1);
 
-            /* if RDB_TYPE_HASH_METADATA (Can have TTLs on fields) */
+            /* 如果是 RDB_TYPE_HASH_METADATA（字段上可以有 TTL） */
             if (minExpire != EB_EXPIRE_TIME_INVALID) {
                 hashWithMeta = 1;
-                /* Save next field expire time of hash */
+                /* 保存哈希的下一个字段过期时间 */
                 if (rdbSaveMillisecondTime(rdb, minExpire) == -1) {
                     dictReleaseIterator(di);
                     return -1;
                 }
             }
 
-            /* save number of fields in hash */
+            /* 保存哈希中的字段数 */
             if ((n = rdbSaveLen(rdb,dictSize((dict*)o->ptr))) == -1) {
                 dictReleaseIterator(di);
                 return -1;
             }
             nwritten += n;
 
-            /* save all hash fields */
+            /* 保存所有哈希字段 */
             while((de = dictNext(di)) != NULL) {
                 hfield field = dictGetKey(de);
                 sds value = dictGetVal(de);
 
-                /* save the TTL */
+                /* 保存 TTL */
                 if (hashWithMeta) {
                     uint64_t ttl, expiryTime= hfieldGetExpireTime(field);
 
-                    /* Saved TTL value:
-                     *  - 0: Indicates no TTL. This is common case so we keep it small.
-                     *  - Otherwise: TTL is relative to minExpire (with +1 to avoid 0 that already taken)
+                    /* 已保存的 TTL 值：
+                     *  - 0：表示无 TTL。这是常见情况，所以保持较小值。
+                     *  - 其他值：TTL 相对于 minExpire（+1 以避免与已使用的 0 冲突）
                      */
                     ttl = (expiryTime == EB_EXPIRE_TIME_INVALID) ? 0 : expiryTime - minExpire + 1;
                     if ((n = rdbSaveLen(rdb, ttl)) == -1) {
@@ -1010,7 +1002,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                     nwritten += n;
                 }
 
-                /* save the key */
+                /* 保存键 */
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)field,
                         hfieldlen(field))) == -1)
                 {
@@ -1019,7 +1011,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 }
                 nwritten += n;
 
-                /* save the value */
+                /* 保存值 */
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)value,
                         sdslen(value))) == -1)
                 {
@@ -1033,15 +1025,15 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown hash encoding");
         }
     } else if (o->type == OBJ_STREAM) {
-        /* Store how many listpacks we have inside the radix tree. */
+        /* 存储 radix tree 中有多少个 listpack */
         stream *s = o->ptr;
         rax *rax = s->rax;
         if ((n = rdbSaveLen(rdb,raxSize(rax))) == -1) return -1;
         nwritten += n;
 
-        /* Serialize all the listpacks inside the radix tree as they are,
-         * when loading back, we'll use the first entry of each listpack
-         * to insert it back into the radix tree. */
+        /* 按原样序列化 radix tree 中的所有 listpack，
+         * 加载时我们将使用每个 listpack 的第一个条目
+         * 重新插入到 radix tree 中。 */
         raxIterator ri;
         raxStart(&ri,rax);
         raxSeek(&ri,"^",NULL,0);
@@ -1061,53 +1053,52 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         }
         raxStop(&ri);
 
-        /* Save the number of elements inside the stream. We cannot obtain
-         * this easily later, since our macro nodes should be checked for
-         * number of items: not a great CPU / space tradeoff. */
+        /* 保存 stream 中的元素数量。我们之后无法轻松获取该值，
+         * 因为需要检查宏节点中条目数量：这不是一个很好的 CPU/空间折衷方案。 */
         if ((n = rdbSaveLen(rdb,s->length)) == -1) return -1;
         nwritten += n;
-        /* Save the last entry ID. */
+        /* 保存最后一个条目 ID */
         if ((n = rdbSaveLen(rdb,s->last_id.ms)) == -1) return -1;
         nwritten += n;
         if ((n = rdbSaveLen(rdb,s->last_id.seq)) == -1) return -1;
         nwritten += n;
-        /* Save the first entry ID. */
+        /* 保存第一个条目 ID */
         if ((n = rdbSaveLen(rdb,s->first_id.ms)) == -1) return -1;
         nwritten += n;
         if ((n = rdbSaveLen(rdb,s->first_id.seq)) == -1) return -1;
         nwritten += n;
-        /* Save the maximal tombstone ID. */
+        /* 保存最大的墓碑 ID */
         if ((n = rdbSaveLen(rdb,s->max_deleted_entry_id.ms)) == -1) return -1;
         nwritten += n;
         if ((n = rdbSaveLen(rdb,s->max_deleted_entry_id.seq)) == -1) return -1;
         nwritten += n;
-        /* Save the offset. */
+        /* 保存 offset */
         if ((n = rdbSaveLen(rdb,s->entries_added)) == -1) return -1;
         nwritten += n;
 
-        /* The consumer groups and their clients are part of the stream
-         * type, so serialize every consumer group. */
+        /* 消费者组及其客户端是 stream 类型的一部分，
+         * 因此需要序列化每个消费者组。 */
 
-        /* Save the number of groups. */
+        /* 保存消费者组的数量 */
         size_t num_cgroups = s->cgroups ? raxSize(s->cgroups) : 0;
         if ((n = rdbSaveLen(rdb,num_cgroups)) == -1) return -1;
         nwritten += n;
 
         if (num_cgroups) {
-            /* Serialize each consumer group. */
+            /* 序列化每个消费者组 */
             raxStart(&ri,s->cgroups);
             raxSeek(&ri,"^",NULL,0);
             while(raxNext(&ri)) {
                 streamCG *cg = ri.data;
 
-                /* Save the group name. */
+                /* 保存消费者组名称 */
                 if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) {
                     raxStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
-                /* Last ID. */
+                /* 最后 ID */
                 if ((n = rdbSaveLen(rdb,cg->last_id.ms)) == -1) {
                     raxStop(&ri);
                     return -1;
@@ -1118,22 +1109,22 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                     return -1;
                 }
                 nwritten += n;
-                
-                /* Save the group's logical reads counter. */
+
+                /* 保存消费者组的逻辑读取计数器 */
                 if ((n = rdbSaveLen(rdb,cg->entries_read)) == -1) {
                     raxStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
-                /* Save the global PEL. */
+                /* 保存全局 PEL */
                 if ((n = rdbSaveStreamPEL(rdb,cg->pel,1)) == -1) {
                     raxStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
-                /* Save the consumers of this group. */
+                /* 保存该消费者组的消费者 */
                 if ((n = rdbSaveStreamConsumers(rdb,cg)) == -1) {
                     raxStop(&ri);
                     return -1;
@@ -1143,19 +1134,18 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             raxStop(&ri);
         }
     } else if (o->type == OBJ_MODULE) {
-        /* Save a module-specific value. */
+        /* 保存模块特定的值 */
         RedisModuleIO io;
         moduleValue *mv = o->ptr;
         moduleType *mt = mv->type;
 
-        /* Write the "module" identifier as prefix, so that we'll be able
-         * to call the right module during loading. */
+        /* 写入 "module" 标识符作为前缀，以便加载时能够调用正确的模块 */
         int retval = rdbSaveLen(rdb,mt->id);
         if (retval == -1) return -1;
         moduleInitIOContext(io,mt,rdb,key,dbid);
         io.bytes += retval;
 
-        /* Then write the module-specific representation + EOF marker. */
+        /* 然后写入模块特定的表示 + EOF 标记 */
         mt->rdb_save(&io,mv->value);
         retval = rdbSaveLen(rdb,RDB_MODULE_OPCODE_EOF);
         if (retval == -1)
@@ -1174,62 +1164,61 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
     return nwritten;
 }
 
-/* Return the length the object will have on disk if saved with
- * the rdbSaveObject() function. Currently we use a trick to get
- * this length with very little changes to the code. In the future
- * we could switch to a faster solution. */
+/* 返回对象使用 rdbSaveObject() 保存时在磁盘上占用的长度。
+ * 目前我们使用一种小技巧来获取该长度，对代码的改动非常小。
+ * 将来我们可以切换到更快的方案。 */
 size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
     ssize_t len = rdbSaveObject(NULL,o,key,dbid);
     serverAssertWithInfo(NULL,o,len != -1);
     return len;
 }
 
-/* Save a key-value pair, with expire time, type, key, value.
- * On error -1 is returned.
- * On success if the key was actually saved 1 is returned. */
+/* 保存一个键值对，包括过期时间、类型、键、值。
+ * 出错时返回 -1。
+ * 成功时，如果键确实被保存，则返回 1。 */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
-    /* Save the expire time */
+    /* 保存过期时间 */
     if (expiretime != -1) {
         if (rdbSaveType(rdb,RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;
         if (rdbSaveMillisecondTime(rdb,expiretime) == -1) return -1;
     }
 
-    /* Save the LRU info. */
+    /* 保存 LRU 信息 */
     if (savelru) {
         uint64_t idletime = estimateObjectIdleTime(val);
-        idletime /= 1000; /* Using seconds is enough and requires less space.*/
+        idletime /= 1000; /* 使用秒为单位就足够了，且占用的空间更少 */
         if (rdbSaveType(rdb,RDB_OPCODE_IDLE) == -1) return -1;
         if (rdbSaveLen(rdb,idletime) == -1) return -1;
     }
 
-    /* Save the LFU info. */
+    /* 保存 LFU 信息 */
     if (savelfu) {
         uint8_t buf[1];
         buf[0] = LFUDecrAndReturn(val);
-        /* We can encode this in exactly two bytes: the opcode and an 8
-         * bit counter, since the frequency is logarithmic with a 0-255 range.
-         * Note that we do not store the halving time because to reset it
-         * a single time when loading does not affect the frequency much. */
+        /* 我们可以恰好用两个字节编码此信息：操作码和一个 8 位计数器，
+         * 因为频率采用对数刻度，范围为 0-255。
+         * 注意我们不存储减半时间，因为在加载时重置一次
+         * 不会对频率产生太大影响。 */
         if (rdbSaveType(rdb,RDB_OPCODE_FREQ) == -1) return -1;
         if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
     }
 
-    /* Save type, key, value */
+    /* 保存类型、键、值 */
     if (rdbSaveObjectType(rdb,val) == -1) return -1;
     if (rdbSaveStringObject(rdb,key) == -1) return -1;
     if (rdbSaveObject(rdb,val,key,dbid) == -1) return -1;
 
-    /* Delay return if required (for testing) */
+    /* 如果需要（用于测试），在返回前增加延时 */
     if (server.rdb_key_save_delay)
         debugDelay(server.rdb_key_save_delay);
 
     return 1;
 }
 
-/* Save an AUX field. */
+/* 保存一个 AUX 字段 */
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen) {
     ssize_t ret, len = 0;
     if ((ret = rdbSaveType(rdb,RDB_OPCODE_AUX)) == -1) return -1;
@@ -1241,31 +1230,30 @@ ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t va
     return len;
 }
 
-/* Wrapper for rdbSaveAuxField() used when key/val length can be obtained
- * with strlen(). */
+/* rdbSaveAuxField() 的封装，用于 key/val 长度可由 strlen() 获取的情况 */
 ssize_t rdbSaveAuxFieldStrStr(rio *rdb, char *key, char *val) {
     return rdbSaveAuxField(rdb,key,strlen(key),val,strlen(val));
 }
 
-/* Wrapper for strlen(key) + integer type (up to long long range). */
+/* strlen(key) + 整数类型（最大到 long long 范围）的封装 */
 ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val) {
     char buf[LONG_STR_SIZE];
     int vlen = ll2string(buf,sizeof(buf),val);
     return rdbSaveAuxField(rdb,key,strlen(key),buf,vlen);
 }
 
-/* Save a few default AUX fields with information about the RDB generated. */
+/* 保存一些默认的 AUX 字段，包含有关生成的 RDB 的信息 */
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void*) == 8) ? 64 : 32;
     int aof_base = (rdbflags & RDBFLAGS_AOF_PREAMBLE) != 0;
 
-    /* Add a few fields about the state when the RDB was created. */
+    /* 添加几个关于创建 RDB 时状态的字段 */
     if (rdbSaveAuxFieldStrStr(rdb,"redis-ver",REDIS_VERSION) == -1) return -1;
     if (rdbSaveAuxFieldStrInt(rdb,"redis-bits",redis_bits) == -1) return -1;
     if (rdbSaveAuxFieldStrInt(rdb,"ctime",time(NULL)) == -1) return -1;
     if (rdbSaveAuxFieldStrInt(rdb,"used-mem",zmalloc_used_memory()) == -1) return -1;
 
-    /* Handle saving options that generate aux fields. */
+    /* 处理会生成 aux 字段的保存选项 */
     if (rsi) {
         if (rdbSaveAuxFieldStrInt(rdb,"repl-stream-db",rsi->repl_stream_db)
             == -1) return -1;
@@ -1279,43 +1267,42 @@ int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
 }
 
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt) {
-    /* Save a module-specific aux value. */
+    /* 保存模块特定的 aux 值 */
     RedisModuleIO io;
     int retval = 0;
     moduleInitIOContext(io,mt,rdb,NULL,-1);
 
-    /* We save the AUX field header in a temporary buffer so we can support aux_save2 API.
-     * If aux_save2 is used the buffer will be flushed at the first time the module will perform
-     * a write operation to the RDB and will be ignored is case there was no writes. */
+    /* 我们将 AUX 字段头部保存在一个临时缓冲区中，
+     * 以便支持 aux_save2 API。如果使用了 aux_save2，
+     * 该缓冲区会在模块第一次对 RDB 执行写操作时被刷新，
+     * 且若模块未执行任何写操作则会被忽略。 */
     rio aux_save_headers_rio;
     rioInitWithBuffer(&aux_save_headers_rio, sdsempty());
 
     if (rdbSaveType(&aux_save_headers_rio, RDB_OPCODE_MODULE_AUX) == -1) goto error;
 
-    /* Write the "module" identifier as prefix, so that we'll be able
-     * to call the right module during loading. */
+    /* 写入 "module" 标识符作为前缀，以便加载时能够调用正确的模块 */
     if (rdbSaveLen(&aux_save_headers_rio,mt->id) == -1) goto error;
 
-    /* write the 'when' so that we can provide it on loading. add a UINT opcode
-     * for backwards compatibility, everything after the MT needs to be prefixed
-     * by an opcode. */
+    /* 写入 'when' 以便在加载时提供。为了向后兼容，添加一个 UINT 操作码，
+     * MT 之后的所有内容都需要以操作码作为前缀。 */
     if (rdbSaveLen(&aux_save_headers_rio,RDB_MODULE_OPCODE_UINT) == -1) goto error;
     if (rdbSaveLen(&aux_save_headers_rio,when) == -1) goto error;
 
-    /* Then write the module-specific representation + EOF marker. */
+    /* 然后写入模块特定的表示 + EOF 标记 */
     if (mt->aux_save2) {
         io.pre_flush_buffer = aux_save_headers_rio.io.buffer.ptr;
         mt->aux_save2(&io,when);
         if (io.pre_flush_buffer) {
-            /* aux_save did not save any data to the RDB.
-             * We will avoid saving any data related to this aux type
-             * to allow loading this RDB if the module is not present. */
+            /* aux_save 未将任何数据保存到 RDB。
+             * 我们将不保存与此 aux 类型相关的任何数据，
+             * 以便在模块不存在时也能加载该 RDB。 */
             sdsfree(io.pre_flush_buffer);
             io.pre_flush_buffer = NULL;
             return 0;
         }
     } else {
-        /* Write headers now, aux_save does not do lazy saving of the headers. */
+        /* 立即写入头部，aux_save 不会延迟保存头部 */
         retval = rdbWriteRaw(rdb, aux_save_headers_rio.io.buffer.ptr, sdslen(aux_save_headers_rio.io.buffer.ptr));
         if (retval == -1) goto error;
         io.bytes += retval;
@@ -1341,6 +1328,8 @@ error:
     return -1;
 }
 
+/* 将所有已注册的函数库序列化到 RDB 流。
+ * 成功返回写入字节数，出错返回 -1。 */
 ssize_t rdbSaveFunctions(rio *rdb) {
     dict *functions = functionsLibGet();
     dictIterator *iter = dictGetIterator(functions);
@@ -1362,6 +1351,9 @@ werr:
     return -1;
 }
 
+/* 将指定数据库的所有键值对序列化到 RDB 流。
+ * 包括 SELECTDB、RESIZEDB 操作码以及每个条目。
+ * 成功返回写入字节数，出错返回 -1。 */
 ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
     dictEntry *de;
     ssize_t written = 0;
@@ -1369,18 +1361,19 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
     kvstoreIterator *kvs_it = NULL;
     static long long info_updated_time = 0;
     char *pname = (rdbflags & RDBFLAGS_AOF_PREAMBLE) ? "AOF rewrite" :  "RDB";
+    /* 根据保存类型选择进度信息的前缀名称 */
 
     redisDb *db = server.db + dbid;
     unsigned long long int db_size = kvstoreSize(db->keys);
     if (db_size == 0) return 0;
 
-    /* Write the SELECT DB opcode */
+    /* 写入 SELECT DB 操作码 */
     if ((res = rdbSaveType(rdb,RDB_OPCODE_SELECTDB)) < 0) goto werr;
     written += res;
     if ((res = rdbSaveLen(rdb, dbid)) < 0) goto werr;
     written += res;
 
-    /* Write the RESIZE DB opcode. */
+    /* 写入 RESIZE DB 操作码 */
     unsigned long long expires_size = kvstoreSize(db->expires);
     if ((res = rdbSaveType(rdb,RDB_OPCODE_RESIZEDB)) < 0) goto werr;
     written += res;
@@ -1391,10 +1384,10 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
 
     kvs_it = kvstoreIteratorInit(db->keys);
     int last_slot = -1;
-    /* Iterate this DB writing every entry */
+    /* 遍历该数据库，写入每个条目 */
     while ((de = kvstoreIteratorNext(kvs_it)) != NULL) {
         int curr_slot = kvstoreIteratorGetCurrentDictIndex(kvs_it);
-        /* Save slot info. */
+        /* 保存 slot 信息 */
         if (server.cluster_enabled && curr_slot != last_slot) {
             if ((res = rdbSaveType(rdb, RDB_OPCODE_SLOT_INFO)) < 0) goto werr;
             written += res;
@@ -1416,15 +1409,15 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
         if ((res = rdbSaveKeyValuePair(rdb, &key, o, expire, dbid)) < 0) goto werr;
         written += res;
 
-        /* In fork child process, we can try to release memory back to the
-         * OS and possibly avoid or decrease COW. We give the dismiss
-         * mechanism a hint about an estimated size of the object we stored. */
+        /* 在 fork 出的子进程中，我们可以尝试将内存归还给 OS，
+         * 并可能避免或减少 COW。我们向 dismiss 机制提供
+         * 已存储对象估计大小的提示。 */
         size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
         if (server.in_fork_child) dismissObject(o, dump_size);
 
-        /* Update child info every 1 second (approximately).
-         * in order to avoid calling mstime() on each iteration, we will
-         * check the diff every 1024 keys */
+        /* 大约每 1 秒更新一次子进程信息。
+         * 为了避免在每次迭代中调用 mstime()，
+         * 我们每处理 1024 个键检查一次时间差 */
         if (((*key_counter)++ & 1023) == 0) {
             long long now = mstime();
             if (now - info_updated_time >= 1000) {
@@ -1441,14 +1434,12 @@ werr:
     return -1;
 }
 
-/* Produces a dump of the database in RDB format sending it to the specified
- * Redis I/O channel. On success C_OK is returned, otherwise C_ERR
- * is returned and part of the output, or all the output, can be
- * missing because of I/O errors.
+/* 以 RDB 格式生成数据库转储，并将其发送到指定的 Redis I/O 通道。
+ * 成功时返回 C_ERR，否则返回 C_OK；
+ * 由于 I/O 错误，部分或全部输出可能会丢失。
  *
- * When the function returns C_ERR and if 'error' is not NULL, the
- * integer pointed by 'error' is set to the value of errno just after the I/O
- * error. */
+ * 当函数返回 C_ERR 且 'error' 不为 NULL 时，
+ * 'error' 指向的整数将被设置为 I/O 错误发生后的 errno 值。 */
 int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     char magic[10];
     uint64_t cksum;
@@ -1462,10 +1453,10 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     if (rdbSaveInfoAuxFields(rdb,rdbflags,rsi) == -1) goto werr;
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_BEFORE_RDB) == -1) goto werr;
 
-    /* save functions */
+    /* 保存 functions */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) goto werr;
 
-    /* save all databases, skip this if we're in functions-only mode */
+    /* 保存所有数据库，如果处于仅函数模式则跳过此步骤 */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
         for (j = 0; j < server.dbnum; j++) {
             if (rdbSaveDb(rdb, j, rdbflags, &key_counter) == -1) goto werr;
@@ -1474,11 +1465,11 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
 
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
 
-    /* EOF opcode */
+    /* EOF 操作码 */
     if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
 
-    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
-     * loading code skips the check in this case. */
+    /* CRC64 校验和。如果禁用了校验和计算，其值将为零，
+     * 加载代码在这种情况下会跳过校验。 */
     cksum = rdb->cksum;
     memrev64ifbe(&cksum);
     if (rioWrite(rdb,&cksum,8) == 0) goto werr;
@@ -1489,15 +1480,14 @@ werr:
     return C_ERR;
 }
 
-/* This helper function is only used for diskless replication.
- * This is just a wrapper to rdbSaveRio() that additionally adds a prefix
- * and a suffix to the generated RDB dump. The prefix is:
+/* 此辅助函数仅用于无盘复制。
+ * 它只是 rdbSaveRio() 的一个包装，在生成的 RDB 转储上
+ * 额外添加前缀和后缀。前缀为：
  *
- * $EOF:<40 bytes unguessable hex string>\r\n
+ * $EOF:<40 字节不可猜测的十六进制字符串>\r\n
  *
- * While the suffix is the 40 bytes hex string we announced in the prefix.
- * This way processes receiving the payload can understand when it ends
- * without doing any processing of the content. */
+ * 后缀为我们在前缀中公布的 40 字节十六进制字符串。
+ * 这样接收负载的进程无需处理内容即可知道负载的结束位置。 */
 int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi) {
     char eofmark[RDB_EOF_MARK_SIZE];
 
@@ -1512,19 +1502,21 @@ int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi) {
     stopSaving(1);
     return C_OK;
 
-werr: /* Write error. */
-    /* Set 'error' only if not already set by rdbSaveRio() call. */
+werr: /* 写入错误 */
+    /* 仅当 rdbSaveRio() 调用尚未设置 'error' 时才设置它 */
     if (error && *error == 0) *error = errno;
     stopSaving(0);
     return C_ERR;
 }
 
+/* RDB 保存的内部实现。将数据库转储写入指定文件。
+ * 成功返回 C_OK，出错返回 C_ERR。 */
 static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
+    char cwd[MAXPATHLEN]; /* 用于错误消息的当前工作目录路径 */
     rio rdb;
     int error = 0;
     int saved_errno;
-    char *err_op;    /* For a detailed log */
+    char *err_op;    /* 用于详细日志 */
 
     FILE *fp = fopen(filename,"w");
     if (!fp) {
@@ -1544,6 +1536,7 @@ static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int 
     rioInitWithFile(&rdb,fp);
 
     if (server.rdb_save_incremental_fsync) {
+        /* 启用增量 fsync 以避免一次性写入大量数据导致延迟 */
         rioSetAutoSync(&rdb,REDIS_AUTOSYNC_BYTES);
         if (!(rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(&rdb,1);
     }
@@ -1554,7 +1547,7 @@ static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int 
         goto werr;
     }
 
-    /* Make sure data will not remain on the OS's output buffers */
+    /* 确保数据不会残留在 OS 的输出缓冲区中 */
     if (fflush(fp)) { err_op = "fflush"; goto werr; }
     if (fsync(fileno(fp))) { err_op = "fsync"; goto werr; }
     if (!(rdbflags & RDBFLAGS_KEEP_CACHE) && reclaimFilePageCache(fileno(fp), 0, 0) == -1) {
@@ -1573,10 +1566,11 @@ werr:
     return C_ERR;
 }
 
-/* Save DB to the file. Similar to rdbSave() but this function won't use a
- * temporary file and won't update the metrics. */
+/* 将 DB 保存到文件。类似于 rdbSave()，但此函数不使用临时文件，
+ * 也不会更新指标。 */
 int rdbSaveToFile(const char *filename) {
     startSaving(RDBFLAGS_NONE);
+    /* 通知模块保存开始 */
 
     if (rdbSaveInternal(SLAVE_REQ_NONE,filename,NULL,RDBFLAGS_NONE) != C_OK) {
         int saved_errno = errno;
@@ -1589,7 +1583,7 @@ int rdbSaveToFile(const char *filename) {
     return C_OK;
 }
 
-/* Save the DB on disk. Return C_ERR on error, C_OK on success. */
+/* 将 DB 保存到磁盘。出错返回 C_ERR，成功返回 C_OK。 */
 int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
@@ -1602,8 +1596,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         return C_ERR;
     }
     
-    /* Use RENAME to make sure the DB file is changed atomically only
-     * if the generate DB file is ok. */
+    /* 使用 RENAME 以确保仅当生成的 DB 文件正常时才原子地替换 DB 文件 */
     if (rename(tmpfile,filename) == -1) {
         char *str_err = strerror(errno);
         char *cwdp = getcwd(cwd,MAXPATHLEN);
@@ -1633,6 +1626,9 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     return C_OK;
 }
 
+/* 在后台子进程中执行 RDB 保存（BGSAVE）。
+ * 成功 fork 子进程返回 C_OK，出错返回 C_ERR。
+ * 子进程会将 RDB 写入 filename 指定的文件。 */
 int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
@@ -1669,23 +1665,23 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     return C_OK; /* unreached */
 }
 
-/* Note that we may call this function in signal handle 'sigShutdownHandler',
- * so we need guarantee all functions we call are async-signal-safe.
- * If we call this function from signal handle, we won't call bg_unlink that
- * is not async-signal-safe. */
+/* 注意我们可能在信号处理函数 'sigShutdownHandler' 中调用此函数，
+ * 因此需要保证我们调用的所有函数都是异步信号安全的。
+ * 如果从信号处理函数中调用此函数，我们将不会调用
+ * 非异步信号安全的 bg_unlink。 */
 void rdbRemoveTempFile(pid_t childpid, int from_signal) {
     char tmpfile[256];
     char pid[32];
 
-    /* Generate temp rdb file name using async-signal safe functions. */
+    /* 使用异步信号安全的函数生成临时 rdb 文件名 */
     ll2string(pid, sizeof(pid), childpid);
     redis_strlcpy(tmpfile, "temp-", sizeof(tmpfile));
     redis_strlcat(tmpfile, pid, sizeof(tmpfile));
     redis_strlcat(tmpfile, ".rdb", sizeof(tmpfile));
 
     if (from_signal) {
-        /* bg_unlink is not async-signal-safe, but in this case we don't really
-         * need to close the fd, it'll be released when the process exists. */
+        /* bg_unlink 不是异步信号安全的，但在这种情况下
+         * 我们并不真的需要关闭 fd，它会在进程退出时被释放。 */
         int fd = open(tmpfile, O_RDONLY|O_NONBLOCK);
         UNUSED(fd);
         unlink(tmpfile);
@@ -1694,10 +1690,10 @@ void rdbRemoveTempFile(pid_t childpid, int from_signal) {
     }
 }
 
-/* This function is called by rdbLoadObject() when the code is in RDB-check
- * mode and we find a module value of type 2 that can be parsed without
- * the need of the actual module. The value is parsed for errors, finally
- * a dummy redis object is returned just to conform to the API. */
+/* 当代码处于 RDB-check 模式且发现一个无需实际模块即可解析的
+ * type 2 模块值时，rdbLoadObject() 会调用此函数。
+ * 该值被解析以检查错误，最后返回一个虚拟的 redis 对象
+ * 以符合 API 要求。 */
 robj *rdbLoadCheckModuleValue(rio *rdb, char *modulename) {
     uint64_t opcode;
     while((opcode = rdbLoadLen(rdb,NULL)) != RDB_MODULE_OPCODE_EOF) {
@@ -1733,9 +1729,9 @@ robj *rdbLoadCheckModuleValue(rio *rdb, char *modulename) {
     return createStringObject("module-dummy-value",18);
 }
 
-/* callback for hashZiplistConvertAndValidateIntegrity.
- * Check that the ziplist doesn't have duplicate hash field names.
- * The ziplist element pointed by 'p' will be converted and stored into listpack. */
+/* hashZiplistConvertAndValidateIntegrity 的回调函数。
+ * 检查 ziplist 中没有重复的哈希字段名。
+ * 由 'p' 指向的 ziplist 元素将被转换并存储到 listpack 中。 */
 static int _ziplistPairsEntryConvertAndValidate(unsigned char *p, unsigned int head_count, void *userdata) {
     unsigned char *str;
     unsigned int slen;
@@ -1755,11 +1751,11 @@ static int _ziplistPairsEntryConvertAndValidate(unsigned char *p, unsigned int h
     if (!ziplistGet(p, &str, &slen, &vll))
         return 0;
 
-    /* Even records are field names, add to dict and check that's not a dup */
+    /* 偶数索引的记录是字段名，添加到字典并检查是否重复 */
     if (((data->count) & 1) == 0) {
         sds field = str? sdsnewlen(str, slen): sdsfromlonglong(vll);
         if (dictAdd(data->fields, field, NULL) != DICT_OK) {
-            /* Duplicate, return an error */
+            /* 重复，返回错误 */
             sdsfree(field);
             return 0;
         }
@@ -1775,10 +1771,9 @@ static int _ziplistPairsEntryConvertAndValidate(unsigned char *p, unsigned int h
     return 1;
 }
 
-/* Validate the integrity of the data structure while converting it to 
- * listpack and storing it at 'lp'.
- * The function is safe to call on non-validated ziplists, it returns 0
- * when encounter an integrity validation issue. */
+/* 在将数据结构转换为 listpack 并存储到 'lp' 的同时验证其完整性。
+ * 该函数可以安全地用于未经验证的 ziplist，
+ * 当遇到完整性验证问题时返回 0。 */
 int ziplistPairsConvertAndValidateIntegrity(unsigned char *zl, size_t size, unsigned char **lp) {
     /* Keep track of the field names to locate duplicate ones */
     struct {
@@ -1797,8 +1792,8 @@ int ziplistPairsConvertAndValidateIntegrity(unsigned char *zl, size_t size, unsi
     return ret;
 }
 
-/* callback for ziplistValidateIntegrity.
- * The ziplist element pointed by 'p' will be converted and stored into listpack. */
+/* ziplistValidateIntegrity 的回调函数。
+ * 由 'p' 指向的 ziplist 元素将被转换并存储到 listpack 中。 */
 static int _ziplistEntryConvertAndValidate(unsigned char *p, unsigned int head_count, void *userdata) {
     UNUSED(head_count);
     unsigned char *str;
@@ -1816,8 +1811,8 @@ static int _ziplistEntryConvertAndValidate(unsigned char *p, unsigned int head_c
     return 1;
 }
 
-/* callback for ziplistValidateIntegrity.
- * The ziplist element pointed by 'p' will be converted and stored into quicklist. */
+/* ziplistValidateIntegrity 的回调函数。
+ * 由 'p' 指向的 ziplist 元素将被转换并存储到 quicklist 中。 */
 static int _listZiplistEntryConvertAndValidate(unsigned char *p, unsigned int head_count, void *userdata) {
     UNUSED(head_count);
     unsigned char *str;
@@ -1828,7 +1823,7 @@ static int _listZiplistEntryConvertAndValidate(unsigned char *p, unsigned int he
 
     if (!ziplistGet(p, &str, &slen, &vll)) return 0;
     if (!str) {
-        /* Write the longval as a string so we can re-add it */
+        /* 将 longval 作为字符串写入以便能够重新添加 */
         slen = ll2string(longstr, sizeof(longstr), vll);
         str = (unsigned char *)longstr;
     }
@@ -1836,7 +1831,7 @@ static int _listZiplistEntryConvertAndValidate(unsigned char *p, unsigned int he
     return 1;
 }
 
-/* callback for to check the listpack doesn't have duplicate records */
+/* 用于检查 listpack 中没有重复记录的回调函数 */
 static int _lpEntryValidation(unsigned char *p, unsigned int head_count, void *userdata) {
     struct {
         int tuple_len;
@@ -1850,8 +1845,8 @@ static int _lpEntryValidation(unsigned char *p, unsigned int head_count, void *u
         dictExpand(data->fields, head_count/data->tuple_len);
     }
 
-    /* If we're checking pairs, then even records are field names. Otherwise
-     * we're checking all elements. Add to dict and check that's not a dup */
+    /* 如果我们在检查键值对，则偶数索引的记录是字段名。
+     * 否则我们在检查所有元素。将其添加到字典并检查是否重复 */
     if (data->count % data->tuple_len == 0) {
         unsigned char *str;
         int64_t slen;
@@ -1860,21 +1855,21 @@ static int _lpEntryValidation(unsigned char *p, unsigned int head_count, void *u
         str = lpGet(p, &slen, buf);
         sds field = sdsnewlen(str, slen);
         if (dictAdd(data->fields, field, NULL) != DICT_OK) {
-            /* Duplicate, return an error */
+            /* 重复，返回错误 */
             sdsfree(field);
             return 0;
         }
     }
 
-    /* Validate TTL field, only for listpackex. */
+    /* 仅对 listpackex 验证 TTL 字段 */
     if (data->count % data->tuple_len == 2) {
         long long expire_at;
-        /* Must be an integer. */
+        /* 必须是整数 */
         if (!lpGetIntegerValue(p, &expire_at)) return 0;
-        /* Must be less than EB_EXPIRE_TIME_MAX. */
+        /* 必须小于 EB_EXPIRE_TIME_MAX */
         if (expire_at < 0 || (unsigned long long)expire_at > EB_EXPIRE_TIME_MAX) return 0;
-        /* TTL fields are ordered. If the current field has TTL, the previous field must
-         * also have one, and the current TTL must be greater than the previous one. */
+        /* TTL 字段是有序的。如果当前字段有 TTL，则前一个字段也必须有 TTL，
+         * 且当前 TTL 必须大于前一个 TTL。 */
         if (expire_at != 0 && (data->last_expireat == 0 || expire_at < data->last_expireat)) return 0;
         data->last_expireat = expire_at;
     }
@@ -1883,12 +1878,12 @@ static int _lpEntryValidation(unsigned char *p, unsigned int head_count, void *u
     return 1;
 }
 
-/* Validate the integrity of the listpack structure.
- * when `deep` is 0, only the integrity of the header is validated.
- * when `deep` is 1, we scan all the entries one by one.
- * tuple_len indicates what is a logical entry tuple size.
- * Whether tuple is of size 1 (set), 2 (feild-value) or 3 (field-value[-ttl]),
- * first element in the tuple must be unique */
+/* 验证 listpack 结构的完整性。
+ * 当 `deep` 为 0 时，仅验证头部的完整性。
+ * 当 `deep` 为 1 时，我们会逐个扫描所有条目。
+ * tuple_len 表示一个逻辑条目的元组大小。
+ * 无论 tuple 大小是 1（集合）、2（field-value）还是 3（field-value[-ttl]），
+ * 元组中的第一个元素必须是唯一的。 */
 int lpValidateIntegrityAndDups(unsigned char *lp, size_t size, int deep, int tuple_len) {
     if (!deep)
         return lpValidateIntegrity(lp, size, 0, NULL, NULL);
@@ -1911,15 +1906,14 @@ int lpValidateIntegrityAndDups(unsigned char *lp, size_t size, int deep, int tup
     return ret;
 }
 
-/* Load a Redis object of the specified type from the specified file.
- * On success a newly allocated object is returned, otherwise NULL.
+/* 从指定文件加载指定类型的 Redis 对象。
+ * 成功时返回一个新分配的对象，否则返回 NULL。
  *
- * error - When the function returns NULL and if 'error' is not NULL, the
- *   integer pointed by 'error' is set to the type of error that occurred
- * minExpiredField - If loading a hash with expiration on fields, then this value
- *   will be set to the minimum expire time found in the hash fields. If there are
- *   no fields with expiration or it is not a hash, then it will set be to
- *   EB_EXPIRE_TIME_INVALID.
+ * error - 当函数返回 NULL 且 'error' 不为 NULL 时，
+ *   'error' 指向的整数被设置为发生的错误类型。
+ * minExpiredField - 如果加载的是带字段过期的哈希，
+ *   则此值被设置为哈希字段中找到的最小过期时间。
+ *   如果没有带过期的字段，或者不是哈希，则设置为 EB_EXPIRE_TIME_INVALID。
  */
 robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 {
@@ -1927,13 +1921,13 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     uint64_t len;
     unsigned int i;
 
-    /* Set default error of load object, it will be set to 0 on success. */
+    /* 设置加载对象的默认错误，成功时将被设置为 0 */
     if (error) *error = RDB_LOAD_ERR_OTHER;
 
     int deep_integrity_validation = server.sanitize_dump_payload == SANITIZE_DUMP_YES;
     if (server.sanitize_dump_payload == SANITIZE_DUMP_CLIENTS) {
-        /* Skip sanitization when loading (an RDB), or getting a RESTORE command
-         * from either the master or a client using an ACL user with the skip-sanitize-payload flag. */
+        /* 在加载（RDB）时，或从主节点或具有 skip-sanitize-payload 标志的
+         * ACL 用户的客户端接收到 RESTORE 命令时，跳过清理 */
         int skip = server.loading ||
             (server.current_client && (server.current_client->flags & CLIENT_MASTER));
         if (!skip && server.current_client && server.current_client->user)
@@ -1942,17 +1936,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     }
 
     if (rdbtype == RDB_TYPE_STRING) {
-        /* Read string value */
+        /* 读取字符串值 */
         if ((o = rdbLoadEncodedStringObject(rdb)) == NULL) return NULL;
         o = tryObjectEncodingEx(o, 0);
     } else if (rdbtype == RDB_TYPE_LIST) {
-        /* Read list value */
+        /* 读取列表值 */
         if ((len = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;
 
         o = createQuicklistObject(server.list_max_listpack_size, server.list_compress_depth);
 
-        /* Load every single element of the list */
+        /* 加载列表中的每个元素 */
         while(len--) {
             if ((ele = rdbLoadEncodedStringObject(rdb)) == NULL) {
                 decrRefCount(o);
@@ -1967,17 +1961,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
         listTypeTryConversion(o, LIST_CONV_AUTO, NULL, NULL);
     } else if (rdbtype == RDB_TYPE_SET) {
-        /* Read Set value */
+        /* 读取 Set 值 */
         if ((len = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;
 
-        /* Use a regular set when there are too many entries. */
+        /* 当条目过多时使用常规集合 */
         size_t max_entries = server.set_max_intset_entries;
         if (max_entries >= 1<<30) max_entries = 1<<30;
         if (len > max_entries) {
             o = createSetObject();
-            /* It's faster to expand the dict to the right size asap in order
-             * to avoid rehashing */
+            /* 尽快将 dict 扩展到合适的大小可以加快速度，
+             * 以避免 rehash */
             if (len > DICT_HT_INITIAL_SIZE && dictTryExpand(o->ptr, len) != DICT_OK) {
                 rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)len);
                 decrRefCount(o);
@@ -1987,7 +1981,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             o = createIntsetObject();
         }
 
-        /* Load every single element of the set */
+        /* 加载集合中的每个元素 */
         size_t maxelelen = 0, sumelelen = 0;
         for (i = 0; i < len; i++) {
             long long llval;
@@ -2002,7 +1996,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (elelen > maxelelen) maxelelen = elelen;
 
             if (o->encoding == OBJ_ENCODING_INTSET) {
-                /* Fetch integer value from element. */
+                /* 从元素获取整数值 */
                 if (isSdsRepresentableAsLongLong(sdsele,&llval) == C_OK) {
                     uint8_t success;
                     o->ptr = intsetAdd(o->ptr, llval, &success);
@@ -2016,9 +2010,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                            maxelelen <= server.set_max_listpack_value &&
                            lpSafeToAdd(NULL, sumelelen))
                 {
-                    /* We checked if it's safe to add one large element instead
-                     * of many small ones. It's OK since lpSafeToAdd doesn't
-                     * care about individual elements, only the total size. */
+                    /* 我们检查了添加一个大元素是否比添加多个小元素更安全。
+                     * 这样做没问题，因为 lpSafeToAdd 不关心单个元素，
+                     * 仅关心总大小。 */
                     setTypeConvert(o, OBJ_ENCODING_LISTPACK);
                 } else if (setTypeConvertAndExpand(o, OBJ_ENCODING_HT, len, 0) != C_OK) {
                     rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)len);
@@ -2028,8 +2022,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
-            /* This will also be called when the set was just converted
-             * to a listpack encoded set. */
+            /* 当集合刚刚被转换为 listpack 编码的集合时也会执行此处 */
             if (o->encoding == OBJ_ENCODING_LISTPACK) {
                 if (setTypeSize(o) < server.set_max_listpack_entries &&
                     elelen <= server.set_max_listpack_value &&
@@ -2052,8 +2045,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
-            /* This will also be called when the set was just converted
-             * to a regular hash table encoded set. */
+            /* 当集合刚刚被转换为常规哈希表编码的集合时也会执行此处 */
             if (o->encoding == OBJ_ENCODING_HT) {
                 if (dictAdd((dict*)o->ptr, sdsele, NULL) != DICT_OK) {
                     rdbReportCorruptRDB("Duplicate set members detected");
@@ -2066,7 +2058,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
         }
     } else if (rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
-        /* Read sorted set value. */
+        /* 读取有序集合值 */
         uint64_t zsetlen;
         size_t maxelelen = 0, totelelen = 0;
         zset *zs;
@@ -2083,7 +2075,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             return NULL;
         }
 
-        /* Load every single element of the sorted set. */
+        /* 加载有序集合中的每个元素 */
         while(zsetlen--) {
             sds sdsele;
             double score;
@@ -2115,7 +2107,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* Don't care about integer-encoded strings. */
+            /* 不关心整数编码的字符串 */
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
@@ -2123,12 +2115,12 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (dictAdd(zs->dict,sdsele,&znode->score) != DICT_OK) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 decrRefCount(o);
-                /* no need to free 'sdsele', will be released by zslFree together with 'o' */
+                /* 无需释放 'sdsele'，它会与 'o' 一起通过 zslFree 释放 */
                 return NULL;
             }
         }
 
-        /* Convert *after* loading, since sorted sets are not stored ordered. */
+        /* 在加载完成之后再进行转换，因为有序集合并非有序存储 */
         if (zsetLength(o) <= server.zset_max_listpack_entries &&
             maxelelen <= server.zset_max_listpack_value &&
             lpSafeToAdd(NULL, totelelen))
@@ -2148,21 +2140,21 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
         o = createHashObject();
 
-        /* Too many entries? Use a hash table right from the start. */
+        /* 条目过多？从一开始就使用哈希表 */
         if (len > server.hash_max_listpack_entries)
             hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
         else if (deep_integrity_validation) {
-            /* In this mode, we need to guarantee that the server won't crash
-             * later when the ziplist is converted to a dict.
-             * Create a set (dict with no values) to for a dup search.
-             * We can dismiss it as soon as we convert the ziplist to a hash. */
+            /* 在此模式下，我们需要保证稍后 ziplist 转换为 dict 时
+             * 服务器不会崩溃。
+             * 创建一个集合（不包含值的 dict）用于查找重复。
+             * 一旦将 ziplist 转换为哈希，就可以丢弃它。 */
             dupSearchDict = dictCreate(&hashDictType);
         }
 
-        /* Load every field and value into the listpack */
+        /* 将每个字段和值加载到 listpack 中 */
         while (o->encoding == OBJ_ENCODING_LISTPACK && len > 0) {
             len--;
-            /* Load raw strings */
+            /* 加载原始字符串 */
             if ((field = rdbGenericLoadStringObject(rdb,RDB_LOAD_HFLD,NULL)) == NULL) {
                 decrRefCount(o);
                 if (dupSearchDict) dictRelease(dupSearchDict);
@@ -2189,7 +2181,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
-            /* Convert to hash table if size threshold is exceeded */
+            /* 超过大小阈值时转换为哈希表 */
             if (hfieldlen(field) > server.hash_max_listpack_value ||
                 sdslen(value) > server.hash_max_listpack_value ||
                 !lpSafeToAdd(o->ptr, hfieldlen(field) + sdslen(value)))
@@ -2209,7 +2201,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 break;
             }
 
-            /* Add pair to listpack */
+            /* 将键值对添加到 listpack */
             o->ptr = lpAppend(o->ptr, (unsigned char*)field, hfieldlen(field));
             o->ptr = lpAppend(o->ptr, (unsigned char*)value, sdslen(value));
 
@@ -2218,8 +2210,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         }
 
         if (dupSearchDict) {
-            /* We no longer need this, from now on the entries are added
-             * to a dict so the check is performed implicitly. */
+            /* 我们不再需要它，从现在起条目会被添加到 dict 中，
+             * 因此该检查是隐式执行的。 */
             dictRelease(dupSearchDict);
             dupSearchDict = NULL;
         }
@@ -2232,10 +2224,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
         }
 
-        /* Load remaining fields and values into the hash table */
+        /* 将剩余的字段和值加载到哈希表中 */
         while (o->encoding == OBJ_ENCODING_HT && len > 0) {
             len--;
-            /* Load encoded strings */
+            /* 加载编码字符串 */
             if ((field = rdbGenericLoadStringObject(rdb,RDB_LOAD_HFLD,NULL)) == NULL) {
                 decrRefCount(o);
                 return NULL;
@@ -2246,7 +2238,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* Add pair to hash table */
+            /* 将键值对添加到哈希表 */
             dict *d = o->ptr;
             dictUseStoredKeyApi(d, 1);
             ret = dictAdd(d, field, value);
@@ -2260,7 +2252,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
         }
 
-        /* All pairs should be read by now */
+        /* 此时应该已读取所有键值对 */
         serverAssert(len == 0);
     } else if (rdbtype == RDB_TYPE_HASH_METADATA || rdbtype == RDB_TYPE_HASH_METADATA_PRE_GA) {
         sds value;
@@ -2268,11 +2260,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         uint64_t ttl, expireAt, minExpire = EB_EXPIRE_TIME_INVALID;
         dict *dupSearchDict = NULL;
 
-        /* If hash with TTLs, load next/min expiration time
+        /* 如果是带 TTL 的哈希，加载下一个/最小过期时间
          *
-         * - This value is serialized for future use-case of streaming the object
-         *   directly to FLASH (while keeping in mem its next expiration time).
-         * - It is also being used to keep only relative TTL for fields in RDB file.
+         * - 此值被序列化以便将来用于直接将对象流式传输到 FLASH
+         *   的用例（同时在内存中保留其下一个过期时间）。
+         * - 它也用于在 RDB 文件中仅为字段保留相对 TTL。
          */
         if (rdbtype == RDB_TYPE_HASH_METADATA) {
             minExpire = rdbLoadMillisecondTime(rdb, RDB_VERSION);
@@ -2288,9 +2280,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         len = rdbLoadLen(rdb, NULL);
         if (len == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;
-        /* TODO: create listpackEx or HT directly*/
+        /* TODO: 直接创建 listpackEx 或 HT */
         o = createHashObject();
-        /* Too many entries? Use a hash table right from the start. */
+        /* 条目过多？从一开始就使用哈希表 */
         if (len > server.hash_max_listpack_entries) {
             hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
             dictTypeAddMeta((dict**)&o->ptr, &mstrHashDictTypeWithHFE);
@@ -2298,10 +2290,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         } else {
             hashTypeConvert(o, OBJ_ENCODING_LISTPACK_EX, NULL);
             if (deep_integrity_validation) {
-                /* In this mode, we need to guarantee that the server won't crash
-                * later when the listpack is converted to a dict.
-                * Create a set (dict with no values) for dup search.
-                * We can dismiss it as soon as we convert the listpack to a hash. */
+                /* 在此模式下，我们需要保证稍后 listpack 转换为 dict 时
+                 * 服务器不会崩溃。
+                 * 创建一个集合（不包含值的 dict）用于查找重复。
+                 * 一旦将 listpack 转换为哈希，就可以丢弃它。 */
                 dupSearchDict = dictCreate(&hashDictType);
             }
         }
@@ -2309,7 +2301,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         while (len > 0) {
             len--;
 
-            /* read the TTL */
+            /* 读取 TTL */
             if (rdbLoadLenByRef(rdb, NULL, &ttl) == -1) {
                 serverLog(LL_WARNING, "failed reading hash TTL");
                 decrRefCount(o);
@@ -2319,13 +2311,13 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
 
             if (rdbtype == RDB_TYPE_HASH_METADATA) {
-                /* Loaded TTL value:
-                 *  - 0: Indicates no TTL. This is common case so we keep it small.
-                 *  - Otherwise: TTL is relative to minExpire (with +1 to avoid 0 that already taken)
+                /* 已加载的 TTL 值：
+                 *  - 0：表示无 TTL。这是常见情况，所以保持较小值。
+                 *  - 其他值：TTL 相对于 minExpire（+1 以避免与已使用的 0 冲突）
                  */
                 expireAt = (ttl != 0) ? (ttl + minExpire - 1) : 0;
             } else { /* RDB_TYPE_HASH_METADATA_PRE_GA */
-                expireAt = ttl; /* Value is absolute */
+                expireAt = ttl; /* 值为绝对值 */
             }
 
             if (expireAt > EB_EXPIRE_TIME_MAX) {
@@ -2336,7 +2328,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* if needed create field with TTL metadata  */
+            /* 如果需要，创建带 TTL 元数据的字段 */
             if (expireAt !=0)
                 field = rdbGenericLoadStringObject(rdb, RDB_LOAD_HFLD_TTL, NULL);
             else
@@ -2349,7 +2341,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* read the value */
+            /* 读取值 */
             if ((value = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL)) == NULL) {
                 serverLog(LL_WARNING, "failed reading hash value");
                 decrRefCount(o);
@@ -2358,9 +2350,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* store the values read - either to listpack or dict */
+            /* 存储读取的值 - 存储到 listpack 或 dict */
             if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-                /* integrity - check for key duplication (if required) */
+                /* 完整性 - 检查键是否重复（如果需要） */
                 if (dupSearchDict) {
                     sds field_dup = sdsnewlen(field, hfieldlen(field));
 
@@ -2375,15 +2367,15 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     }
                 }
 
-                /* check if the values can be saved to listpack (or should convert to dict encoding) */
+                /* 检查值是否能够保存到 listpack（或应转换为 dict 编码） */
                 if (hfieldlen(field) > server.hash_max_listpack_value ||
                     sdslen(value) > server.hash_max_listpack_value ||
                     !lpSafeToAdd(((listpackEx*)o->ptr)->lp, hfieldlen(field) + sdslen(value) + lpEntrySizeInteger(expireAt)))
                 {
-                    /* convert to hash */
+                    /* 转换为哈希 */
                     hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
 
-                    if (len > DICT_HT_INITIAL_SIZE) { /* TODO: this is NOT the original len, but this is also the case for simple hash, is this a bug? */
+                    if (len > DICT_HT_INITIAL_SIZE) { /* TODO: 这并非原始 len，但简单哈希也存在这种情况，这是一个 bug 吗？ */
                         if (dictTryExpand(o->ptr, len) != DICT_OK) {
                             rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)len);
                             decrRefCount(o);
@@ -2394,7 +2386,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         }
                     }
 
-                    /* don't add the values to the new hash: the next if will catch and the values will be added there */
+                    /* 不要将值添加到新哈希中：下一个 if 会捕获并在相应位置添加这些值 */
                 } else {
                     listpackExAddNew(o, field, hfieldlen(field),
                                      value, sdslen(value), expireAt);
@@ -2404,13 +2396,13 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
 
             if (o->encoding == OBJ_ENCODING_HT) {
-                /* Add pair to hash table */
+                /* 将键值对添加到哈希表 */
                 dict *d = o->ptr;
                 dictUseStoredKeyApi(d, 1);
                 int ret = dictAdd(d, field, value);
                 dictUseStoredKeyApi(d, 0);
 
-                /* Attach expiry to the hash field and register in hash private HFE DS */
+                /* 将过期时间附加到哈希字段，并在哈希私有 HFE DS 中注册 */
                 if ((ret != DICT_ERR) && expireAt) {
                     dictExpireMetadata *m = (dictExpireMetadata *) dictMetadata(d);
                     ret = ebAdd(&m->hfe, &hashFieldExpireBucketsType, field, expireAt);
@@ -2516,11 +2508,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     {
         size_t encoded_len;
 
-        /* If Hash TTLs, Load next/min expiration time before the `encoded` */
+        /* 对于带 TTL 的哈希，在加载编码数据前先加载最小过期时间 */
         if (rdbtype == RDB_TYPE_HASH_LISTPACK_EX) {
             uint64_t minExpire = rdbLoadMillisecondTime(rdb, RDB_VERSION);
-            /* This value was serialized for future use-case of streaming the object
-             * directly to FLASH (while keeping in mem its next expiration time) */
+            /* 此值序列化用于未来将对象直接流式传输到 FLASH
+             * （同时在内存中保留其下一个过期时间）的用例 */
             UNUSED(minExpire);
             if (rioGetReadError(rdb)) {
                 rdbReportCorruptRDB( "Hash listpackex integrity check failed.");
@@ -2534,16 +2526,14 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
         o = createObject(OBJ_STRING, encoded); /* Obj type fixed below. */
 
-        /* Fix the object encoding, and make sure to convert the encoded
-         * data type into the base type if accordingly to the current
-         * configuration there are too many elements in the encoded data
-         * type. Note that we only check the length and not max element
-         * size as this is an O(N) scan. Eventually everything will get
-         * converted. */
+        /* 修正对象编码，如果根据当前配置编码数据类型中
+         * 包含过多元素，则将其转换为基本类型。
+         * 注意我们只检查长度而不检查最大元素大小，
+         * 因为这是 O(N) 扫描。最终一切都会被转换。 */
         switch(rdbtype) {
             case RDB_TYPE_HASH_ZIPMAP:
-                /* Since we don't keep zipmaps anymore, the rdb loading for these
-                 * is O(n) anyway, use `deep` validation. */
+                /* 由于不再保留 zipmap，加载时已经是 O(n)，
+                 * 使用 'deep' 验证。 */
                 if (!zipmapValidateIntegrity(encoded, encoded_len, 1)) {
                     rdbReportCorruptRDB("Zipmap integrity check failed.");
                     zfree(encoded);
@@ -2551,8 +2541,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     decrRefCount(o);
                     return NULL;
                 }
-                /* Convert to ziplist encoded hash. This must be deprecated
-                 * when loading dumps created by Redis 2.4 gets deprecated. */
+                /* 转换为 ziplist 编码的哈希。当加载
+                 * Redis 2.4 创建的转储被弃用时，此处也应弃用。 */
                 {
                     unsigned char *lp = lpNew(0);
                     unsigned char *zi = zipmapRewind(o->ptr);
@@ -2565,7 +2555,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         if (flen > maxlen) maxlen = flen;
                         if (vlen > maxlen) maxlen = vlen;
 
-                        /* search for duplicate records */
+                        /* 搜索重复记录 */
                         sds field = sdstrynewlen(fstr, flen);
                         if (!field || dictAdd(dupSearchDict, field, NULL) != DICT_OK ||
                             !lpSafeToAdd(lp, (size_t)flen + vlen)) {
@@ -2736,8 +2726,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             case RDB_TYPE_HASH_LISTPACK:
             case RDB_TYPE_HASH_LISTPACK_EX_PRE_GA:
             case RDB_TYPE_HASH_LISTPACK_EX:
-                /* listpack-encoded hash with TTL requires its own struct
-                 * pointed to by o->ptr */
+                /* 带 TTL 的 listpack 编码哈希需要自己的结构，
+                 * 通过 o->ptr 指向 */
                 o->type = OBJ_HASH;
                 if ( (rdbtype == RDB_TYPE_HASH_LISTPACK_EX) ||
                      (rdbtype == RDB_TYPE_HASH_LISTPACK_EX_PRE_GA) ) {
@@ -2749,10 +2739,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 } else
                     o->encoding = OBJ_ENCODING_LISTPACK;
 
-                /* tuple_len is the number of elements for each key:
-                 * key + value for simple hash, key + value + tll for hash with TTL*/
+                /* tuple_len 是每个键的元素数量：
+                 * 简单哈希为 key + value，带 TTL 的哈希为 key + value + ttl */
                 int tuple_len = (rdbtype == RDB_TYPE_HASH_LISTPACK ? 2 : 3);
-                /* validate read data */
+                /* 验证读取的数据 */
                 if (deep_integrity_validation) server.stat_dump_payload_sanitizations++;
                 if (!lpValidateIntegrityAndDups(encoded, encoded_len,
                                                 deep_integrity_validation, tuple_len)) {
@@ -2761,20 +2751,20 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     return NULL;
                 }
 
-                /* if listpack is empty, delete it */
+                /* 如果 listpack 为空，则删除它 */
                 if (hashTypeLength(o, 0) == 0) {
                     decrRefCount(o);
                     goto emptykey;
                 }
 
-                /* Convert listpack to hash table without registering in global HFE DS,
-                 * if has HFEs, since the listpack is not connected yet to the DB */
+                /* 如果有 HFE，将 listpack 转换为哈希表但不注册到全局 HFE DS，
+                 * 因为此时 listpack 还未连接到 DB */
                 if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
                     hashTypeConvert(o, OBJ_ENCODING_HT, NULL /*db->hexpires*/);
 
                 break;
             default:
-                /* totally unreachable */
+                /* 完全不可达 */
                 rdbReportCorruptRDB("Unknown RDB encoding type %d",rdbtype);
                 break;
         }
@@ -2792,9 +2782,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         }
 
         while(listpacks--) {
-            /* Get the master ID, the one we'll use as key of the radix tree
-             * node: the entries inside the listpack itself are delta-encoded
-             * relatively to this ID. */
+            /* 获取主 ID，用作 radix tree 节点的键：
+             * listpack 内部的条目相对于该 ID 进行差分编码。 */
             sds nodekey = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL);
             if (nodekey == NULL) {
                 rdbReportReadError("Stream master ID loading failed: invalid encoding or I/O error.");
@@ -2809,7 +2798,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* Load the listpack. */
+            /* 加载 listpack */
             size_t lp_size;
             unsigned char *lp =
                 rdbGenericLoadStringObject(rdb,RDB_LOAD_PLAIN,&lp_size);
@@ -2830,9 +2819,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
             unsigned char *first = lpFirst(lp);
             if (first == NULL) {
-                /* Serialized listpacks should never be empty, since on
-                 * deletion we should remove the radix tree key if the
-                 * resulting listpack is empty. */
+                /* 序列化后的 listpack 不应为空，因为在删除时
+                 * 如果 listpack 结果为空，我们应该删除 radix tree 键。 */
                 rdbReportCorruptRDB("Empty listpack inside stream");
                 sdsfree(nodekey);
                 decrRefCount(o);
@@ -2840,7 +2828,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            /* Insert the key in the radix tree. */
+            /* 将键插入到 radix tree 中 */
             int retval = raxTryInsert(s->rax,
                 (unsigned char*)nodekey,sizeof(streamID),lp,NULL);
             sdsfree(nodekey);
@@ -2851,34 +2839,33 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
         }
-        /* Load total number of items inside the stream. */
+        /* 加载 stream 中的条目总数 */
         s->length = rdbLoadLen(rdb,NULL);
 
-        /* Load the last entry ID. */
+        /* 加载最后一个条目 ID */
         s->last_id.ms = rdbLoadLen(rdb,NULL);
         s->last_id.seq = rdbLoadLen(rdb,NULL);
 
         if (rdbtype >= RDB_TYPE_STREAM_LISTPACKS_2) {
-            /* Load the first entry ID. */
+            /* 加载第一个条目 ID */
             s->first_id.ms = rdbLoadLen(rdb,NULL);
             s->first_id.seq = rdbLoadLen(rdb,NULL);
 
-            /* Load the maximal deleted entry ID. */
+            /* 加载最大已删除条目 ID */
             s->max_deleted_entry_id.ms = rdbLoadLen(rdb,NULL);
             s->max_deleted_entry_id.seq = rdbLoadLen(rdb,NULL);
 
-            /* Load the offset. */
+            /* 加载 offset */
             s->entries_added = rdbLoadLen(rdb,NULL);
         } else {
-            /* During migration the offset can be initialized to the stream's
-             * length. At this point, we also don't care about tombstones
-             * because CG offsets will be later initialized as well. */
+            /* 在迁移过程中，offset 可以初始化为 stream 的长度。
+             * 此时我们也无需关心墓碑，
+             * 因为 CG offset 稍后也会被初始化。 */
             s->max_deleted_entry_id.ms = 0;
             s->max_deleted_entry_id.seq = 0;
             s->entries_added = s->length;
 
-            /* Since the rax is already loaded, we can find the first entry's
-             * ID. */
+            /* 由于 rax 已经加载，我们可以找到第一个条目的 ID。 */
             streamGetEdgeID(s,1,1,&s->first_id);
         }
 
@@ -2894,7 +2881,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             return NULL;
         }
 
-        /* Consumer groups loading */
+        /* 加载消费者组 */
         uint64_t cgroups_count = rdbLoadLen(rdb,NULL);
         if (cgroups_count == RDB_LENERR) {
             rdbReportReadError("Stream cgroup count loading failed.");
@@ -2902,9 +2889,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             return NULL;
         }
         while(cgroups_count--) {
-            /* Get the consumer group name and ID. We can then create the
-             * consumer group ASAP and populate its structure as
-             * we read more data. */
+            /* 获取消费者组名称和 ID。然后我们可以尽快创建消费者组，
+             * 并在读取更多数据时填充其结构。 */
             streamID cg_id;
             sds cgname = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL);
             if (cgname == NULL) {
@@ -2922,8 +2908,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 decrRefCount(o);
                 return NULL;
             }
-            
-            /* Load group offset. */
+
+            /* 加载消费者组 offset */
             uint64_t cg_offset;
             if (rdbtype >= RDB_TYPE_STREAM_LISTPACKS_2) {
                 cg_offset = rdbLoadLen(rdb,NULL);
@@ -2947,11 +2933,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
             sdsfree(cgname);
 
-            /* Load the global PEL for this consumer group, however we'll
-             * not yet populate the NACK structures with the message
-             * owner, since consumers for this group and their messages will
-             * be read as a next step. So for now leave them not resolved
-             * and later populate it. */
+            /* 加载此消费者组的全局 PEL，但我们暂不会用消息所有者
+             * 填充 NACK 结构，因为该组的消费者及其消息将在下一步读取。
+             * 所以现在让它们保持未解析状态，之后再填充。 */
             uint64_t pel_size = rdbLoadLen(rdb,NULL);
             if (pel_size == RDB_LENERR) {
                 rdbReportReadError("Stream PEL size loading failed.");
@@ -2983,8 +2967,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
-            /* Now that we loaded our global PEL, we need to load the
-             * consumers and their local PELs. */
+            /* 现在我们已经加载了全局 PEL，接下来需要加载
+             * 消费者及其本地 PEL。 */
             uint64_t consumers_num = rdbLoadLen(rdb,NULL);
             if (consumers_num == RDB_LENERR) {
                 rdbReportReadError("Stream consumers num loading failed.");
@@ -3023,12 +3007,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         return NULL;
                     }
                 } else {
-                    /* That's the best estimate we got */
+                    /* 这是我们能得到的最佳估计值 */
                     consumer->active_time = consumer->seen_time;
                 }
 
-                /* Load the PEL about entries owned by this specific
-                 * consumer. */
+                /* 加载此特定消费者所拥有条目的 PEL */
                 pel_size = rdbLoadLen(rdb,NULL);
                 if (pel_size == RDB_LENERR) {
                     rdbReportReadError(
@@ -3053,9 +3036,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     }
                     streamNACK *nack = result;
 
-                    /* Set the NACK consumer, that was left to NULL when
-                     * loading the global PEL. Then set the same shared
-                     * NACK structure also in the consumer-specific PEL. */
+                    /* 设置 NACK 的消费者（在加载全局 PEL 时保留为 NULL）。
+                     * 然后将同一个共享的 NACK 结构也设置到消费者特定的 PEL 中。 */
                     nack->consumer = consumer;
                     if (!raxTryInsert(consumer->pel,rawid,sizeof(rawid),nack,NULL)) {
                         rdbReportCorruptRDB("Duplicated consumer PEL entry "
@@ -3068,7 +3050,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
-            /* Verify that each PEL eventually got a consumer assigned to it. */
+            /* 验证每个 PEL 最终都有一个分配的消费者 */
             if (deep_integrity_validation) {
                 raxIterator ri_cg_pel;
                 raxStart(&ri_cg_pel,cgroup->pel);
@@ -3112,19 +3094,19 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         robj keyobj;
         initStaticStringObject(keyobj,key);
         moduleInitIOContext(io,mt,rdb,&keyobj,dbid);
-        /* Call the rdb_load method of the module providing the 10 bit
-         * encoding version in the lower 10 bits of the module ID. */
+        /* 调用模块的 rdb_load 方法，编码版本号
+         * 存储在模块 ID 的低 10 位中。 */
         void *ptr = mt->rdb_load(&io,moduleid&1023);
         if (io.ctx) {
             moduleFreeContext(io.ctx);
             zfree(io.ctx);
         }
 
-        /* Module v2 serialization has an EOF mark at the end. */
+        /* 模块 v2 序列化格式在末尾有一个 EOF 标记。 */
         uint64_t eof = rdbLoadLen(rdb,NULL);
         if (eof == RDB_LENERR) {
             if (ptr) {
-                o = createModuleObject(mt, ptr); /* creating just in order to easily destroy */
+                o = createModuleObject(mt, ptr); /* 创建对象以便轻松销毁 */
                 decrRefCount(o);
             }
             return NULL;
@@ -3133,7 +3115,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             rdbReportCorruptRDB("The RDB file contains module data for the module '%s' that is not terminated by "
                                 "the proper module value EOF marker", moduleTypeModuleName(mt));
             if (ptr) {
-                o = createModuleObject(mt, ptr); /* creating just in order to easily destroy */
+                o = createModuleObject(mt, ptr); /* 创建对象以便轻松销毁 */
                 decrRefCount(o);
             }
             return NULL;
@@ -3159,10 +3141,9 @@ emptykey:
     return NULL;
 }
 
-/* Mark that we are loading in the global state and setup the fields
- * needed to provide loading stats. */
+/* 标记服务器正在加载状态，并初始化用于显示加载进度的字段。 */
 void startLoading(size_t size, int rdbflags, int async) {
-    /* Load the DB */
+    /* 加载数据库 */
     server.loading = 1;
     if (async == 1) server.async_loading = 1;
     server.loading_start_time = time(NULL);
@@ -3173,7 +3154,7 @@ void startLoading(size_t size, int rdbflags, int async) {
     server.rdb_last_load_keys_loaded = 0;
     blockingOperationStarts();
 
-    /* Fire the loading modules start event. */
+    /* 触发加载模块开始事件 */
     int subevent;
     if (rdbflags & RDBFLAGS_AOF_PREAMBLE)
         subevent = REDISMODULE_SUBEVENT_LOADING_AOF_START;
@@ -3184,41 +3165,40 @@ void startLoading(size_t size, int rdbflags, int async) {
     moduleFireServerEvent(REDISMODULE_EVENT_LOADING,subevent,NULL);
 }
 
-/* Mark that we are loading in the global state and setup the fields
- * needed to provide loading stats.
- * 'filename' is optional and used for rdb-check on error */
+/* 标记服务器正在加载状态，并初始化用于显示加载进度的字段。
+ * 'filename' 为可选参数，用于出错时的 rdb 检查。 */
 void startLoadingFile(size_t size, char* filename, int rdbflags) {
     rdbFileBeingLoaded = filename;
     startLoading(size, rdbflags, 0);
 }
 
-/* Refresh the absolute loading progress info */
+/* 更新绝对加载进度信息 */
 void loadingAbsProgress(off_t pos) {
     server.loading_loaded_bytes = pos;
     if (server.stat_peak_memory < zmalloc_used_memory())
         server.stat_peak_memory = zmalloc_used_memory();
 }
 
-/* Refresh the incremental loading progress info */
+/* 更新增量加载进度信息 */
 void loadingIncrProgress(off_t size) {
     server.loading_loaded_bytes += size;
     if (server.stat_peak_memory < zmalloc_used_memory())
         server.stat_peak_memory = zmalloc_used_memory();
 }
 
-/* Update the file name currently being loaded */
+/* 更新当前正在加载的文件名 */
 void updateLoadingFileName(char* filename) {
     rdbFileBeingLoaded = filename;
 }
 
-/* Loading finished */
+/* 加载完成 */
 void stopLoading(int success) {
     server.loading = 0;
     server.async_loading = 0;
     blockingOperationEnds();
     rdbFileBeingLoaded = NULL;
 
-    /* Fire the loading modules end event. */
+    /* 触发加载模块结束事件 */
     moduleFireServerEvent(REDISMODULE_EVENT_LOADING,
                           success?
                             REDISMODULE_SUBEVENT_LOADING_ENDED:
@@ -3226,8 +3206,10 @@ void stopLoading(int success) {
                            NULL);
 }
 
+/* 通知模块持久化操作开始。根据标志和进程类型
+ * 选择不同的子事件类型。 */
 void startSaving(int rdbflags) {
-    /* Fire the persistence modules start event. */
+    /* 触发持久化模块开始事件 */
     int subevent;
     if (rdbflags & RDBFLAGS_AOF_PREAMBLE && getpid() != server.pid)
         subevent = REDISMODULE_SUBEVENT_PERSISTENCE_AOF_START;
@@ -3240,8 +3222,9 @@ void startSaving(int rdbflags) {
     moduleFireServerEvent(REDISMODULE_EVENT_PERSISTENCE,subevent,NULL);
 }
 
+/* 通知模块持久化操作结束。 */
 void stopSaving(int success) {
-    /* Fire the persistence modules end event. */
+    /* 触发持久化模块结束事件 */
     moduleFireServerEvent(REDISMODULE_EVENT_PERSISTENCE,
                           success?
                             REDISMODULE_SUBEVENT_PERSISTENCE_ENDED:
@@ -3249,8 +3232,8 @@ void stopSaving(int success) {
                           NULL);
 }
 
-/* Track loading progress in order to serve client's from time to time
-   and if needed calculate rdb checksum  */
+/* 跟踪加载进度，以便在加载过程中定期服务客户端请求，
+ * 并在需要时计算 RDB 校验和。 */
 void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
     if (server.rdb_checksum)
         rioGenericUpdateChecksum(r, buf, len);
@@ -3268,13 +3251,12 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
     }
 }
 
-/* Save the given functions_ctx to the rdb.
- * The err output parameter is optional and will be set with relevant error
- * message on failure, it is the caller responsibility to free the error
- * message on failure.
+/* 从 RDB 中加载函数库。
+ * err 输出参数为可选，失败时会被设置为相关错误信息，
+ * 调用者负责在失败时释放该错误信息。
  *
- * The lib_ctx argument is also optional. If NULL is given, only verify rdb
- * structure with out performing the actual functions loading. */
+ * lib_ctx 参数也是可选的。如果传入 NULL，
+ * 则仅验证 RDB 结构而不执行实际的函数加载。 */
 int rdbFunctionLoad(rio *rdb, int ver, functionsLibCtx* lib_ctx, int rdbflags, sds *err) {
     UNUSED(ver);
     sds error = NULL;
@@ -3311,8 +3293,8 @@ done:
     return res;
 }
 
-/* Load an RDB file from the rio stream 'rdb'. On success C_OK is returned,
- * otherwise C_ERR is returned and 'errno' is set accordingly. */
+/* 从 rio 流 'rdb' 中加载 RDB 文件。
+ * 成功返回 C_OK，否则返回 C_ERR 并设置 errno。 */
 int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     functionsLibCtx* functions_lib_ctx = functionsLibCtxGetCurrent();
     rdbLoadingCtx loading_ctx = { .dbarray = server.db, .functions_lib_ctx = functions_lib_ctx };
@@ -3320,11 +3302,10 @@ int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     return retval;
 }
 
-/* Load an RDB file from the rio stream 'rdb'. On success C_OK is returned,
- * otherwise C_ERR is returned.
- * The rdb_loading_ctx argument holds objects to which the rdb will be loaded to,
- * currently it only allow to set db object and functionLibCtx to which the data
- * will be loaded (in the future it might contains more such objects). */
+/* 从 rio 流 'rdb' 中加载 RDB 文件。成功返回 C_OK，否则返回 C_ERR。
+ * rdb_loading_ctx 参数保存 RDB 数据加载的目标对象，
+ * 当前仅允许设置数据库对象和 functionsLibCtx，
+ * 未来可能会包含更多此类对象。 */
 int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadingCtx *rdb_loading_ctx) {
     uint64_t dbid = 0;
     int type, rdbver;
@@ -3349,7 +3330,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
         return C_ERR;
     }
 
-    /* Key-specific attributes, set by opcodes before the key type. */
+    /* 键相关属性，由键类型之前的特殊操作码设置 */
     long long lru_idle = -1, lfu_freq = -1, expiretime = -1, now = mstime();
     long long lru_clock = LRU_CLOCK();
 
@@ -3357,41 +3338,40 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
         sds key;
         robj *val;
 
-        /* Read type. */
+        /* 读取类型 */
         if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
 
-        /* Handle special types. */
+        /* 处理特殊类型 */
         if (type == RDB_OPCODE_EXPIRETIME) {
-            /* EXPIRETIME: load an expire associated with the next key
-             * to load. Note that after loading an expire we need to
-             * load the actual type, and continue. */
+            /* EXPIRETIME: 加载与下一个键关联的过期时间。
+             * 注意：加载过期时间后需要继续读取实际类型。 */
             expiretime = rdbLoadTime(rdb);
             expiretime *= 1000;
             if (rioGetReadError(rdb)) goto eoferr;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_EXPIRETIME_MS) {
-            /* EXPIRETIME_MS: milliseconds precision expire times introduced
-             * with RDB v3. Like EXPIRETIME but no with more precision. */
+            /* EXPIRETIME_MS: 毫秒精度的过期时间，
+             * 从 RDB v3 引入。与 EXPIRETIME 类似但精度更高。 */
             expiretime = rdbLoadMillisecondTime(rdb,rdbver);
             if (rioGetReadError(rdb)) goto eoferr;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_FREQ) {
-            /* FREQ: LFU frequency. */
+            /* FREQ: LFU 访问频率 */
             uint8_t byte;
             if (rioRead(rdb,&byte,1) == 0) goto eoferr;
             lfu_freq = byte;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_IDLE) {
-            /* IDLE: LRU idle time. */
+            /* IDLE: LRU 空闲时间 */
             uint64_t qword;
             if ((qword = rdbLoadLen(rdb,NULL)) == RDB_LENERR) goto eoferr;
             lru_idle = qword;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_EOF) {
-            /* EOF: End of file, exit the main loop. */
+            /* EOF: 文件结束，退出主循环 */
             break;
         } else if (type == RDB_OPCODE_SELECTDB) {
-            /* SELECTDB: Select the specified database. */
+            /* SELECTDB: 选择指定的数据库 */
             if ((dbid = rdbLoadLen(rdb,NULL)) == RDB_LENERR) goto eoferr;
             if (dbid >= (unsigned)server.dbnum) {
                 serverLog(LL_WARNING,
@@ -3403,8 +3383,8 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             db = rdb_loading_ctx->dbarray+dbid;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_RESIZEDB) {
-            /* RESIZEDB: Hint about the size of the keys in the currently
-             * selected data base, in order to avoid useless rehashing. */
+            /* RESIZEDB: 提示当前选中数据库的键数量，
+             * 以避免不必要的 rehash。 */
             if ((db_size = rdbLoadLen(rdb,NULL)) == RDB_LENERR)
                 goto eoferr;
             if ((expires_size = rdbLoadLen(rdb,NULL)) == RDB_LENERR)
@@ -3422,17 +3402,18 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             if (!server.cluster_enabled) {
                 continue; /* Ignore gracefully. */
             }
-            /* In cluster mode we resize individual slot specific dictionaries based on the number of keys that slot holds. */
+            /* 在集群模式下，根据各 slot 的键数量对
+             * 对应的字典进行扩容。 */
             kvstoreDictExpand(db->keys, slot_id, slot_size);
             kvstoreDictExpand(db->expires, slot_id, expires_slot_size);
             should_expand_db = 0;
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_AUX) {
-            /* AUX: generic string-string fields. Use to add state to RDB
-             * which is backward compatible. Implementations of RDB loading
-             * are required to skip AUX fields they don't understand.
+            /* AUX: 通用的字符串键值对字段。用于向 RDB 添加
+             * 向后兼容的状态信息。RDB 加载实现必须跳过
+             * 无法识别的 AUX 字段。
              *
-             * An AUX field is composed of two strings: key and value. */
+             * AUX 字段由两个字符串组成：键和值。 */
             robj *auxkey, *auxval;
             if ((auxkey = rdbLoadStringObject(rdb)) == NULL) goto eoferr;
             if ((auxval = rdbLoadStringObject(rdb)) == NULL) {
@@ -3441,9 +3422,8 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             }
 
             if (((char*)auxkey->ptr)[0] == '%') {
-                /* All the fields with a name staring with '%' are considered
-                 * information fields and are logged at startup with a log
-                 * level of NOTICE. */
+                /* 所有以 '%' 开头的字段名被视为信息字段，
+                 * 启动时以 NOTICE 级别记录日志。 */
                 serverLog(LL_NOTICE,"RDB '%s': %s",
                     (char*)auxkey->ptr,
                     (char*)auxval->ptr);
@@ -3457,7 +3437,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             } else if (!strcasecmp(auxkey->ptr,"repl-offset")) {
                 if (rsi) rsi->repl_offset = strtoll(auxval->ptr,NULL,10);
             } else if (!strcasecmp(auxkey->ptr,"lua")) {
-                /* Won't load the script back in memory anymore. */
+                /* 不再将脚本加载回内存 */
             } else if (!strcasecmp(auxkey->ptr,"redis-ver")) {
                 serverLog(LL_NOTICE,"Loading RDB produced by version %s",
                     (char*)auxval->ptr);
@@ -3478,10 +3458,9 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 long long isbase = strtoll(auxval->ptr, NULL, 10);
                 if (isbase) serverLog(LL_NOTICE, "RDB is base AOF");
             } else if (!strcasecmp(auxkey->ptr,"redis-bits")) {
-                /* Just ignored. */
+                /* 忽略该字段 */
             } else {
-                /* We ignore fields we don't understand, as by AUX field
-                 * contract. */
+                /* 按照 AUX 字段约定，忽略无法识别的字段 */
                 serverLog(LL_DEBUG,"Unrecognized RDB AUX field: '%s'",
                     (char*)auxkey->ptr);
             }
@@ -3490,9 +3469,8 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             decrRefCount(auxval);
             continue; /* Read type again. */
         } else if (type == RDB_OPCODE_MODULE_AUX) {
-            /* Load module data that is not related to the Redis key space.
-             * Such data can be potentially be stored both before and after the
-             * RDB keys-values section. */
+            /* 加载与 Redis 键空间无关的模块数据。
+             * 此类数据可能存储在 RDB 键值部分之前或之后。 */
             uint64_t moduleid = rdbLoadLen(rdb,NULL);
             int when_opcode = rdbLoadLen(rdb,NULL);
             int when = rdbLoadLen(rdb,NULL);
@@ -3506,20 +3484,20 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             moduleTypeNameByID(name,moduleid);
 
             if (!rdbCheckMode && mt == NULL) {
-                /* Unknown module. */
+                /* 未知模块 */
                 serverLog(LL_WARNING,"The RDB file contains AUX module data I can't load: no matching module '%s'", name);
                 exit(1);
             } else if (!rdbCheckMode && mt != NULL) {
                 if (!mt->aux_load) {
-                    /* Module doesn't support AUX. */
+                    /* 模块不支持 AUX */
                     serverLog(LL_WARNING,"The RDB file contains module AUX data, but the module '%s' doesn't seem to support it.", name);
                     exit(1);
                 }
 
                 RedisModuleIO io;
                 moduleInitIOContext(io,mt,rdb,NULL,-1);
-                /* Call the rdb_load method of the module providing the 10 bit
-                 * encoding version in the lower 10 bits of the module ID. */
+                /* 调用模块的 rdb_load 方法，编码版本号
+                 * 存储在模块 ID 的低 10 位中。 */
                 int rc = mt->aux_load(&io,moduleid&1023, when);
                 if (io.ctx) {
                     moduleFreeContext(io.ctx);
@@ -3537,7 +3515,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 }
                 continue;
             } else {
-                /* RDB check mode. */
+                /* RDB 检查模式 */
                 robj *aux = rdbLoadCheckModuleValue(rdb,name);
                 decrRefCount(aux);
                 continue; /* Read next opcode. */
@@ -3555,33 +3533,30 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             continue;
         }
 
-        /* If there is no slot info, it means that it's either not cluster mode or we are trying to load legacy RDB file.
-         * In this case we want to estimate number of keys per slot and resize accordingly. */
+        /* 如果没有 slot 信息，说明不在集群模式或正在加载
+         * 旧版 RDB 文件。此时需要估算每个 slot 的键数量并相应扩容。 */
         if (should_expand_db) {
             dbExpand(db, db_size, 0);
             dbExpandExpires(db, expires_size, 0);
             should_expand_db = 0;
         }
 
-        /* Read key */
+        /* 读取键 */
         if ((key = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL)) == NULL)
             goto eoferr;
-        /* Read value */
+        /* 读取值 */
         val = rdbLoadObject(type,rdb,key,db->id,&error);
 
-        /* Check if the key already expired. This function is used when loading
-         * an RDB file from disk, either at startup, or when an RDB was
-         * received from the master. In the latter case, the master is
-         * responsible for key expiry. If we would expire keys here, the
-         * snapshot taken by the master may not be reflected on the slave.
-         * Similarly, if the base AOF is RDB format, we want to load all
-         * the keys they are, since the log of operations in the incr AOF
-         * is assumed to work in the exact keyspace state. */
+        /* 检查键是否已过期。此函数用于从磁盘加载 RDB 文件
+         * 时，无论是在启动时还是从主节点接收 RDB 时。
+         * 在后一种情况下，主节点负责键的过期。如果在此处
+         * 过期键，主节点的快照可能无法反映到从节点。
+         * 同理，如果基础 AOF 是 RDB 格式，我们需要加载所有键，
+         * 因为增量 AOF 中的操作日志假定在精确的键空间状态下运行。 */
         if (val == NULL) {
-            /* Since we used to have bug that could lead to empty keys
-             * (See #8453), we rather not fail when empty key is encountered
-             * in an RDB file, instead we will silently discard it and
-             * continue loading. */
+            /* 由于我们曾经遇到可能导致空键的 bug（参见 #8453），
+             * 遇到 RDB 文件中的空键时不报错，
+             * 而是静默丢弃并继续加载。 */
             if (error == RDB_LOAD_ERR_EMPTY_KEY) {
                 if(empty_keys_skipped++ < 10)
                     serverLog(LL_NOTICE, "rdbLoadObject skipping empty key: %s", key);
@@ -3595,9 +3570,9 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             expiretime != -1 && expiretime < now)
         {
             if (rdbflags & RDBFLAGS_FEED_REPL) {
-                /* Caller should have created replication backlog,
-                 * and now this path only works when rebooting,
-                 * so we don't have replicas yet. */
+                /* 调用者应已创建复制积压缓冲区，
+                 * 此路径仅在重启时生效，
+                 * 因此此时没有从节点。 */
                 serverAssert(server.repl_backlog != NULL && listLength(server.slaves) == 0);
                 robj keyobj;
                 initStaticStringObject(keyobj,key);
@@ -3613,14 +3588,13 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             robj keyobj;
             initStaticStringObject(keyobj,key);
 
-            /* Add the new object in the hash table */
+            /* 将新对象添加到哈希表 */
             int added = dbAddRDBLoad(db,key,val);
             server.rdb_last_load_keys_loaded++;
             if (!added) {
                 if (rdbflags & RDBFLAGS_ALLOW_DUP) {
-                    /* This flag is useful for DEBUG RELOAD special modes.
-                     * When it's set we allow new keys to replace the current
-                     * keys with the same name. */
+                    /* 此标志用于 DEBUG RELOAD 特殊模式。
+                     * 设置后允许新键替换同名的现有键。 */
                     dbSyncDelete(db,&keyobj);
                     dbAddRDBLoad(db,key,val);
                 } else {
@@ -3630,38 +3604,37 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 }
             }
 
-            /* If minExpiredField was set, then the object is hash with expiration
-             * on fields and need to register it in global HFE DS */
+            /* 如果设置了 minExpiredField，则对象是带字段过期的哈希，
+             * 需要在全局 HFE DS 中注册 */
             if (val->type == OBJ_HASH) {
                 uint64_t minExpiredField = hashTypeGetMinExpire(val, 1);
                 if (minExpiredField != EB_EXPIRE_TIME_INVALID)
                     hashTypeAddToExpires(db, key, val, minExpiredField);
             }
 
-            /* Set the expire time if needed */
+            /* 根据需要设置过期时间 */
             if (expiretime != -1) {
                 setExpire(NULL,db,&keyobj,expiretime);
             }
 
-            /* Set usage information (for eviction). */
+            /* 设置使用信息（用于淘汰策略） */
             objectSetLRUOrLFU(val,lfu_freq,lru_idle,lru_clock,1000);
 
-            /* call key space notification on key loaded for modules only */
+            /* 仅为模块触发键空间加载通知 */
             moduleNotifyKeyspaceEvent(NOTIFY_LOADED, "loaded", &keyobj, db->id);
         }
 
-        /* Loading the database more slowly is useful in order to test
-         * certain edge cases. */
+        /* 以较慢的速度加载数据库，用于测试某些边缘情况。 */
         if (server.key_load_delay)
             debugDelay(server.key_load_delay);
 
-        /* Reset the state that is key-specified and is populated by
-         * opcodes before the key, so that we start from scratch again. */
+        /* 重置由之前操作码设置的键相关状态，
+         * 以便从头开始处理下一个键。 */
         expiretime = -1;
         lfu_freq = -1;
         lru_idle = -1;
     }
-    /* Verify the checksum if RDB version is >= 5 */
+    /* 如果 RDB 版本 >= 5，验证校验和 */
     if (rdbver >= 5) {
         uint64_t cksum, expected = rdb->cksum;
 
@@ -3692,10 +3665,10 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
     }
     return C_OK;
 
-    /* Unexpected end of file is handled here calling rdbReportReadError():
-     * this will in turn either abort Redis in most cases, or if we are loading
-     * the RDB file from a socket during initial SYNC (diskless replica mode),
-     * we'll report the error to the caller, so that we can retry. */
+    /* 意外的文件结尾通过调用 rdbReportReadError() 处理：
+     * 大多数情况下会终止 Redis，但如果我们在初始 SYNC 期间
+     * 从套接字加载 RDB 文件（无盘副本模式），
+     * 则将错误报告给调用者以便重试。 */
 eoferr:
     serverLog(LL_WARNING,
         "Short read or OOM loading DB. Unrecoverable error, aborting now.");
@@ -3703,13 +3676,12 @@ eoferr:
     return C_ERR;
 }
 
-/* Like rdbLoadRio() but takes a filename instead of a rio stream. The
- * filename is open for reading and a rio stream object created in order
- * to do the actual loading. Moreover the ETA displayed in the INFO
- * output is initialized and finalized.
+/* 类似于 rdbLoadRio()，但接受文件名而非 rio 流。
+ * 该函数打开文件进行读取并创建 rio 流对象来执行加载。
+ * 同时初始化和完成 INFO 输出中显示的 ETA。
  *
- * If you pass an 'rsi' structure initialized with RDB_SAVE_INFO_INIT, the
- * loading code will fill the information fields in the structure. */
+ * 如果传入使用 RDB_SAVE_INFO_INIT 初始化的 'rsi' 结构，
+ * 加载代码将填充该结构中的信息字段。 */
 int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
     FILE *fp;
     rio rdb;
@@ -3735,17 +3707,17 @@ int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
 
     fclose(fp);
     stopLoading(retval==C_OK);
-    /* Reclaim the cache backed by rdb */
+    /* 回收 RDB 文件占用的页缓存 */
     if (retval == C_OK && !(rdbflags & RDBFLAGS_KEEP_CACHE)) {
-        /* TODO: maybe we could combine the fopen and open into one in the future */
+        /* TODO: 未来或许可以将 fopen 和 open 合并为一次操作 */
         rdb_fd = open(filename, O_RDONLY);
         if (rdb_fd >= 0) bioCreateCloseJob(rdb_fd, 0, 1);
     }
     return (retval==C_OK) ? RDB_OK : RDB_FAILED;
 }
 
-/* A background saving child (BGSAVE) terminated its work. Handle this.
- * This function covers the case of actual BGSAVEs. */
+/* 后台保存子进程（BGSAVE）完成后的处理函数。
+ * 此函数处理实际的 BGSAVE 磁盘写入场景。 */
 static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t save_end) {
     if (!bysignal && exitcode == 0) {
         serverLog(LL_NOTICE,
@@ -3765,16 +3737,15 @@ static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t sav
         rdbRemoveTempFile(server.child_pid, 0);
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("rdb-unlink-temp-file",latency);
-        /* SIGUSR1 is whitelisted, so we have a way to kill a child without
-         * triggering an error condition. */
+        /* SIGUSR1 被加入白名单，因此我们可以用它
+         * 终止子进程而不触发错误状态。 */
         if (bysignal != SIGUSR1)
             server.lastbgsave_status = C_ERR;
     }
 }
 
-/* A background saving child (BGSAVE) terminated its work. Handle this.
- * This function covers the case of RDB -> Slaves socket transfers for
- * diskless replication. */
+/* 后台保存子进程（BGSAVE）完成后的处理函数。
+ * 此函数处理无盘复制中 RDB -> 从节点套接字传输的场景。 */
 static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
     if (!bysignal && exitcode == 0) {
         serverLog(LL_NOTICE,
@@ -3800,7 +3771,7 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
     server.rdb_pipe_bufflen = 0;
 }
 
-/* When a background RDB saving/transfer terminates, call the right handler. */
+/* 当后台 RDB 保存/传输完成时，调用相应的处理函数。 */
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     int type = server.rdb_child_type;
     time_t save_end = time(NULL);
@@ -3822,32 +3793,33 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     server.rdb_save_time_last = save_end-server.rdb_save_time_start;
     server.rdb_save_time_start = -1;
     server.bgsave_aborted = 0;
-    /* Possibly there are slaves waiting for a BGSAVE in order to be served
-     * (the first stage of SYNC is a bulk transfer of dump.rdb) */
+    /* 可能有从节点正在等待 BGSAVE 以完成同步
+     * （SYNC 的第一阶段是 dump.rdb 的批量传输） */
     updateSlavesWaitingBgsave((!bysignal && exitcode == 0) ? C_OK : C_ERR, type);
 }
 
-/* Kill the RDB saving child using SIGUSR1 (so that the parent will know
- * the child did not exit for an error, but because we wanted), and performs
- * the cleanup needed. */
+/* 使用 SIGUSR1 终止 RDB 保存子进程（使父进程知道
+ * 子进程并非因错误退出，而是被主动终止），
+ * 并执行必要的清理工作。 */
 void killRDBChild(void) {
     kill(server.child_pid, SIGUSR1);
-    /* Because we are not using here waitpid (like we have in killAppendOnlyChild
-     * and TerminateModuleForkChild), all the cleanup operations is done by
-     * checkChildrenDone, that later will find that the process killed.
-     * This includes:
+    /* 由于此处未使用 waitpid（与 killAppendOnlyChild
+     * 和 TerminateModuleForkChild 不同），所有清理操作
+     * 由 checkChildrenDone 完成，它稍后会发现进程已被终止。
+     * 清理操作包括：
      * - resetChildState
      * - rdbRemoveTempFile */
 
-    /* However, there's a chance the child already exited (or about to exit), and will
-     * not receive the signal, in that case it could result in success and the done
-     * handler will override some server metrics (e.g. the dirty counter) which it
-     * shouldn't (e.g. in case of FLUSHALL), or the synchronously created RDB file. */
+    /* 然而，子进程可能已经退出（或即将退出），
+     * 因此无法接收信号。在这种情况下子进程可能返回成功，
+     * 完成处理函数会错误地覆盖某些服务器指标
+     * （如 dirty 计数器，例如在 FLUSHALL 时），
+     * 或覆盖同步创建的 RDB 文件。 */
      server.bgsave_aborted = 1;
 }
 
-/* Spawn an RDB child that writes the RDB to the sockets of the slaves
- * that are currently in SLAVE_STATE_WAIT_BGSAVE_START state. */
+/* 创建一个 RDB 子进程，将 RDB 写入处于
+ * SLAVE_STATE_WAIT_BGSAVE_START 状态的从节点套接字。 */
 int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listNode *ln;
     listIter li;
@@ -3856,20 +3828,18 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
 
     if (hasActiveChildProcess()) return C_ERR;
 
-    /* Even if the previous fork child exited, don't start a new one until we
-     * drained the pipe. */
+    /* 即使上一个 fork 子进程已退出，在管道数据
+     * 未完全读取前不要启动新的子进程。 */
     if (server.rdb_pipe_conns) return C_ERR;
 
-    /* Before to fork, create a pipe that is used to transfer the rdb bytes to
-     * the parent, we can't let it write directly to the sockets, since in case
-     * of TLS we must let the parent handle a continuous TLS state when the
-     * child terminates and parent takes over. */
+    /* 在 fork 之前创建一个管道，用于将 RDB 字节传输到父进程。
+     * 不能让子进程直接写入套接字，因为在 TLS 情况下
+     * 子进程终止后父进程接管时必须保持连续的 TLS 状态。 */
     if (anetPipe(pipefds, O_NONBLOCK, 0) == -1) return C_ERR;
     server.rdb_pipe_read = pipefds[0]; /* read end */
     rdb_pipe_write = pipefds[1]; /* write end */
 
-    /* create another pipe that is used by the parent to signal to the child
-     * that it can exit. */
+    /* 创建另一个管道，用于父进程通知子进程可以退出。 */
     if (anetPipe(pipefds, 0, 0) == -1) {
         close(rdb_pipe_write);
         close(server.rdb_pipe_read);
@@ -3878,8 +3848,8 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     safe_to_exit_pipe = pipefds[0]; /* read end */
     server.rdb_child_exit_pipe = pipefds[1]; /* write end */
 
-    /* Collect the connections of the replicas we want to transfer
-     * the RDB to, which are i WAIT_BGSAVE_START state. */
+    /* 收集需要传输 RDB 的从节点连接，
+     * 即处于 WAIT_BGSAVE_START 状态的从节点。 */
     server.rdb_pipe_conns = zmalloc(sizeof(connection *)*listLength(server.slaves));
     server.rdb_pipe_numconns = 0;
     server.rdb_pipe_numconns_writing = 0;
@@ -3887,7 +3857,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     while((ln = listNext(&li))) {
         client *slave = ln->value;
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
-            /* Check slave has the exact requirements */
+            /* 检查从节点是否有精确匹配的要求 */
             if (slave->slave_req != req)
                 continue;
             server.rdb_pipe_conns[server.rdb_pipe_numconns++] = slave->conn;
@@ -3895,7 +3865,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         }
     }
 
-    /* Create the child process. */
+    /* 创建子进程 */
     if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
         /* Child */
         int retval, dummy;
@@ -3903,8 +3873,8 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
 
         rioInitWithFd(&rdb,rdb_pipe_write);
 
-        /* Close the reading part, so that if the parent crashes, the child will
-         * get a write error and exit. */
+        /* 关闭读取端，这样如果父进程崩溃，
+         * 子进程会收到写入错误并退出。 */
         close(server.rdb_pipe_read);
 
         redisSetProcTitle("redis-rdb-to-slaves");
@@ -3919,11 +3889,11 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         }
 
         rioFreeFd(&rdb);
-        /* wake up the reader, tell it we're done. */
+        /* 唤醒读取端，通知已完成 */
         close(rdb_pipe_write);
-        close(server.rdb_child_exit_pipe); /* close write end so that we can detect the close on the parent. */
-        /* hold exit until the parent tells us it's safe. we're not expecting
-         * to read anything, just get the error when the pipe is closed. */
+        close(server.rdb_child_exit_pipe); /* 关闭写入端以便父进程检测到关闭 */
+        /* 等待父进程通知可以安全退出。我们不期望读取到
+         * 任何数据，仅在管道关闭时收到错误。 */
         dummy = read(safe_to_exit_pipe, pipefds, 1);
         UNUSED(dummy);
         exitFromChild((retval == C_OK) ? 0 : 1);
@@ -3933,9 +3903,10 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
             serverLog(LL_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
 
-            /* Undo the state change. The caller will perform cleanup on
-             * all the slaves in BGSAVE_START state, but an early call to
-             * replicationSetupSlaveForFullResync() turned it into BGSAVE_END */
+            /* 撤销状态变更。调用者将对所有处于
+             * BGSAVE_START 状态的从节点执行清理，
+             * 但 replicationSetupSlaveForFullResync() 的提前调用
+             * 已将其转为 BGSAVE_END */
             listRewind(server.slaves,&li);
             while((ln = listNext(&li))) {
                 client *slave = ln->value;
@@ -3955,7 +3926,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
                 (long) childpid);
             server.rdb_save_time_start = time(NULL);
             server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
-            close(rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
+            close(rdb_pipe_write); /* 在父进程中关闭写入端以便检测子进程关闭 */
             if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler,NULL) == AE_ERR) {
                 serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
             }
@@ -3963,9 +3934,11 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         close(safe_to_exit_pipe);
         return (childpid == -1) ? C_ERR : C_OK;
     }
-    return C_OK; /* Unreached. */
+    return C_OK; /* 不可达 */
 }
 
+/* SAVE 命令实现。同步保存数据库到磁盘。
+ * 如果后台保存已在进行中则返回错误。 */
 void saveCommand(client *c) {
     if (server.child_type == CHILD_TYPE_RDB) {
         addReplyError(c,"Background save already in progress");
@@ -3983,12 +3956,12 @@ void saveCommand(client *c) {
     }
 }
 
-/* BGSAVE [SCHEDULE] */
+/* BGSAVE [SCHEDULE] 命令实现 */
 void bgsaveCommand(client *c) {
     int schedule = 0;
 
-    /* The SCHEDULE option changes the behavior of BGSAVE when an AOF rewrite
-     * is in progress. Instead of returning an error a BGSAVE gets scheduled. */
+    /* SCHEDULE 选项改变了 BGSAVE 在 AOF 重写进行中的行为。
+     * 不返回错误，而是调度一个 BGSAVE。 */
     if (c->argc > 1) {
         if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"schedule")) {
             schedule = 1;
@@ -4020,26 +3993,22 @@ void bgsaveCommand(client *c) {
     }
 }
 
-/* Populate the rdbSaveInfo structure used to persist the replication
- * information inside the RDB file. Currently the structure explicitly
- * contains just the currently selected DB from the master stream, however
- * if the rdbSave*() family functions receive a NULL rsi structure also
- * the Replication ID/offset is not saved. The function populates 'rsi'
- * that is normally stack-allocated in the caller, returns the populated
- * pointer if the instance has a valid master client, otherwise NULL
- * is returned, and the RDB saving will not persist any replication related
- * information. */
+/* 填充用于在 RDB 文件中持久化复制信息的 rdbSaveInfo 结构。
+ * 当前该结构仅显式包含主节点流中当前选中的数据库。
+ * 然而如果 rdbSave*() 系列函数收到 NULL rsi 结构，
+ * 复制 ID/偏移量也不会被保存。
+ * 函数填充 'rsi'（通常由调用者在栈上分配），
+ * 如果实例有有效的主客户端则返回填充后的指针，
+ * 否则返回 NULL，此时 RDB 保存不会持久化任何复制相关信息。 */
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi) {
     rdbSaveInfo rsi_init = RDB_SAVE_INFO_INIT;
     *rsi = rsi_init;
 
-    /* If the instance is a master, we can populate the replication info
-     * only when repl_backlog is not NULL. If the repl_backlog is NULL,
-     * it means that the instance isn't in any replication chains. In this
-     * scenario the replication info is useless, because when a slave
-     * connects to us, the NULL repl_backlog will trigger a full
-     * synchronization, at the same time we will use a new replid and clear
-     * replid2. */
+    /* 如果实例是主节点，只有在 repl_backlog 不为 NULL 时
+     * 才能填充复制信息。如果 repl_backlog 为 NULL，
+     * 说明实例不在任何复制链中。在这种场景下复制信息无用，
+     * 因为当从节点连接到我们时，NULL 的 repl_backlog 会触发
+     * 全量同步，同时我们会使用新的 replid 并清空旧的。 */
     if (!server.masterhost && server.repl_backlog) {
         /* Note that when server.slaveseldb is -1, it means that this master
          * didn't apply any write commands after a full synchronization.

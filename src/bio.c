@@ -1,38 +1,31 @@
-/* Background I/O service for Redis.
+/* Redis 后台 I/O 服务。
  *
- * This file implements operations that we need to perform in the background.
- * Currently there are 3 operations:
- * 1) a background close(2) system call. This is needed when the process is
- *    the last owner of a reference to a file closing it means unlinking it, and
- *    the deletion of the file is slow, blocking the server.
- * 2) AOF fsync
- * 3) lazyfree of memory
+ * 本文件实现了需要在后台执行的操作。当前共有 3 类操作：
+ * 1) 后台 close(2) 系统调用。当进程是文件引用的最后一个拥有者时，
+ *    关闭该文件意味着要 unlink 它，而删除文件可能很慢，会阻塞服务器。
+ * 2) AOF fsync（AOF 文件同步）
+ * 3) lazyfree（惰性释放内存）
  *
- * In the future we'll either continue implementing new things we need or
- * we'll switch to libeio. However there are probably long term uses for this
- * file as we may want to put here Redis specific background tasks.
+ * 未来我们可能会继续实现新的后台任务，或者切换到 libeio。
+ * 不过这个文件长期来看仍然有用，因为我们可以把 Redis 特有的后台任务
+ * 放在这里。
  *
- * DESIGN
+ * 设计说明
  * ------
  *
- * The design is simple: We have a structure representing a job to perform,
- * and several worker threads and job queues. Every job type is assigned to
- * a specific worker thread, and a single worker may handle several different
- * job types.
- * Every thread waits for new jobs in its queue, and processes every job
- * sequentially.
+ * 设计很简单：我们用一个结构体表示一个待执行的作业，
+ * 并配有若干工作线程和作业队列。每种作业类型被分配到
+ * 一个特定的工作线程，一个工作线程可以处理多种不同的作业类型。
+ * 每个线程在自己的队列上等待新作业，并按顺序处理每个作业。
  *
- * Jobs handled by the same worker are guaranteed to be processed from the
- * least-recently-inserted to the most-recently-inserted (older jobs processed
- * first).
+ * 由同一个工作线程处理的作业保证按照从最早插入到最近插入的
+ * 顺序进行处理（较早的作业先处理）。
  *
- * To let the creator of the job to be notified about the completion of the 
- * operation, it will need to submit additional dummy job, coined as
- * completion job request that will be written back eventually, by the
- * background thread, into completion job response queue. This notification
- * layout can simplify flows that might submit more than one job, such as
- * in case of FLUSHALL which for a single command submits multiple jobs. It
- * is also correct because jobs are processed in FIFO fashion.
+ * 为了让作业创建者能够在操作完成时收到通知，它需要额外提交一个
+ * 虚拟作业（称为“完成作业请求”），后台线程最终会将其回写到
+ * 完成作业响应队列中。这种通知机制可以简化需要提交多个作业的流程，
+ * 例如 FLUSHALL 会为单个命令提交多个作业。由于作业按 FIFO 顺序处理，
+ * 因此这种机制也是正确的。
  *
  * ----------------------------------------------------------------------------
  *
@@ -47,124 +40,129 @@
 #include "bio.h"
 #include <fcntl.h>
 
+/* 后台工作线程的名称数组。下标对应 bio_worker_t 枚举值。
+ * 用作 pthread 的 thread title，方便调试时识别线程类型。 */
 static char* bio_worker_title[] = {
-    "bio_close_file",
-    "bio_aof",
-    "bio_lazy_free",
+    "bio_close_file",   // 负责异步关闭文件的工作线程
+    "bio_aof",          // 负责 AOF fsync / 关闭 AOF 的工作线程
+    "bio_lazy_free",    // 负责惰性释放内存的工作线程
 };
 
+/* 后台工作线程数量：由线程名称数组长度推导而来。 */
 #define BIO_WORKER_NUM (sizeof(bio_worker_title) / sizeof(*bio_worker_title))
 
+/* 作业类型到工作线程下标的映射表。
+ * 用于在 bioSubmitJob 中根据作业类型找到对应的后台线程。 */
 static unsigned int bio_job_to_worker[] = {
-    [BIO_CLOSE_FILE] = 0,
-    [BIO_AOF_FSYNC] = 1,
-    [BIO_CLOSE_AOF] = 1,
-    [BIO_LAZY_FREE] = 2,
-    [BIO_COMP_RQ_CLOSE_FILE] = 0,
-    [BIO_COMP_RQ_AOF_FSYNC]  = 1,
-    [BIO_COMP_RQ_LAZY_FREE]  = 2
+    [BIO_CLOSE_FILE] = 0,            // 关闭文件 -> 工作线程 0
+    [BIO_AOF_FSYNC] = 1,             // AOF fsync -> 工作线程 1
+    [BIO_CLOSE_AOF] = 1,             // 关闭 AOF -> 工作线程 1
+    [BIO_LAZY_FREE] = 2,             // 惰性释放 -> 工作线程 2
+    [BIO_COMP_RQ_CLOSE_FILE] = 0,    // 关闭文件完成回调 -> 工作线程 0
+    [BIO_COMP_RQ_AOF_FSYNC]  = 1,    // AOF fsync 完成回调 -> 工作线程 1
+    [BIO_COMP_RQ_LAZY_FREE]  = 2     // 惰性释放完成回调 -> 工作线程 2
 };
 
+/* 各工作线程的 pthread 句柄、互斥锁、条件变量、作业队列。
+ * BIO_WORKER_NUM 与 bio_worker_title 数组长度一致。 */
 static pthread_t bio_threads[BIO_WORKER_NUM];
 static pthread_mutex_t bio_mutex[BIO_WORKER_NUM];
 static pthread_cond_t bio_newjob_cond[BIO_WORKER_NUM];
 static list *bio_jobs[BIO_WORKER_NUM];
+/* 每种作业类型的待处理计数。bio_pending_jobs_of_type 用于向 INFO 等接口暴露。 */
 static unsigned long bio_jobs_counter[BIO_NUM_OPS] = {0};
 
-/* The bio_comp_list is used to hold completion job responses and to handover
- * to main thread to callback as notification for job completion. Main
- * thread will be triggered to read the list by signaling via writing to a pipe */
+/* bio_comp_list 用于保存完成作业响应，并交接给主线程以回调的方式
+ * 通知作业完成。主线程通过向管道写入信号来触发读取该列表。 */
 static list *bio_comp_list;
 static pthread_mutex_t bio_mutex_comp;
-static int job_comp_pipe[2];   /* Pipe used to awake the event loop */
+static int job_comp_pipe[2];   /* 用于唤醒事件循环的管道 */
 
 typedef struct bio_comp_item {
-    comp_fn *func;    /* callback after completion job will be processed  */
-    uint64_t arg;     /* user data to be passed to the function */
+    comp_fn *func;    /* 作业完成后的回调函数 */
+    uint64_t arg;     /* 传递给回调函数的用户数据 */
 } bio_comp_item;
 
-/* This structure represents a background Job. It is only used locally to this
- * file as the API does not expose the internals at all. */
+/* 该结构体表示一个后台作业。它仅在本文件内使用，
+ * 因为 API 完全不向外暴露其内部细节。 */
 typedef union bio_job {
     struct {
-        int type; /* Job-type tag. This needs to appear as the first element in all union members. */
+        int type; /* 作业类型标签。必须是所有联合成员的第一个元素。 */
     } header;
 
-    /* Job specific arguments.*/
+    /* 作业特定的参数。*/
     struct {
         int type;
-        int fd; /* Fd for file based background jobs */
-        long long offset; /* A job-specific offset, if applicable */
-        unsigned need_fsync:1; /* A flag to indicate that a fsync is required before
-                                * the file is closed. */
-        unsigned need_reclaim_cache:1; /* A flag to indicate that reclaim cache is required before
-                                * the file is closed. */
+        int fd; /* 基于文件的后台作业所使用的 fd */
+        long long offset; /* 作业相关的偏移量（如适用） */
+        unsigned need_fsync:1; /* 指示关闭文件前是否需要执行 fsync。*/
+        unsigned need_reclaim_cache:1; /* 指示关闭文件前是否需要回收页缓存。*/
     } fd_args;
 
     struct {
         int type;
-        lazy_free_fn *free_fn; /* Function that will free the provided arguments */
-        void *free_args[]; /* List of arguments to be passed to the free function */
+        lazy_free_fn *free_fn; /* 用于释放传入参数的函数 */
+        void *free_args[]; /* 传递给释放函数的参数列表（柔性数组） */
     } free_args;
     struct {
-        int type; /* header */
-        comp_fn *fn; /* callback. Handover to main thread to cb as notify for job completion */
-        uint64_t arg; /* callback arguments */
+        int type; /* 头部 */
+        comp_fn *fn; /* 回调函数。交给主线程回调，作为作业完成的通知 */
+        uint64_t arg; /* 回调参数 */
     } comp_rq;
 } bio_job;
 
 void *bioProcessBackgroundJobs(void *arg);
 void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask);
 
-/* Make sure we have enough stack to perform all the things we do in the
- * main thread. */
+/* 确保我们有足够的栈空间来执行所有在主线程中做的事情。 */
 #define REDIS_THREAD_STACK_SIZE (1024*1024*4)
 
-/* Initialize the background system, spawning the thread. */
+/* 初始化后台 I/O 系统，派生工作线程。
+ * 创建每个工作线程的互斥锁、条件变量、作业队列，完成列表与管道，
+ * 并向事件循环注册管道读事件用于接收作业完成通知。 */
 void bioInit(void) {
     pthread_attr_t attr;
     pthread_t thread;
     size_t stacksize;
     unsigned long j;
 
-    /* Initialization of state vars and objects */
+    /* 初始化状态变量与对象 */
     for (j = 0; j < BIO_WORKER_NUM; j++) {
         pthread_mutex_init(&bio_mutex[j],NULL);
         pthread_cond_init(&bio_newjob_cond[j],NULL);
         bio_jobs[j] = listCreate();
     }
 
-    /* init jobs comp responses */
+    /* 初始化作业完成响应列表 */
     bio_comp_list = listCreate();
     pthread_mutex_init(&bio_mutex_comp, NULL);
 
-    /* Create a pipe for background thread to be able to wake up the redis main thread.
-     * Make the pipe non blocking. This is just a best effort aware mechanism
-     * and we do not want to block not in the read nor in the write half.
-     * Enable close-on-exec flag on pipes in case of the fork-exec system calls in
-     * sentinels or redis servers. */
+    /* 创建一个管道，以便后台线程能够唤醒 Redis 主线程。
+     * 将管道设置为非阻塞。这只是一种尽力而为的唤醒机制，
+     * 我们不希望在读或写端发生阻塞。
+     * 在管道上启用 close-on-exec 标志，以应对 sentinel 或
+     * redis 服务器中可能的 fork-exec 系统调用。 */
     if (anetPipe(job_comp_pipe, O_CLOEXEC|O_NONBLOCK, O_CLOEXEC|O_NONBLOCK) == -1) {
         serverLog(LL_WARNING,
                   "Can't create the pipe for bio thread: %s", strerror(errno));
         exit(1);
     }
 
-    /* Register a readable event for the pipe used to awake the event loop on job completion */
+    /* 为管道注册一个可读事件，用于在作业完成时唤醒事件循环 */
     if (aeCreateFileEvent(server.el, job_comp_pipe[0], AE_READABLE,
                           bioPipeReadJobCompList, NULL) == AE_ERR) {
         serverPanic("Error registering the readable event for the bio pipe.");
     }
 
-    /* Set the stack size as by default it may be small in some system */
+    /* 设置栈大小，因为某些系统的默认栈大小可能较小 */
     pthread_attr_init(&attr);
     pthread_attr_getstacksize(&attr,&stacksize);
-    if (!stacksize) stacksize = 1; /* The world is full of Solaris Fixes */
+    if (!stacksize) stacksize = 1; /* 世界充满了针对 Solaris 的补丁 */
     while (stacksize < REDIS_THREAD_STACK_SIZE) stacksize *= 2;
     pthread_attr_setstacksize(&attr, stacksize);
 
-    /* Ready to spawn our threads. We use the single argument the thread
-     * function accepts in order to pass the job ID the thread is
-     * responsible for. */
+    /* 准备派生线程。我们使用线程函数接受的单个参数
+     * 来传入该线程所负责的工作线程下标。 */
     for (j = 0; j < BIO_WORKER_NUM; j++) {
         void *arg = (void*)(unsigned long) j;
         if (pthread_create(&thread,&attr,bioProcessBackgroundJobs,arg) != 0) {
@@ -175,6 +173,10 @@ void bioInit(void) {
     }
 }
 
+/* 提交一个后台作业。
+ * type 为作业类型（CLOSE_FILE / AOF_FSYNC / LAZY_FREE 等），
+ * job 为已分配好的 bio_job 联合体（其 header.type 字段将被覆盖）。
+ * 该函数将作业追加到对应工作线程的队尾，并递增计数器与发送条件信号。 */
 void bioSubmitJob(int type, bio_job *job) {
     job->header.type = type;
     unsigned long worker = bio_job_to_worker[type];
@@ -185,10 +187,12 @@ void bioSubmitJob(int type, bio_job *job) {
     pthread_mutex_unlock(&bio_mutex[worker]);
 }
 
+/* 创建并提交一个惰性释放作业。
+ * free_fn 为释放函数，arg_count 为可变参数个数。
+ * 后台线程会调用 free_fn(free_args[0..arg_count-1])。 */
 void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...) {
     va_list valist;
-    /* Allocate memory for the job structure and all required
-     * arguments */
+    /* 为作业结构体以及所有必需的参数分配内存 */
     bio_job *job = zmalloc(sizeof(*job) + sizeof(void *) * (arg_count));
     job->free_args.free_fn = free_fn;
 
@@ -200,6 +204,9 @@ void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...) {
     bioSubmitJob(BIO_LAZY_FREE, job);
 }
 
+/* 在指定工作线程上注册一个“作业完成”回调请求。
+ * 后台线程在完成前置作业后，会将回调写回主线程的完成列表，
+ * 主线程随后会在事件循环中执行 func(user_data)。 */
 void bioCreateCompRq(bio_worker_t assigned_worker, comp_fn *func, uint64_t user_data) {
     int type;
     switch (assigned_worker) {
@@ -222,6 +229,9 @@ void bioCreateCompRq(bio_worker_t assigned_worker, comp_fn *func, uint64_t user_
     bioSubmitJob(type, job);
 }
 
+/* 创建一个“后台关闭文件”作业。
+ * fd 为待关闭的文件描述符；need_fsync 表示关闭前是否需要 fsync；
+ * need_reclaim_cache 表示关闭前是否需要回收页缓存。 */
 void bioCreateCloseJob(int fd, int need_fsync, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -231,6 +241,9 @@ void bioCreateCloseJob(int fd, int need_fsync, int need_reclaim_cache) {
     bioSubmitJob(BIO_CLOSE_FILE, job);
 }
 
+/* 创建一个“后台关闭 AOF 文件”作业。
+ * fd 为待关闭的 AOF 文件描述符；offset 为对应的复制偏移；
+ * need_reclaim_cache 表示关闭前是否需要回收页缓存。 */
 void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -241,6 +254,9 @@ void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_CLOSE_AOF, job);
 }
 
+/* 创建一个“后台 fsync AOF 文件”作业。
+ * fd 为 AOF 文件描述符；offset 为对应的复制偏移；
+ * need_reclaim_cache 表示 fsync 后是否需要回收页缓存。 */
 void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -250,12 +266,16 @@ void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_AOF_FSYNC, job);
 }
 
+/* 后台 I/O 线程入口。
+ * 每个工作线程负责一个 bio_jobs[worker] 队列，
+ * 循环从队列中取出作业并按类型分派执行。
+ * 线程退出前会一直循环。 */
 void *bioProcessBackgroundJobs(void *arg) {
     bio_job *job;
     unsigned long worker = (unsigned long) arg;
     sigset_t sigset;
 
-    /* Check that the worker is within the right interval. */
+    /* 校验工作线程下标在合法范围内。 */
     serverAssert(worker < BIO_WORKER_NUM);
 
     redis_set_thread_title(bio_worker_title[worker]);
@@ -265,8 +285,7 @@ void *bioProcessBackgroundJobs(void *arg) {
     makeThreadKillable();
 
     pthread_mutex_lock(&bio_mutex[worker]);
-    /* Block SIGALRM so we are sure that only the main thread will
-     * receive the watchdog signal. */
+    /* 屏蔽 SIGALRM，确保只有主线程会接收看门狗信号。 */
     sigemptyset(&sigset);
     sigaddset(&sigset, SIGALRM);
     if (pthread_sigmask(SIG_BLOCK, &sigset, NULL))
@@ -276,22 +295,23 @@ void *bioProcessBackgroundJobs(void *arg) {
     while(1) {
         listNode *ln;
 
-        /* The loop always starts with the lock hold. */
+        /* 循环每次进入时都持有对应工作线程的锁。 */
         if (listLength(bio_jobs[worker]) == 0) {
+            /* 队列为空时阻塞等待新作业信号。 */
             pthread_cond_wait(&bio_newjob_cond[worker], &bio_mutex[worker]);
             continue;
         }
-        /* Get the job from the queue. */
+        /* 从队列头部取出一个作业（FIFO）。 */
         ln = listFirst(bio_jobs[worker]);
         job = ln->value;
-        /* It is now possible to unlock the background system as we know have
-         * a stand alone job structure to process.*/
+        /* 由于已经取得了独立的 job 结构体，可以释放后台系统的锁。 */
         pthread_mutex_unlock(&bio_mutex[worker]);
 
-        /* Process the job accordingly to its type. */
+        /* 根据作业类型分派处理逻辑。 */
         int job_type = job->header.type;
 
         if (job_type == BIO_CLOSE_FILE) {
+            // 异步关闭文件：可选 fsync 与页缓存回收
             if (job->fd_args.need_fsync &&
                 redis_fsync(job->fd_args.fd) == -1 &&
                 errno != EBADF && errno != EINVAL)
@@ -305,9 +325,8 @@ void *bioProcessBackgroundJobs(void *arg) {
             }
             close(job->fd_args.fd);
         } else if (job_type == BIO_AOF_FSYNC || job_type == BIO_CLOSE_AOF) {
-            /* The fd may be closed by main thread and reused for another
-             * socket, pipe, or file. We just ignore these errno because
-             * aof fsync did not really fail. */
+            /* fd 可能已被主线程关闭并被另一个 socket、管道或文件复用。
+             * 这里直接忽略这些 errno，因为 AOF fsync 实际上并未真正失败。 */
             if (redis_fsync(job->fd_args.fd) == -1 &&
                 errno != EBADF && errno != EINVAL)
             {
@@ -329,32 +348,35 @@ void *bioProcessBackgroundJobs(void *arg) {
                     serverLog(LL_NOTICE,"Unable to reclaim page cache: %s", strerror(errno));
                 }
             }
+            // BIO_CLOSE_AOF 在 fsync 之后还需要关闭 fd
             if (job_type == BIO_CLOSE_AOF)
                 close(job->fd_args.fd);
         } else if (job_type == BIO_LAZY_FREE) {
+            // 惰性释放：调用注册的释放函数并传入参数数组
             job->free_args.free_fn(job->free_args.free_args);
         } else if ((job_type == BIO_COMP_RQ_CLOSE_FILE) ||
                    (job_type == BIO_COMP_RQ_AOF_FSYNC) ||
                    (job_type == BIO_COMP_RQ_LAZY_FREE)) {
+            // 作业完成回调请求：构造响应项并放入完成列表，再通过管道唤醒主线程
             bio_comp_item *comp_rsp = zmalloc(sizeof(bio_comp_item));
             comp_rsp->func = job->comp_rq.fn;
             comp_rsp->arg = job->comp_rq.arg;
 
-            /* just write it to completion job responses */
+            /* 仅将其写入完成作业响应列表 */
             pthread_mutex_lock(&bio_mutex_comp);
             listAddNodeTail(bio_comp_list, comp_rsp);
             pthread_mutex_unlock(&bio_mutex_comp);
 
             if (write(job_comp_pipe[1],"A",1) != 1) {
-                /* Pipe is non-blocking, write() may fail if it's full. */
+                /* 管道是非阻塞的，若缓冲区已满 write() 可能失败。 */
             }
         } else {
             serverPanic("Wrong job type in bioProcessBackgroundJobs().");
         }
         zfree(job);
 
-        /* Lock again before reiterating the loop, if there are no longer
-         * jobs to process we'll block again in pthread_cond_wait(). */
+        /* 再次加锁以进入下一轮循环；若已无作业可处理，
+         * 将在 pthread_cond_wait() 中再次阻塞。 */
         pthread_mutex_lock(&bio_mutex[worker]);
         listDelNode(bio_jobs[worker], ln);
         bio_jobs_counter[job_type]--;
@@ -362,7 +384,8 @@ void *bioProcessBackgroundJobs(void *arg) {
     }
 }
 
-/* Return the number of pending jobs of the specified type. */
+/* 返回指定类型的待处理作业数。
+ * 常用于 aof_pending_bio_fsync 等 INFO 字段以及 lazyfree 等待逻辑。 */
 unsigned long bioPendingJobsOfType(int type) {
     unsigned int worker = bio_job_to_worker[type];
 
@@ -373,7 +396,8 @@ unsigned long bioPendingJobsOfType(int type) {
     return val;
 }
 
-/* Wait for the job queue of the worker for jobs of specified type to become empty. */
+/* 等待负责指定作业类型的工作线程队列清空。
+ * 通过条件变量阻塞，直到该工作线程的作业队列长度为 0。 */
 void bioDrainWorker(int job_type) {
     unsigned long worker = bio_job_to_worker[job_type];
 
@@ -384,15 +408,16 @@ void bioDrainWorker(int job_type) {
     pthread_mutex_unlock(&bio_mutex[worker]);
 }
 
-/* Kill the running bio threads in an unclean way. This function should be
- * used only when it's critical to stop the threads for some reason.
- * Currently Redis does this only on crash (for instance on SIGSEGV) in order
- * to perform a fast memory check without other threads messing with memory. */
+/* 以一种“非常规”的方式终止正在运行的后台 I/O 线程。
+ * 该函数仅在必须立即停止线程的紧急情况下使用。
+ * 目前 Redis 仅在崩溃时（例如收到 SIGSEGV）调用它，
+ * 以便在不受其他线程干扰的情况下执行快速内存检查。 */
 void bioKillThreads(void) {
     int err;
     unsigned long j;
 
     for (j = 0; j < BIO_WORKER_NUM; j++) {
+        // 不要取消当前线程自身
         if (bio_threads[j] == pthread_self()) continue;
         if (bio_threads[j] && pthread_cancel(bio_threads[j]) == 0) {
             if ((err = pthread_join(bio_threads[j],NULL)) != 0) {
@@ -407,6 +432,9 @@ void bioKillThreads(void) {
     }
 }
 
+/* 事件循环中管道读事件回调：从管道读端清空数据，
+ * 然后取出 bio_comp_list 中的完成回调项并依次执行。
+ * 通过在取出时整体替换列表的方式，避免长时间持锁。 */
 void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
@@ -415,11 +443,13 @@ void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask) {
     char buf[128];
     list *tmp_list = NULL;
 
+    // 排空管道中所有待读字节（仅用于唤醒，自身内容无意义）
     while (read(fd, buf, sizeof(buf)) == sizeof(buf));
 
-    /* Handle event loop events if pipe was written from event loop API */
+    /* 如果管道由事件循环 API 写入，处理事件循环事件 */
     pthread_mutex_lock(&bio_mutex_comp);
     if (listLength(bio_comp_list)) {
+        // 取出当前完成列表并替换为一个空列表，降低持锁时间
         tmp_list = bio_comp_list;
         bio_comp_list = listCreate();
     }
@@ -427,7 +457,7 @@ void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     if (!tmp_list) return;
 
-    /* callback to all job completions  */
+    /* 依次回调所有作业完成通知 */
     while (listLength(tmp_list)) {
         listNode *ln = listFirst(tmp_list);
         bio_comp_item *rsp = ln->value;
