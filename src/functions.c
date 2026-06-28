@@ -6,119 +6,153 @@
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
+/*
+ * 本文件实现了 Redis Functions 子系统。
+ * 主要功能包括：
+ * - 函数库（library）和引擎（engine）的注册与管理
+ * - 函数库上下文（functionsLibCtx）的生命周期管理
+ * - 实现所有 FUNCTION 子命令：
+ *   FUNCTION LOAD    - 加载函数库
+ *   FUNCTION DELETE  - 删除函数库
+ *   FUNCTION LIST    - 列出函数库信息
+ *   FUNCTION STATS   - 查看运行中的函数统计
+ *   FUNCTION FLUSH   - 清空所有函数库
+ *   FUNCTION DUMP    - 序列化所有函数库
+ *   FUNCTION RESTORE - 从序列化数据恢复函数库
+ *   FUNCTION KILL    - 终止正在运行的函数
+ *   FUNCTION HELP    - 显示帮助信息
+ *   FCALL / FCALL_RO - 调用函数
+ */
+
 #include "functions.h"
 #include "sds.h"
 #include "dict.h"
 #include "adlist.h"
 #include "atomicvar.h"
 
+/* 函数加载超时时间（毫秒） */
 #define LOAD_TIMEOUT_MS 500
 
+/* 恢复策略枚举 */
 typedef enum {
-    restorePolicy_Flush, restorePolicy_Append, restorePolicy_Replace
+    restorePolicy_Flush,    /* 清空已有库后再恢复 */
+    restorePolicy_Append,   /* 追加模式，冲突则中止 */
+    restorePolicy_Replace   /* 追加模式，冲突则替换 */
 } restorePolicy;
 
+/* 引擎缓存的内存开销（结构体、字典等元数据） */
 static size_t engine_cache_memory = 0;
 
-/* Forward declaration */
+/* 前向声明 */
 static void engineFunctionDispose(dict *d, void *obj);
 static void engineStatsDispose(dict *d, void *obj);
 static void engineLibraryDispose(dict *d, void *obj);
 static void engineDispose(dict *d, void *obj);
 static int functionsVerifyName(sds name);
 
+/* 每个引擎的统计信息 */
 typedef struct functionsLibEngineStats {
-    size_t n_lib;
-    size_t n_functions;
+    size_t n_lib;        /* 该引擎下的函数库数量 */
+    size_t n_functions;  /* 该引擎下的函数数量 */
 } functionsLibEngineStats;
 
+/* 函数库上下文，管理所有已注册的函数库 */
 struct functionsLibCtx {
-    dict *libraries;     /* Library name -> Library object */
-    dict *functions;     /* Function name -> Function object that can be used to run the function */
-    size_t cache_memory; /* Overhead memory (structs, dictionaries, ..) used by all the functions */
-    dict *engines_stats; /* Per engine statistics */
+    dict *libraries;     /* 函数库名 -> 函数库对象 */
+    dict *functions;     /* 函数名 -> 函数对象（可用于执行） */
+    size_t cache_memory; /* 所有函数的额外内存开销（结构体、字典等） */
+    dict *engines_stats; /* 每个引擎的统计信息 */
 };
 
+/* 函数库元数据（从代码 shebang 行解析） */
 typedef struct functionsLibMataData {
-    sds engine;
-    sds name;
-    sds code;
+    sds engine;  /* 引擎名称 */
+    sds name;    /* 函数库名称 */
+    sds code;    /* 函数库代码（去除 shebang 行后） */
 } functionsLibMataData;
 
+/* 引擎字典类型（key 不区分大小写） */
 dictType engineDictType = {
-        dictSdsCaseHash,       /* hash function */
-        dictSdsDup,            /* key dup */
-        NULL,                  /* val dup */
-        dictSdsKeyCaseCompare, /* key compare */
-        dictSdsDestructor,     /* key destructor */
-        engineDispose,         /* val destructor */
-        NULL                   /* allow to expand */
+        dictSdsCaseHash,       /* 哈希函数 */
+        dictSdsDup,            /* key 复制 */
+        NULL,                  /* val 复制 */
+        dictSdsKeyCaseCompare, /* key 比较（不区分大小写） */
+        dictSdsDestructor,     /* key 析构 */
+        engineDispose,         /* val 析构 */
+        NULL                   /* 允许扩展 */
 };
 
+/* 函数字典类型（key 不区分大小写） */
 dictType functionDictType = {
-        dictSdsCaseHash,      /* hash function */
-        dictSdsDup,           /* key dup */
-        NULL,                 /* val dup */
-        dictSdsKeyCaseCompare,/* key compare */
-        dictSdsDestructor,    /* key destructor */
-        NULL,                 /* val destructor */
-        NULL                  /* allow to expand */
+        dictSdsCaseHash,      /* 哈希函数 */
+        dictSdsDup,           /* key 复制 */
+        NULL,                 /* val 复制 */
+        dictSdsKeyCaseCompare,/* key 比较（不区分大小写） */
+        dictSdsDestructor,    /* key 析构 */
+        NULL,                 /* val 析构 */
+        NULL                  /* 允许扩展 */
 };
 
+/* 引擎统计字典类型（key 不区分大小写） */
 dictType engineStatsDictType = {
-        dictSdsCaseHash,      /* hash function */
-        dictSdsDup,           /* key dup */
-        NULL,                 /* val dup */
-        dictSdsKeyCaseCompare,/* key compare */
-        dictSdsDestructor,    /* key destructor */
-        engineStatsDispose,   /* val destructor */
-        NULL                  /* allow to expand */
+        dictSdsCaseHash,      /* 哈希函数 */
+        dictSdsDup,           /* key 复制 */
+        NULL,                 /* val 复制 */
+        dictSdsKeyCaseCompare,/* key 比较（不区分大小写） */
+        dictSdsDestructor,    /* key 析构 */
+        engineStatsDispose,   /* val 析构 */
+        NULL                  /* 允许扩展 */
 };
 
+/* 库内函数字典类型（key 区分大小写） */
 dictType libraryFunctionDictType = {
-        dictSdsHash,          /* hash function */
-        dictSdsDup,           /* key dup */
-        NULL,                 /* val dup */
-        dictSdsKeyCompare,    /* key compare */
-        dictSdsDestructor,    /* key destructor */
-        engineFunctionDispose,/* val destructor */
-        NULL                  /* allow to expand */
+        dictSdsHash,          /* 哈希函数 */
+        dictSdsDup,           /* key 复制 */
+        NULL,                 /* val 复制 */
+        dictSdsKeyCompare,    /* key 比较（区分大小写） */
+        dictSdsDestructor,    /* key 析构 */
+        engineFunctionDispose,/* val 析构 */
+        NULL                  /* 允许扩展 */
 };
 
+/* 函数库字典类型（key 区分大小写） */
 dictType librariesDictType = {
-        dictSdsHash,          /* hash function */
-        dictSdsDup,           /* key dup */
-        NULL,                 /* val dup */
-        dictSdsKeyCompare,    /* key compare */
-        dictSdsDestructor,    /* key destructor */
-        engineLibraryDispose, /* val destructor */
-        NULL                  /* allow to expand */
+        dictSdsHash,          /* 哈希函数 */
+        dictSdsDup,           /* key 复制 */
+        NULL,                 /* val 复制 */
+        dictSdsKeyCompare,    /* key 比较（区分大小写） */
+        dictSdsDestructor,    /* key 析构 */
+        engineLibraryDispose, /* val 析构 */
+        NULL                  /* 允许扩展 */
 };
 
-/* Dictionary of engines */
+/* 引擎字典：engine_name -> engineInfo */
 static dict *engines = NULL;
 
-/* Libraries Ctx. */
+/* 当前函数库上下文 */
 static functionsLibCtx *curr_functions_lib_ctx = NULL;
 
+/* 计算函数对象的内存占用 */
 static size_t functionMallocSize(functionInfo *fi) {
     return zmalloc_size(fi) + sdsZmallocSize(fi->name)
             + (fi->desc ? sdsZmallocSize(fi->desc) : 0)
             + fi->li->ei->engine->get_function_memory_overhead(fi->function);
 }
 
+/* 计算函数库对象的内存占用 */
 static size_t libraryMallocSize(functionLibInfo *li) {
     return zmalloc_size(li) + sdsZmallocSize(li->name)
             + sdsZmallocSize(li->code);
 }
 
+/* 释放引擎统计信息 */
 static void engineStatsDispose(dict *d, void *obj) {
     UNUSED(d);
     functionsLibEngineStats *stats = obj;
     zfree(stats);
 }
 
-/* Dispose function memory */
+/* 释放函数内存 */
 static void engineFunctionDispose(dict *d, void *obj) {
     UNUSED(d);
     if (!obj) {
@@ -134,6 +168,7 @@ static void engineFunctionDispose(dict *d, void *obj) {
     zfree(fi);
 }
 
+/* 释放函数库及其所有资源 */
 static void engineLibraryFree(functionLibInfo* li) {
     if (!li) {
         return;
@@ -144,11 +179,13 @@ static void engineLibraryFree(functionLibInfo* li) {
     zfree(li);
 }
 
+/* 字典释放回调，释放函数库 */
 static void engineLibraryDispose(dict *d, void *obj) {
     UNUSED(d);
     engineLibraryFree(obj);
 }
 
+/* 字典释放回调，释放引擎及其关联资源 */
 static void engineDispose(dict *d, void *obj) {
     UNUSED(d);
     engineInfo *ei = obj;
@@ -159,7 +196,7 @@ static void engineDispose(dict *d, void *obj) {
     zfree(ei);
 }
 
-/* Clear all the functions from the given library ctx */
+/* 清空给定函数库上下文中的所有函数和库 */
 void functionsLibCtxClear(functionsLibCtx *lib_ctx) {
     dictEmpty(lib_ctx->functions, NULL);
     dictEmpty(lib_ctx->libraries, NULL);
@@ -174,6 +211,7 @@ void functionsLibCtxClear(functionsLibCtx *lib_ctx) {
     lib_ctx->cache_memory = 0;
 }
 
+/* 清除当前函数库上下文（支持同步/异步） */
 void functionsLibCtxClearCurrent(int async) {
     if (async) {
         functionsLibCtx *old_l_ctx = curr_functions_lib_ctx;
@@ -186,7 +224,7 @@ void functionsLibCtxClearCurrent(int async) {
     functionsInit();
 }
 
-/* Free the given functions ctx */
+/* 释放给定的函数库上下文及其所有资源 */
 void functionsLibCtxFree(functionsLibCtx *functions_lib_ctx) {
     functionsLibCtxClear(functions_lib_ctx);
     dictRelease(functions_lib_ctx->functions);
@@ -195,19 +233,18 @@ void functionsLibCtxFree(functionsLibCtx *functions_lib_ctx) {
     zfree(functions_lib_ctx);
 }
 
-/* Swap the current functions ctx with the given one.
- * Free the old functions ctx. */
+/* 将当前函数库上下文替换为给定的新上下文，并释放旧上下文 */
 void functionsLibCtxSwapWithCurrent(functionsLibCtx *new_lib_ctx) {
     functionsLibCtxFree(curr_functions_lib_ctx);
     curr_functions_lib_ctx = new_lib_ctx;
 }
 
-/* return the current functions ctx */
+/* 返回当前函数库上下文 */
 functionsLibCtx* functionsLibCtxGetCurrent(void) {
     return curr_functions_lib_ctx;
 }
 
-/* Create a new functions ctx */
+/* 创建新的函数库上下文 */
 functionsLibCtx* functionsLibCtxCreate(void) {
     functionsLibCtx *ret = zmalloc(sizeof(functionsLibCtx));
     ret->libraries = dictCreate(&librariesDictType);
@@ -226,13 +263,12 @@ functionsLibCtx* functionsLibCtxCreate(void) {
 }
 
 /*
- * Creating a function inside the given library.
- * On success, return C_OK.
- * On error, return C_ERR and set err output parameter with a relevant error message.
+ * 在给定的函数库中创建一个函数。
+ * 成功返回 C_OK。
+ * 失败返回 C_ERR，并通过 err 输出参数设置相关错误信息。
  *
- * Note: the code assumes 'name' is NULL terminated but not require it to be binary safe.
- *       the function will verify that the given name is following the naming format
- *       and return an error if its not.
+ * 注意：代码假设 'name' 以 NULL 结尾，但不要求二进制安全。
+ *       函数会验证名称是否符合命名格式，不符合则返回错误。
  */
 int functionLibCreateFunction(sds name, void *function, functionLibInfo *li, sds desc, uint64_t f_flags, sds *err) {
     if (functionsVerifyName(name) != C_OK) {
@@ -260,6 +296,7 @@ int functionLibCreateFunction(sds name, void *function, functionLibInfo *li, sds
     return C_OK;
 }
 
+/* 创建新的函数库信息对象 */
 static functionLibInfo* engineLibraryCreate(sds name, engineInfo *ei, sds code) {
     functionLibInfo *li = zmalloc(sizeof(*li));
     *li = (functionLibInfo) {
@@ -271,6 +308,7 @@ static functionLibInfo* engineLibraryCreate(sds name, engineInfo *ei, sds code) 
     return li;
 }
 
+/* 从上下文中取消链接函数库，更新统计信息 */
 static void libraryUnlink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
     dictIterator *iter = dictGetIterator(li->functions);
     dictEntry *entry = NULL;
@@ -286,13 +324,14 @@ static void libraryUnlink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
     dictFreeUnlinkedEntry(lib_ctx->libraries, entry);
     lib_ctx->cache_memory -= libraryMallocSize(li);
 
-    /* update stats */
+    /* 更新引擎统计 */
     functionsLibEngineStats *stats = dictFetchValue(lib_ctx->engines_stats, li->ei->name);
     serverAssert(stats);
     stats->n_lib--;
     stats->n_functions -= dictSize(li->functions);
 }
 
+/* 将函数库链接到上下文中，更新统计信息 */
 static void libraryLink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
     dictIterator *iter = dictGetIterator(li->functions);
     dictEntry *entry = NULL;
@@ -306,24 +345,23 @@ static void libraryLink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
     dictAdd(lib_ctx->libraries, li->name, li);
     lib_ctx->cache_memory += libraryMallocSize(li);
 
-    /* update stats */
+    /* 更新引擎统计 */
     functionsLibEngineStats *stats = dictFetchValue(lib_ctx->engines_stats, li->ei->name);
     serverAssert(stats);
     stats->n_lib++;
     stats->n_functions += dictSize(li->functions);
 }
 
-/* Takes all libraries from lib_ctx_src and add to lib_ctx_dst.
- * On collision, if 'replace' argument is true, replace the existing library with the new one.
- * Otherwise abort and leave 'lib_ctx_dst' and 'lib_ctx_src' untouched.
- * Return C_OK on success and C_ERR if aborted. If C_ERR is returned, set a relevant
- * error message on the 'err' out parameter.
- *  */
+/* 将 lib_ctx_src 中的所有函数库合并到 lib_ctx_dst 中。
+ * 若发生冲突，当 'replace' 参数为 true 时，用新库替换旧库；
+ * 否则中止操作，lib_ctx_dst 和 lib_ctx_src 保持不变。
+ * 成功返回 C_OK，中止返回 C_ERR 并通过 'err' 参数设置错误信息。
+ */
 static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *functions_lib_ctx_src, int replace, sds *err) {
     int ret = C_ERR;
     dictIterator *iter = NULL;
-    /* Stores the libraries we need to replace in case a revert is required.
-     * Only initialized when needed */
+    /* 存储需要替换的旧库（用于回滚）。
+     * 仅在需要时初始化 */
     list *old_libraries_list = NULL;
     dictEntry *entry = NULL;
     iter = dictGetIterator(functions_lib_ctx_src->libraries);
@@ -332,7 +370,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
         functionLibInfo *old_li = dictFetchValue(functions_lib_ctx_dst->libraries, li->name);
         if (old_li) {
             if (!replace) {
-                /* library already exists, failed the restore. */
+                /* 函数库已存在，恢复失败 */
                 *err = sdscatfmt(sdsempty(), "Library %s already exists", li->name);
                 goto done;
             } else {
@@ -348,7 +386,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
     dictReleaseIterator(iter);
     iter = NULL;
 
-    /* Make sure no functions collision */
+    /* 确保没有函数名冲突 */
     iter = dictGetIterator(functions_lib_ctx_src->functions);
     while ((entry = dictNext(iter))) {
         functionInfo *fi = dictGetVal(entry);
@@ -360,7 +398,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
     dictReleaseIterator(iter);
     iter = NULL;
 
-    /* No collision, it is safe to link all the new libraries. */
+    /* 无冲突，安全链接所有新函数库 */
     iter = dictGetIterator(functions_lib_ctx_src->libraries);
     while ((entry = dictNext(iter))) {
         functionLibInfo *li = dictGetVal(entry);
@@ -380,7 +418,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
 done:
     if (iter) dictReleaseIterator(iter);
     if (old_libraries_list) {
-        /* Link back all libraries on tmp_l_ctx */
+        /* 回滚：重新链接所有旧函数库 */
         while (listLength(old_libraries_list) > 0) {
             listNode *head = listFirst(old_libraries_list);
             functionLibInfo *li = listNodeValue(head);
@@ -393,10 +431,10 @@ done:
     return ret;
 }
 
-/* Register an engine, should be called once by the engine on startup and give the following:
+/* 注册引擎，应在引擎启动时调用一次，参数如下：
  *
- * - engine_name - name of the engine to register
- * - engine_ctx - the engine ctx that should be used by Redis to interact with the engine */
+ * - engine_name - 要注册的引擎名称
+ * - engine_ctx  - Redis 用于与引擎交互的引擎上下文 */
 int functionsRegisterEngine(const char *engine_name, engine *engine) {
     sds engine_name_sds = sdsnew(engine_name);
     if (dictFetchValue(engines, engine_name_sds)) {
@@ -420,7 +458,8 @@ int functionsRegisterEngine(const char *engine_name, engine *engine) {
 }
 
 /*
- * FUNCTION STATS
+ * FUNCTION STATS 命令实现
+ * 返回当前正在运行的函数信息及各引擎的统计信息
  */
 void functionStatsCommand(client *c) {
     if (scriptIsRunning() && scriptIsEval()) {
@@ -464,8 +503,9 @@ void functionStatsCommand(client *c) {
     dictReleaseIterator(iter);
 }
 
+/* 构建函数标志的回复 */
 static void functionListReplyFlags(client *c, functionInfo *fi) {
-    /* First count the number of flags we have */
+    /* 首先计算标志数量 */
     int flagcount = 0;
     for (scriptFlag *flag = scripts_flags_def; flag->str ; ++flag) {
         if (fi->f_flags & flag->flag) {
@@ -485,15 +525,14 @@ static void functionListReplyFlags(client *c, functionInfo *fi) {
 /*
  * FUNCTION LIST [LIBRARYNAME PATTERN] [WITHCODE]
  *
- * Return general information about all the libraries:
- * * Library name
- * * The engine used to run the Library
- * * Functions list
- * * Library code (if WITHCODE is given)
+ * 返回所有函数库的概要信息：
+ * * 函数库名称
+ * * 运行函数库所使用的引擎
+ * * 函数列表
+ * * 函数库代码（如果指定了 WITHCODE）
  *
- * It is also possible to given library name pattern using
- * LIBRARYNAME argument, if given, return only libraries
- * that matches the given pattern.
+ * 也可通过 LIBRARYNAME 参数指定函数库名称模式，
+ * 仅返回匹配该模式的函数库。
  */
 void functionListCommand(client *c) {
     int with_code = 0;
@@ -520,7 +559,7 @@ void functionListCommand(client *c) {
     if (library_name) {
         len_ptr = addReplyDeferredLen(c);
     } else {
-        /* If no pattern is asked we know the reply len and we can just set it */
+        /* 未指定模式时，已知回复长度，直接设置 */
         addReplyArrayLen(c, dictSize(curr_functions_lib_ctx->libraries));
     }
     dictIterator *iter = dictGetIterator(curr_functions_lib_ctx->libraries);
@@ -572,6 +611,7 @@ void functionListCommand(client *c) {
 
 /*
  * FUNCTION DELETE <LIBRARY NAME>
+ * 删除指定的函数库
  */
 void functionDeleteCommand(client *c) {
     robj *function_name = c->argv[2];
@@ -583,19 +623,18 @@ void functionDeleteCommand(client *c) {
 
     libraryUnlink(curr_functions_lib_ctx, li);
     engineLibraryFree(li);
-    /* Indicate that the command changed the data so it will be replicated and
-     * counted as a data change (for persistence configuration) */
+    /* 标记数据已变更，用于复制和持久化 */
     server.dirty++;
     addReply(c, shared.ok);
 }
 
-/* FUNCTION KILL */
+/* FUNCTION KILL - 终止正在运行的函数 */
 void functionKillCommand(client *c) {
     scriptKill(c, 0);
 }
 
-/* Try to extract command flags if we can, returns the modified flags.
- * Note that it does not guarantee the command arguments are right. */
+/* 尝试提取命令标志，返回修改后的标志。
+ * 注意：不保证命令参数的正确性。 */
 uint64_t fcallGetCommandFlags(client *c, uint64_t cmd_flags) {
     robj *function_name = c->argv[1];
     c->cur_script = dictFind(curr_functions_lib_ctx->functions, function_name->ptr);
@@ -606,8 +645,9 @@ uint64_t fcallGetCommandFlags(client *c, uint64_t cmd_flags) {
     return scriptFlagsToCmdFlags(cmd_flags, script_flags);
 }
 
+/* FCALL 通用实现，ro 为 1 时表示只读模式 */
 static void fcallCommandGeneric(client *c, int ro) {
-    /* Functions need to be fed to monitors before the commands they execute. */
+    /* 函数需要在其执行的命令之前发送给监控器 */
     replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
 
     robj *function_name = c->argv[1];
@@ -622,7 +662,7 @@ static void fcallCommandGeneric(client *c, int ro) {
     engine *engine = fi->li->ei->engine;
 
     long long numkeys;
-    /* Get the number of arguments that are keys */
+    /* 获取作为 key 的参数数量 */
     if (getLongLongFromObject(c->argv[2], &numkeys) != C_OK) {
         addReplyError(c, "Bad number of keys provided");
         return;
@@ -647,6 +687,7 @@ static void fcallCommandGeneric(client *c, int ro) {
 
 /*
  * FCALL <FUNCTION NAME> nkeys <key1 .. keyn> <arg1 .. argn>
+ * 调用函数（可读写）
  */
 void fcallCommand(client *c) {
     fcallCommandGeneric(c, 0);
@@ -654,6 +695,7 @@ void fcallCommand(client *c) {
 
 /*
  * FCALL_RO <FUNCTION NAME> nkeys <key1 .. keyn> <arg1 .. argn>
+ * 调用函数（只读模式）
  */
 void fcallroCommand(client *c) {
     fcallCommandGeneric(c, 1);
@@ -662,19 +704,16 @@ void fcallroCommand(client *c) {
 /*
  * FUNCTION DUMP
  *
- * Returns a binary payload representing all the libraries.
- * Can be loaded using FUNCTION RESTORE
+ * 返回表示所有函数库的二进制载荷，可通过 FUNCTION RESTORE 加载。
  *
- * The payload structure is the same as on RDB. Each library
- * is saved separately with the following information:
- * * Library name
- * * Engine name
- * * Library code
- * RDB_OPCODE_FUNCTION2 is saved before each library to present
- * that the payload is a library.
- * RDB version and crc64 is saved at the end of the payload.
- * The RDB version is saved for backward compatibility.
- * crc64 is saved so we can verify the payload content.
+ * 载荷结构与 RDB 格式相同，每个函数库单独保存，包含以下信息：
+ * * 函数库名称
+ * * 引擎名称
+ * * 函数库代码
+ * 每个函数库前保存 RDB_OPCODE_FUNCTION2 标识。
+ * 载荷末尾保存 RDB 版本号和 crc64 校验和：
+ * - RDB 版本号用于向后兼容
+ * - crc64 用于验证载荷内容完整性
  */
 void functionDumpCommand(client *c) {
     unsigned char buf[2];
@@ -684,12 +723,12 @@ void functionDumpCommand(client *c) {
 
     rdbSaveFunctions(&payload);
 
-    /* RDB version */
+    /* RDB 版本号 */
     buf[0] = RDB_VERSION & 0xff;
     buf[1] = (RDB_VERSION >> 8) & 0xff;
     payload.io.buffer.ptr = sdscatlen(payload.io.buffer.ptr, buf, 2);
 
-    /* CRC64 */
+    /* CRC64 校验和 */
     crc = crc64(0, (unsigned char*) payload.io.buffer.ptr,
                 sdslen(payload.io.buffer.ptr));
     memrev64ifbe(&crc);
@@ -701,12 +740,11 @@ void functionDumpCommand(client *c) {
 /*
  * FUNCTION RESTORE <payload> [FLUSH|APPEND|REPLACE]
  *
- * Restore the libraries represented by the give payload.
- * Restore policy to can be given to control how to handle existing libraries (default APPEND):
- * * FLUSH: delete all existing libraries.
- * * APPEND: appends the restored libraries to the existing libraries. On collision, abort.
- * * REPLACE: appends the restored libraries to the existing libraries.
- *   On collision, replace the old libraries with the new libraries.
+ * 从给定的载荷恢复函数库。
+ * 恢复策略用于控制如何处理已有函数库（默认 APPEND）：
+ * * FLUSH:    删除所有已有函数库后恢复。
+ * * APPEND:   将恢复的函数库追加到已有库中，冲突则中止。
+ * * REPLACE:  将恢复的函数库追加到已有库中，冲突则替换旧库。
  */
 void functionRestoreCommand(client *c) {
     if (c->argc > 4) {
@@ -714,7 +752,7 @@ void functionRestoreCommand(client *c) {
         return;
     }
 
-    restorePolicy restore_replicy = restorePolicy_Append; /* default policy: APPEND */
+    restorePolicy restore_replicy = restorePolicy_Append; /* 默认策略：APPEND */
     sds data = c->argv[2]->ptr;
     size_t data_len = sdslen(data);
     rio payload;
@@ -743,7 +781,7 @@ void functionRestoreCommand(client *c) {
     functionsLibCtx *functions_lib_ctx = functionsLibCtxCreate();
     rioInitWithBuffer(&payload, data);
 
-    /* Read until reaching last 10 bytes that should contain RDB version and checksum. */
+    /* 读取直到最后 10 字节（包含 RDB 版本号和校验和） */
     while (data_len - payload.io.buffer.pos > 10) {
         int type;
         if ((type = rdbLoadType(&payload)) == -1) {
@@ -768,15 +806,14 @@ void functionRestoreCommand(client *c) {
 
     if (restore_replicy == restorePolicy_Flush) {
         functionsLibCtxSwapWithCurrent(functions_lib_ctx);
-        functions_lib_ctx = NULL; /* avoid releasing the f_ctx in the end */
+        functions_lib_ctx = NULL; /* 避免在最后释放上下文 */
     } else {
         if (libraryJoin(curr_functions_lib_ctx, functions_lib_ctx, restore_replicy == restorePolicy_Replace, &err) != C_OK) {
             goto load_error;
         }
     }
 
-    /* Indicate that the command changed the data so it will be replicated and
-     * counted as a data change (for persistence configuration) */
+    /* 标记数据已变更，用于复制和持久化 */
     server.dirty++;
 
 load_error:
@@ -790,7 +827,7 @@ load_error:
     }
 }
 
-/* FUNCTION FLUSH [ASYNC | SYNC] */
+/* FUNCTION FLUSH [ASYNC | SYNC] 命令实现 */
 void functionFlushCommand(client *c) {
     if (c->argc > 3) {
         addReplySubcommandSyntaxError(c);
@@ -810,13 +847,12 @@ void functionFlushCommand(client *c) {
 
     functionsLibCtxClearCurrent(async);
 
-    /* Indicate that the command changed the data so it will be replicated and
-     * counted as a data change (for persistence configuration) */
+    /* 标记数据已变更，用于复制和持久化 */
     server.dirty++;
     addReply(c,shared.ok);
 }
 
-/* FUNCTION HELP */
+/* FUNCTION HELP - 显示 FUNCTION 子命令的帮助信息 */
 void functionHelpCommand(client *c) {
     const char *help[] = {
 "LOAD [REPLACE] <FUNCTION CODE>",
@@ -859,7 +895,7 @@ NULL };
     addReplyHelp(c, help);
 }
 
-/* Verify that the function name is of the format: [a-zA-Z0-9_][a-zA-Z0-9_]? */
+/* 验证函数名称格式：仅允许 [a-zA-Z0-9_] 且至少一个字符 */
 static int functionsVerifyName(sds name) {
     if (sdslen(name) == 0) {
         return C_ERR;
@@ -878,6 +914,12 @@ static int functionsVerifyName(sds name) {
     return C_OK;
 }
 
+/*
+ * 从函数库代码负载中提取元数据（shebang 行）。
+ * 解析 "#!<engine> name=<libname>" 格式的元数据行，
+ * 并将剩余代码存入 md->code。
+ * 成功返回 C_OK，失败返回 C_ERR 并设置 err。
+ */
 int functionExtractLibMetaData(sds payload, functionsLibMataData *md, sds *err) {
     sds name = NULL;
     sds engine = NULL;
@@ -937,14 +979,15 @@ error:
     return C_ERR;
 }
 
+/* 释放函数库元数据结构体中的所有字符串字段 */
 void functionFreeLibMetaData(functionsLibMataData *md) {
     if (md->code) sdsfree(md->code);
     if (md->name) sdsfree(md->name);
     if (md->engine) sdsfree(md->engine);
 }
 
-/* Compile and save the given library, return the loaded library name on success
- * and NULL on failure. In case on failure the err out param is set with relevant error message */
+/* 编译并保存给定的函数库。
+ * 成功返回加载的函数库名称，失败返回 NULL 并通过 err 参数设置错误信息。 */
 sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibCtx *lib_ctx, size_t timeout) {
     dictIterator *iter = NULL;
     dictEntry *entry = NULL;
@@ -988,12 +1031,12 @@ sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibC
         goto error;
     }
 
-    /* Verify no duplicate functions */
+    /* 验证没有重复的函数名 */
     iter = dictGetIterator(new_li->functions);
     while ((entry = dictNext(iter))) {
         functionInfo *fi = dictGetVal(entry);
         if (dictFetchValue(lib_ctx->functions, fi->name)) {
-            /* functions name collision, abort. */
+            /* 函数名冲突，中止 */
             *err = sdscatfmt(sdsempty(), "Function %s already exists", fi->name);
             goto error;
         }
@@ -1023,8 +1066,8 @@ error:
 
 /*
  * FUNCTION LOAD [REPLACE] <LIBRARY CODE>
- * REPLACE         - optional, replace existing library
- * LIBRARY CODE    - library code to pass to the engine
+ * REPLACE      - 可选，替换已存在的函数库
+ * LIBRARY CODE - 传递给引擎的函数库代码
  */
 void functionLoadCommand(client *c) {
     int replace = 0;
@@ -1056,13 +1099,12 @@ void functionLoadCommand(client *c) {
         addReplyErrorSds(c, err);
         return;
     }
-    /* Indicate that the command changed the data so it will be replicated and
-     * counted as a data change (for persistence configuration) */
+    /* 标记数据已变更，用于复制和持久化 */
     server.dirty++;
     addReplyBulkSds(c, library_name);
 }
 
-/* Return memory usage of all the engines combine */
+/* 返回所有引擎的内存使用量之和 */
 unsigned long functionsMemory(void) {
     dictIterator *iter = dictGetIterator(engines);
     dictEntry *entry = NULL;
@@ -1077,7 +1119,7 @@ unsigned long functionsMemory(void) {
     return engines_memory;
 }
 
-/* Return memory overhead of all the engines combine */
+/* 返回所有引擎的额外内存开销之和 */
 unsigned long functionsMemoryOverhead(void) {
     size_t memory_overhead = dictMemUsage(engines);
     memory_overhead += dictMemUsage(curr_functions_lib_ctx->functions);
@@ -1088,25 +1130,30 @@ unsigned long functionsMemoryOverhead(void) {
     return memory_overhead;
 }
 
-/* Returns the number of functions */
+/* 返回已注册的函数数量 */
 unsigned long functionsNum(void) {
     return dictSize(curr_functions_lib_ctx->functions);
 }
 
+/* 返回已注册的函数库总数 */
 unsigned long functionsLibNum(void) {
     return dictSize(curr_functions_lib_ctx->libraries);
 }
 
+/* 返回当前函数库上下文的 libraries 字典 */
 dict* functionsLibGet(void) {
     return curr_functions_lib_ctx->libraries;
 }
 
+/* 返回给定上下文中的函数数量 */
 size_t functionsLibCtxFunctionsLen(functionsLibCtx *functions_ctx) {
     return dictSize(functions_ctx->functions);
 }
 
-/* Initialize engine data structures.
- * Should be called once on server initialization */
+/*
+ * 初始化引擎数据结构。
+ * 应在服务器启动时调用一次。
+ */
 int functionsInit(void) {
     engines = dictCreate(&engineDictType);
 
@@ -1114,7 +1161,7 @@ int functionsInit(void) {
         return C_ERR;
     }
 
-    /* Must be initialized after engines initialization */
+    /* 必须在引擎初始化之后创建函数库上下文 */
     curr_functions_lib_ctx = functionsLibCtxCreate();
 
     return C_OK;

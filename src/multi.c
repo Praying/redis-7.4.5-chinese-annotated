@@ -9,8 +9,16 @@
 #include "server.h"
 
 /* ================================ MULTI/EXEC ============================== */
+/*
+ * MULTI/EXEC 事务实现
+ *
+ * MULTI/EXEC 是 Redis 提供的事务机制。MULTI 命令开启一个事务块，
+ * 之后的所有命令会被排队，直到 EXEC 命令触发时才依次执行。
+ * DISCARD 可以取消事务。WATCH 提供乐观锁（CAS）支持，
+ * 在 EXEC 执行前检测被监视的键是否被其他客户端修改过。
+ */
 
-/* Client state initialization for MULTI/EXEC */
+/* 初始化客户端的 MULTI/EXEC 事务状态 */
 void initClientMultiState(client *c) {
     c->mstate.commands = NULL;
     c->mstate.count = 0;
@@ -20,7 +28,7 @@ void initClientMultiState(client *c) {
     c->mstate.alloc_count = 0;
 }
 
-/* Release all the resources associated with MULTI/EXEC state */
+/* 释放与 MULTI/EXEC 事务状态相关的所有资源 */
 void freeClientMultiState(client *c) {
     int j;
 
@@ -35,19 +43,18 @@ void freeClientMultiState(client *c) {
     zfree(c->mstate.commands);
 }
 
-/* Add a new command into the MULTI commands queue */
+/* 将新命令加入 MULTI 事务命令队列 */
 void queueMultiCommand(client *c, uint64_t cmd_flags) {
     multiCmd *mc;
 
-    /* No sense to waste memory if the transaction is already aborted.
-     * this is useful in case client sends these in a pipeline, or doesn't
-     * bother to read previous responses and didn't notice the multi was already
-     * aborted. */
+    /* 如果事务已经被中止，没有意义再浪费内存。
+     * 当客户端以流水线方式发送命令，或者没有读取之前的
+     * 响应而没注意到事务已经被中止时，这个检查很有用。 */
     if (c->flags & (CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC))
         return;
     if (c->mstate.count == 0) {
-        /* If a client is using multi/exec, assuming it is used to execute at least
-         * two commands. Hence, creating by default size of 2. */
+        /* 假设使用 multi/exec 的客户端至少会执行两条命令，
+         * 因此默认分配大小为 2。 */
         c->mstate.commands = zmalloc(sizeof(multiCmd)*2);
         c->mstate.alloc_count = 2;
     }
@@ -66,14 +73,15 @@ void queueMultiCommand(client *c, uint64_t cmd_flags) {
     c->mstate.cmd_inv_flags |= ~cmd_flags;
     c->mstate.argv_len_sums += c->argv_len_sum + sizeof(robj*)*c->argc;
 
-    /* Reset the client's args since we copied them into the mstate and shouldn't
-     * reference them from c anymore. */
+    /* 重置客户端的参数，因为已经拷贝到 mstate 中，
+     * 不应再从 c 中引用它们。 */
     c->argv = NULL;
     c->argc = 0;
     c->argv_len_sum = 0;
     c->argv_len = 0;
 }
 
+/* 丢弃当前事务，释放所有资源并取消所有 WATCH */
 void discardTransaction(client *c) {
     freeClientMultiState(c);
     initClientMultiState(c);
@@ -81,13 +89,14 @@ void discardTransaction(client *c) {
     unwatchAllKeys(c);
 }
 
-/* Flag the transaction as DIRTY_EXEC so that EXEC will fail.
- * Should be called every time there is an error while queueing a command. */
+/* 将事务标记为 DIRTY_EXEC，使后续的 EXEC 失败。
+ * 每当命令入队出错时都应调用此函数。 */
 void flagTransaction(client *c) {
     if (c->flags & CLIENT_MULTI)
         c->flags |= CLIENT_DIRTY_EXEC;
 }
 
+/* MULTI 命令：开启事务，将客户端标记为 MULTI 状态 */
 void multiCommand(client *c) {
     if (c->flags & CLIENT_MULTI) {
         addReplyError(c,"MULTI calls can not be nested");
@@ -98,6 +107,7 @@ void multiCommand(client *c) {
     addReply(c,shared.ok);
 }
 
+/* DISCARD 命令：取消事务，释放所有排队的命令 */
 void discardCommand(client *c) {
     if (!(c->flags & CLIENT_MULTI)) {
         addReplyError(c,"DISCARD without MULTI");
@@ -107,23 +117,22 @@ void discardCommand(client *c) {
     addReply(c,shared.ok);
 }
 
-/* Aborts a transaction, with a specific error message.
- * The transaction is always aborted with -EXECABORT so that the client knows
- * the server exited the multi state, but the actual reason for the abort is
- * included too.
- * Note: 'error' may or may not end with \r\n. see addReplyErrorFormat. */
+/* 中止事务，并附带特定的错误消息。
+ * 事务始终以 -EXECABORT 错误中止，以便客户端知道服务器
+ * 已退出 MULTI 状态，同时也会包含中止的实际原因。
+ * 注意：'error' 可能以 \r\n 结尾也可能不以。参见 addReplyErrorFormat。 */
 void execCommandAbort(client *c, sds error) {
     discardTransaction(c);
 
     if (error[0] == '-') error++;
     addReplyErrorFormat(c, "-EXECABORT Transaction discarded because of: %s", error);
 
-    /* Send EXEC to clients waiting data from MONITOR. We did send a MULTI
-     * already, and didn't send any of the queued commands, now we'll just send
-     * EXEC so it is clear that the transaction is over. */
+    /* 向等待 MONITOR 数据的客户端发送 EXEC。之前已经发送了 MULTI，
+     * 但没有发送任何排队的命令，现在发送 EXEC 表明事务已结束。 */
     replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
 }
 
+/* EXEC 命令：执行事务中所有排队的命令 */
 void execCommand(client *c) {
     int j;
     robj **orig_argv;
@@ -135,17 +144,16 @@ void execCommand(client *c) {
         return;
     }
 
-    /* EXEC with expired watched key is disallowed*/
+    /* 如果监视的键已过期，则不允许执行 EXEC */
     if (isWatchedKeyExpired(c)) {
         c->flags |= (CLIENT_DIRTY_CAS);
     }
 
-    /* Check if we need to abort the EXEC because:
-     * 1) Some WATCHed key was touched.
-     * 2) There was a previous error while queueing commands.
-     * A failed EXEC in the first case returns a multi bulk nil object
-     * (technically it is not an error but a special behavior), while
-     * in the second an EXECABORT error is returned. */
+    /* 检查是否需要中止 EXEC，原因可能有：
+     * 1) 某些被 WATCH 监视的键被修改了。
+     * 2) 在命令入队过程中发生了错误。
+     * 第一种情况失败时返回空数组（严格来说不是错误，
+     * 而是一种特殊行为），第二种情况返回 EXECABORT 错误。 */
     if (c->flags & (CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC)) {
         if (c->flags & CLIENT_DIRTY_EXEC) {
             addReplyErrorObject(c, shared.execaborterr);
@@ -159,11 +167,11 @@ void execCommand(client *c) {
 
     uint64_t old_flags = c->flags;
 
-    /* we do not want to allow blocking commands inside multi */
+    /* 不允许在事务中使用阻塞命令 */
     c->flags |= CLIENT_DENY_BLOCKING;
 
-    /* Exec all the queued commands */
-    unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
+    /* 执行所有排队的命令 */
+    unwatchAllKeys(c); /* 尽早取消监视，避免浪费 CPU 周期 */
 
     server.in_exec = 1;
 
@@ -178,8 +186,8 @@ void execCommand(client *c) {
         c->argv_len = c->mstate.commands[j].argv_len;
         c->cmd = c->realcmd = c->mstate.commands[j].cmd;
 
-        /* ACL permissions are also checked at the time of execution in case
-         * they were changed after the commands were queued. */
+        /* 在执行时也会检查 ACL 权限，以防在命令入队后
+         * 权限发生了变化。 */
         int acl_errpos;
         int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
         if (acl_retval != ACL_OK) {
@@ -214,14 +222,14 @@ void execCommand(client *c) {
             serverAssert((c->flags & CLIENT_BLOCKED) == 0);
         }
 
-        /* Commands may alter argc/argv, restore mstate. */
+        /* 命令可能修改 argc/argv，需要恢复 mstate 中的值 */
         c->mstate.commands[j].argc = c->argc;
         c->mstate.commands[j].argv = c->argv;
         c->mstate.commands[j].argv_len = c->argv_len;
         c->mstate.commands[j].cmd = c->cmd;
     }
 
-    // restore old DENY_BLOCKING value
+    // 恢复之前的 DENY_BLOCKING 标志值
     if (!(old_flags & CLIENT_DENY_BLOCKING))
         c->flags &= ~CLIENT_DENY_BLOCKING;
 
@@ -234,48 +242,48 @@ void execCommand(client *c) {
     server.in_exec = 0;
 }
 
-/* ===================== WATCH (CAS alike for MULTI/EXEC) ===================
+/* ===================== WATCH (MULTI/EXEC 的 CAS 乐观锁) ==================
  *
- * The implementation uses a per-DB hash table mapping keys to list of clients
- * WATCHing those keys, so that given a key that is going to be modified
- * we can mark all the associated clients as dirty.
+ * 实现使用每个数据库的哈希表，将键映射到监视该键的客户端列表。
+ * 当某个键即将被修改时，可以将所有相关客户端标记为脏（dirty）。
  *
- * Also every client contains a list of WATCHed keys so that's possible to
- * un-watch such keys when the client is freed or when UNWATCH is called. */
+ * 每个客户端也维护一个被监视键的列表，这样当客户端被释放
+ * 或者调用 UNWATCH 时可以取消对这些键的监视。 */
 
-/* The watchedKey struct is included in two lists: the client->watched_keys list,
- * and db->watched_keys dict (each value in that dict is a list of watchedKey structs).
- * The list in the client struct is a plain list, where each node's value is a pointer to a watchedKey.
- * The list in the db db->watched_keys is different, the listnode member that's embedded in this struct
- * is the node in the dict. And the value inside that listnode is a pointer to the that list, and we can use
- * struct member offset math to get from the listnode to the watchedKey struct.
- * This is done to avoid the need for listSearchKey and dictFind when we remove from the list. */
+/* watchedKey 结构体同时存在于两个链表中：
+ * client->watched_keys 链表和 db->watched_keys 字典
+ * （字典的每个值是一个 watchedKey 结构体的链表）。
+ * 客户端结构体中的链表是普通链表，每个节点的值是指向 watchedKey 的指针。
+ * 而 db->watched_keys 中的链表有所不同：此结构体中内嵌的 listnode 成员
+ * 是字典中的节点，该 listnode 的值指向所属链表，通过结构体成员偏移计算
+ * 可以从 listnode 得到 watchedKey 结构体。
+ * 这样做是为了在从链表中删除时避免调用 listSearchKey 和 dictFind。 */
 typedef struct watchedKey {
     listNode node;
     robj *key;
     redisDb *db;
     client *client;
-    unsigned expired:1; /* Flag that we're watching an already expired key. */
+    unsigned expired:1; /* 标记是否监视的是已过期的键 */
 } watchedKey;
 
-/* Attach a watchedKey to the list of clients watching that key. */
+/* 将 watchedKey 链接到监视该键的客户端列表中 */
 static inline void watchedKeyLinkToClients(list *clients, watchedKey *wk) {
-    wk->node.value = clients; /* Point the value back to the list */
-    listLinkNodeTail(clients, &wk->node); /* Link the embedded node */
+    wk->node.value = clients; /* 将 value 指回链表 */
+    listLinkNodeTail(clients, &wk->node); /* 链接内嵌的节点 */
 }
 
-/* Get the list of clients watching that key. */
+/* 获取监视该键的客户端列表 */
 static inline list *watchedKeyGetClients(watchedKey *wk) {
-    return listNodeValue(&wk->node); /* embedded node->value points back to the list */
+    return listNodeValue(&wk->node); /* 内嵌节点的 value 指回链表 */
 }
 
-/* Get the node with wk->client in the list of clients watching that key. Actually it
- * is just the embedded node. */
+/* 获取在监视该键的客户端列表中代表 wk->client 的节点，
+ * 实际上就是内嵌的节点本身 */
 static inline listNode *watchedKeyGetClientNode(watchedKey *wk) {
     return &wk->node;
 }
 
-/* Watch for the specified key */
+/* 监视指定的键 */
 void watchForKey(client *c, robj *key) {
     list *clients = NULL;
     listIter li;
@@ -284,21 +292,21 @@ void watchForKey(client *c, robj *key) {
 
     if (listLength(c->watched_keys) == 0) server.watching_clients++;
 
-    /* Check if we are already watching for this key */
+    /* 检查是否已经在监视这个键 */
     listRewind(c->watched_keys,&li);
     while((ln = listNext(&li))) {
         wk = listNodeValue(ln);
         if (wk->db == c->db && equalStringObjects(key,wk->key))
-            return; /* Key already watched */
+            return; /* 该键已经在监视中 */
     }
-    /* This key is not already watched in this DB. Let's add it */
+    /* 此数据库中尚未监视此键，添加它 */
     clients = dictFetchValue(c->db->watched_keys,key);
     if (!clients) {
         clients = listCreate();
         dictAdd(c->db->watched_keys,key,clients);
         incrRefCount(key);
     }
-    /* Add the new key to the list of keys watched by this client */
+    /* 将新键添加到此客户端的监视键列表中 */
     wk = zmalloc(sizeof(*wk));
     wk->key = key;
     wk->client = c;
@@ -309,8 +317,8 @@ void watchForKey(client *c, robj *key) {
     watchedKeyLinkToClients(clients, wk);
 }
 
-/* Unwatch all the keys watched by this client. To clean the EXEC dirty
- * flag is up to the caller. */
+/* 取消监视此客户端监视的所有键。
+ * 清除 EXEC 脏标志由调用者负责。 */
 void unwatchAllKeys(client *c) {
     listIter li;
     listNode *ln;
@@ -321,15 +329,15 @@ void unwatchAllKeys(client *c) {
         list *clients;
         watchedKey *wk;
 
-        /* Remove the client's wk from the list of clients watching the key. */
+        /* 从监视该键的客户端列表中移除此客户端的 wk */
         wk = listNodeValue(ln);
         clients = watchedKeyGetClients(wk);
         serverAssertWithInfo(c,NULL,clients != NULL);
         listUnlinkNode(clients, watchedKeyGetClientNode(wk));
-        /* Kill the entry at all if this was the only client */
+        /* 如果这是最后一个客户端，则删除整个条目 */
         if (listLength(clients) == 0)
             dictDelete(wk->db->watched_keys, wk->key);
-        /* Remove this watched key from the client->watched list */
+        /* 从 client->watched 列表中移除此监视键 */
         listDelNode(c->watched_keys,ln);
         decrRefCount(wk->key);
         zfree(wk);
@@ -337,8 +345,8 @@ void unwatchAllKeys(client *c) {
     server.watching_clients--;
 }
 
-/* Iterates over the watched_keys list and looks for an expired key. Keys which
- * were expired already when WATCH was called are ignored. */
+/* 遍历 watched_keys 列表，查找已过期的键。
+ * 在调用 WATCH 时就已经过期的键会被忽略。 */
 int isWatchedKeyExpired(client *c) {
     listIter li;
     listNode *ln;
@@ -347,15 +355,14 @@ int isWatchedKeyExpired(client *c) {
     listRewind(c->watched_keys,&li);
     while ((ln = listNext(&li))) {
         wk = listNodeValue(ln);
-        if (wk->expired) continue; /* was expired when WATCH was called */
+        if (wk->expired) continue; /* 调用 WATCH 时已过期 */
         if (keyIsExpired(wk->db, wk->key)) return 1;
     }
 
     return 0;
 }
 
-/* "Touch" a key, so that if this key is being WATCHed by some client the
- * next EXEC will fail. */
+/* "触碰"一个键，使监视该键的客户端在下次 EXEC 时失败 */
 void touchWatchedKey(redisDb *db, robj *key) {
     list *clients;
     listIter li;
@@ -365,21 +372,20 @@ void touchWatchedKey(redisDb *db, robj *key) {
     clients = dictFetchValue(db->watched_keys, key);
     if (!clients) return;
 
-    /* Mark all the clients watching this key as CLIENT_DIRTY_CAS */
-    /* Check if we are already watching for this key */
+    /* 将所有监视此键的客户端标记为 CLIENT_DIRTY_CAS */
     listRewind(clients,&li);
     while((ln = listNext(&li))) {
         watchedKey *wk = redis_member2struct(watchedKey, node, ln);
         client *c = wk->client;
 
         if (wk->expired) {
-            /* The key was already expired when WATCH was called. */
+            /* 调用 WATCH 时该键已过期 */
             if (db == wk->db &&
                 equalStringObjects(key, wk->key) &&
                 dbFind(db, key->ptr) == NULL)
             {
-                /* Already expired key is deleted, so logically no change. Clear
-                 * the flag. Deleted keys are not flagged as expired. */
+                /* 已过期的键被删除，逻辑上没有变化。
+                 * 清除标志。已删除的键不会标记为过期。 */
                 wk->expired = 0;
                 goto skip_client;
             }
@@ -387,9 +393,8 @@ void touchWatchedKey(redisDb *db, robj *key) {
         }
 
         c->flags |= CLIENT_DIRTY_CAS;
-        /* As the client is marked as dirty, there is no point in getting here
-         * again in case that key (or others) are modified again (or keep the
-         * memory overhead till EXEC). */
+        /* 既然客户端已被标记为脏，就没有必要在键再次被修改时
+         * 重复执行此操作（或一直保留内存开销直到 EXEC）。 */
         unwatchAllKeys(c);
 
     skip_client:
@@ -397,13 +402,12 @@ void touchWatchedKey(redisDb *db, robj *key) {
     }
 }
 
-/* Set CLIENT_DIRTY_CAS to all clients of DB when DB is dirty.
- * It may happen in the following situations:
- * FLUSHDB, FLUSHALL, SWAPDB, end of successful diskless replication.
+/* 当数据库被清空时，将该数据库所有客户端标记为 CLIENT_DIRTY_CAS。
+ * 可能发生在以下场景：
+ * FLUSHDB、FLUSHALL、SWAPDB、无盘复制成功完成。
  *
- * replaced_with: for SWAPDB, the WATCH should be invalidated if
- * the key exists in either of them, and skipped only if it
- * doesn't exist in both. */
+ * replaced_with：对于 SWAPDB，如果键存在于任一数据库中，
+ * 则 WATCH 应失效；仅当两个数据库中都不存在时才跳过。 */
 void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
     listIter li;
     listNode *ln;
@@ -425,30 +429,31 @@ void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
                 watchedKey *wk = redis_member2struct(watchedKey, node, ln);
                 if (wk->expired) {
                     if (!replaced_with || !dbFind(replaced_with, key->ptr)) {
-                        /* Expired key now deleted. No logical change. Clear the
-                         * flag. Deleted keys are not flagged as expired. */
+                        /* 过期的键已被删除，逻辑上无变化。
+                         * 清除标志。已删除的键不标记为过期。 */
                         wk->expired = 0;
                         continue;
                     } else if (keyIsExpired(replaced_with, key)) {
-                        /* Expired key remains expired. */
+                        /* 过期的键仍然保持过期状态 */
                         continue;
                     }
                 } else if (!exists_in_emptied && keyIsExpired(replaced_with, key)) {
-                    /* Non-existing key is replaced with an expired key. */
+                    /* 不存在的键被替换为已过期的键 */
                     wk->expired = 1;
                     continue;
                 }
                 client *c = wk->client;
                 c->flags |= CLIENT_DIRTY_CAS;
-                /* Note - we could potentially call unwatchAllKeys for this specific client in order to reduce
-                 * the total number of iterations. BUT this could also free the current next entry pointer
-                 * held by the iterator and can lead to use-after-free. */
+                /* 注意：我们可以对特定客户端调用 unwatchAllKeys 来减少
+                 * 迭代次数，但这可能释放迭代器当前持有的 next 指针，
+                 * 导致释放后使用（use-after-free）问题。 */
             }
         }
     }
     dictReleaseIterator(di);
 }
 
+/* WATCH 命令：监视一个或多个键，在事务执行前检测它们是否被修改 */
 void watchCommand(client *c) {
     int j;
 
@@ -456,7 +461,7 @@ void watchCommand(client *c) {
         addReplyError(c,"WATCH inside MULTI is not allowed");
         return;
     }
-    /* No point in watching if the client is already dirty. */
+    /* 如果客户端已经被标记为脏，监视没有意义 */
     if (c->flags & CLIENT_DIRTY_CAS) {
         addReply(c,shared.ok);
         return;
@@ -466,17 +471,20 @@ void watchCommand(client *c) {
     addReply(c,shared.ok);
 }
 
+/* UNWATCH 命令：取消监视所有键 */
 void unwatchCommand(client *c) {
     unwatchAllKeys(c);
     c->flags &= (~CLIENT_DIRTY_CAS);
     addReply(c,shared.ok);
 }
 
+/* 计算 MULTI/EXEC 事务状态的内存开销 */
 size_t multiStateMemOverhead(client *c) {
     size_t mem = c->mstate.argv_len_sums;
-    /* Add watched keys overhead, Note: this doesn't take into account the watched keys themselves, because they aren't managed per-client. */
+    /* 加上监视键的开销。注意：这不包括被监视键本身的内存，
+     * 因为它们不是按客户端管理的。 */
     mem += listLength(c->watched_keys) * (sizeof(listNode) + sizeof(watchedKey));
-    /* Reserved memory for queued multi commands. */
+    /* 为排队的事务命令预留的内存 */
     mem += c->mstate.alloc_count * sizeof(multiCmd);
     return mem;
 }

@@ -1,4 +1,4 @@
-/* zmalloc - total amount of allocated memory aware version of malloc()
+/* zmalloc - 能跟踪总已分配内存的 malloc() 封装版本
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -20,10 +20,10 @@
 #include <sys/mman.h>
 #endif
 
-/* This function provide us access to the original libc free(). This is useful
- * for instance to free results obtained by backtrace_symbols(). We need
- * to define this function before including zmalloc.h that may shadow the
- * free implementation if we use jemalloc or another non standard allocator. */
+/* 此函数提供对原始 libc free() 的访问。这对于释放由
+ * backtrace_symbols() 返回的结果很有用。我们需要在包含
+ * zmalloc.h 之前定义此函数，因为 zmalloc.h 可能会在使用
+ * jemalloc 或其他非标准分配器时隐藏原始的 free 实现。 */
 void zlibc_free(void *ptr) {
     free(ptr);
 }
@@ -37,7 +37,7 @@ void zlibc_free(void *ptr) {
 #ifdef HAVE_MALLOC_SIZE
 #define PREFIX_SIZE (0)
 #else
-/* Use at least 8 bytes alignment on all systems. */
+/* 在所有系统上至少使用 8 字节对齐。 */
 #if SIZE_MAX < 0xffffffffffffffffull
 #define PREFIX_SIZE 8
 #else
@@ -45,18 +45,18 @@ void zlibc_free(void *ptr) {
 #endif
 #endif
 
-/* When using the libc allocator, use a minimum allocation size to match the
- * jemalloc behavior that doesn't return NULL in this case.
+/* 使用 libc 分配器时，使用最小分配大小以匹配
+ * jemalloc 在此情况下不返回 NULL 的行为。
  */
 #define MALLOC_MIN_SIZE(x) ((x) > 0 ? (x) : sizeof(long))
 
-/* Explicitly override malloc/free etc when using tcmalloc. */
+/* 使用 tcmalloc 时显式覆盖 malloc/free 等函数。 */
 #if defined(USE_TCMALLOC)
 #define malloc(size) tc_malloc(size)
 #define calloc(count,size) tc_calloc(count,size)
 #define realloc(ptr,size) tc_realloc(ptr,size)
 #define free(ptr) tc_free(ptr)
-/* Explicitly override malloc/free etc when using jemalloc. */
+/* 使用 jemalloc 时显式覆盖 malloc/free 等函数。 */
 #elif defined(USE_JEMALLOC)
 #define malloc(size) je_malloc(size)
 #define calloc(count,size) je_calloc(count,size)
@@ -72,6 +72,7 @@ void zlibc_free(void *ptr) {
 
 static redisAtomic size_t used_memory = 0;
 
+/* 默认的 OOM 处理函数：输出错误信息并终止进程 */
 static void zmalloc_default_oom(size_t size) {
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n",
         size);
@@ -82,16 +83,18 @@ static void zmalloc_default_oom(size_t size) {
 static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 
 #ifdef HAVE_MALLOC_SIZE
+/* 当分配器支持 malloc_size 时，将分配扩展为可用。
+ * 某些分配器可能返回比请求更大的内存块。 */
 void *extend_to_usable(void *ptr, size_t size) {
     UNUSED(size);
     return ptr;
 }
 #endif
 
-/* Try allocating memory, and return NULL if failed.
- * '*usable' is set to the usable size if non NULL. */
+/* 尝试分配内存，失败时返回 NULL。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {
-    /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
+    /* 可能溢出，返回 NULL，让调用方可以选择 panic 或处理分配失败。 */
     if (size >= SIZE_MAX/2) return NULL;
     void *ptr = malloc(MALLOC_MIN_SIZE(size)+PREFIX_SIZE);
 
@@ -110,6 +113,7 @@ static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {
 #endif
 }
 
+/* 尝试分配内存并返回可用大小，失败时返回 NULL */
 void *ztrymalloc_usable(size_t size, size_t *usable) {
     size_t usable_size = 0;
     void *ptr = ztrymalloc_usable_internal(size, &usable_size);
@@ -120,21 +124,21 @@ void *ztrymalloc_usable(size_t size, size_t *usable) {
     return ptr;
 }
 
-/* Allocate memory or panic */
+/* 分配内存，失败时触发 OOM 处理（panic） */
 void *zmalloc(size_t size) {
     void *ptr = ztrymalloc_usable_internal(size, NULL);
     if (!ptr) zmalloc_oom_handler(size);
     return ptr;
 }
 
-/* Try allocating memory, and return NULL if failed. */
+/* 尝试分配内存，失败时返回 NULL。 */
 void *ztrymalloc(size_t size) {
     void *ptr = ztrymalloc_usable_internal(size, NULL);
     return ptr;
 }
 
-/* Allocate memory or panic.
- * '*usable' is set to the usable size if non NULL. */
+/* 分配内存，失败时触发 OOM 处理。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 void *zmalloc_usable(size_t size, size_t *usable) {
     size_t usable_size = 0;
     void *ptr = ztrymalloc_usable_internal(size, &usable_size);
@@ -147,6 +151,7 @@ void *zmalloc_usable(size_t size, size_t *usable) {
 }
 
 #if defined(USE_JEMALLOC)
+/* 使用指定 flags 进行内存分配（仅 jemalloc） */
 void *zmalloc_with_flags(size_t size, int flags) {
     if (size >= SIZE_MAX/2) zmalloc_oom_handler(size);
     void *ptr = mallocx(size+PREFIX_SIZE, flags);
@@ -155,18 +160,19 @@ void *zmalloc_with_flags(size_t size, int flags) {
     return ptr;
 }
 
+/* 使用指定 flags 重新分配内存（仅 jemalloc） */
 void *zrealloc_with_flags(void *ptr, size_t size, int flags) {
-    /* Not allocating anything, just redirect to free. */
+    /* 大小为 0，不分配任何东西，重定向到 free。 */
     if (size == 0 && ptr != NULL) {
         zfree_with_flags(ptr, flags);
         return NULL;
     }
 
-    /* Not freeing anything, just redirect to malloc. */
+    /* 指针为 NULL，不释放任何东西，重定向到 malloc。 */
     if (ptr == NULL)
         return zmalloc_with_flags(size, flags);
 
-    /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
+    /* 可能溢出，返回 NULL，让调用方可以选择 panic 或处理分配失败。 */
     if (size >= SIZE_MAX/2) {
         zfree_with_flags(ptr, flags);
         zmalloc_oom_handler(size);
@@ -186,6 +192,7 @@ void *zrealloc_with_flags(void *ptr, size_t size, int flags) {
     return newptr;
 }
 
+/* 使用指定 flags 释放内存（仅 jemalloc） */
 void zfree_with_flags(void *ptr, int flags) {
     if (ptr == NULL) return;
     update_zmalloc_stat_free(zmalloc_size(ptr));
@@ -193,10 +200,11 @@ void zfree_with_flags(void *ptr, int flags) {
 }
 #endif
 
-/* Allocation and free functions that bypass the thread cache
- * and go straight to the allocator arena bins.
- * Currently implemented only for jemalloc. Used for online defragmentation. */
+/* 绕过线程缓存（thread cache）直接使用分配器 arena bins
+ * 的分配和释放函数。目前仅针对 jemalloc 实现，
+ * 用于在线碎片整理（online defragmentation）。 */
 #ifdef HAVE_DEFRAG
+/* 不使用线程缓存的内存分配（用于碎片整理） */
 void *zmalloc_no_tcache(size_t size) {
     if (size >= SIZE_MAX/2) zmalloc_oom_handler(size);
     void *ptr = mallocx(size+PREFIX_SIZE, MALLOCX_TCACHE_NONE);
@@ -205,6 +213,7 @@ void *zmalloc_no_tcache(size_t size) {
     return ptr;
 }
 
+/* 不使用线程缓存的内存释放（用于碎片整理） */
 void zfree_no_tcache(void *ptr) {
     if (ptr == NULL) return;
     update_zmalloc_stat_free(zmalloc_size(ptr));
@@ -212,10 +221,10 @@ void zfree_no_tcache(void *ptr) {
 }
 #endif
 
-/* Try allocating memory and zero it, and return NULL if failed.
- * '*usable' is set to the usable size if non NULL. */
+/* 尝试分配并清零内存，失败时返回 NULL。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 static inline void *ztrycalloc_usable_internal(size_t size, size_t *usable) {
-    /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
+    /* 可能溢出，返回 NULL，让调用方可以选择 panic 或处理分配失败。 */
     if (size >= SIZE_MAX/2) return NULL;
     void *ptr = calloc(1, MALLOC_MIN_SIZE(size)+PREFIX_SIZE);
     if (ptr == NULL) return NULL;
@@ -234,6 +243,7 @@ static inline void *ztrycalloc_usable_internal(size_t size, size_t *usable) {
 #endif
 }
 
+/* 尝试分配并清零内存，返回可用大小，失败时返回 NULL */
 void *ztrycalloc_usable(size_t size, size_t *usable) {
     size_t usable_size = 0;
     void *ptr = ztrycalloc_usable_internal(size, &usable_size);
@@ -244,11 +254,11 @@ void *ztrycalloc_usable(size_t size, size_t *usable) {
     return ptr;
 }
 
-/* Allocate memory and zero it or panic.
- * We need this wrapper to have a calloc compatible signature */
+/* 分配并清零内存，失败时触发 OOM 处理。
+ * 需要此包装函数以提供与 calloc 兼容的签名 */
 void *zcalloc_num(size_t num, size_t size) {
-    /* Ensure that the arguments to calloc(), when multiplied, do not wrap.
-     * Division operations are susceptible to divide-by-zero errors so we also check it. */
+    /* 确保 calloc() 的参数相乘时不会溢出。
+     * 除法运算可能产生除零错误，因此也需要检查。 */
     if ((size == 0) || (num > SIZE_MAX/size)) {
         zmalloc_oom_handler(SIZE_MAX);
         return NULL;
@@ -258,21 +268,21 @@ void *zcalloc_num(size_t num, size_t size) {
     return ptr;
 }
 
-/* Allocate memory and zero it or panic */
+/* 分配并清零内存，失败时触发 OOM 处理 */
 void *zcalloc(size_t size) {
     void *ptr = ztrycalloc_usable_internal(size, NULL);
     if (!ptr) zmalloc_oom_handler(size);
     return ptr;
 }
 
-/* Try allocating memory, and return NULL if failed. */
+/* 尝试分配并清零内存，失败时返回 NULL。 */
 void *ztrycalloc(size_t size) {
     void *ptr = ztrycalloc_usable_internal(size, NULL);
     return ptr;
 }
 
-/* Allocate memory or panic.
- * '*usable' is set to the usable size if non NULL. */
+/* 分配并清零内存，失败时触发 OOM 处理。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 void *zcalloc_usable(size_t size, size_t *usable) {
     size_t usable_size = 0;
     void *ptr = ztrycalloc_usable_internal(size, &usable_size);
@@ -284,8 +294,8 @@ void *zcalloc_usable(size_t size, size_t *usable) {
     return ptr;
 }
 
-/* Try reallocating memory, and return NULL if failed.
- * '*usable' is set to the usable size if non NULL. */
+/* 尝试重新分配内存，失败时返回 NULL。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *usable) {
 #ifndef HAVE_MALLOC_SIZE
     void *realptr;
@@ -293,17 +303,17 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     size_t oldsize;
     void *newptr;
 
-    /* not allocating anything, just redirect to free. */
+    /* 大小为 0，不分配任何东西，重定向到 free。 */
     if (size == 0 && ptr != NULL) {
         zfree(ptr);
         if (usable) *usable = 0;
         return NULL;
     }
-    /* Not freeing anything, just redirect to malloc. */
+    /* 指针为 NULL，不释放任何东西，重定向到 malloc。 */
     if (ptr == NULL)
         return ztrymalloc_usable(size, usable);
 
-    /* Possible overflow, return NULL, so that the caller can panic or handle a failed allocation. */
+    /* 可能溢出，返回 NULL，让调用方可以选择 panic 或处理分配失败。 */
     if (size >= SIZE_MAX/2) {
         zfree(ptr);
         if (usable) *usable = 0;
@@ -340,6 +350,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
 #endif
 }
 
+/* 尝试重新分配内存并返回可用大小，失败时返回 NULL */
 void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable) {
     size_t usable_size = 0;
     ptr = ztryrealloc_usable_internal(ptr, size, &usable_size);
@@ -350,21 +361,21 @@ void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable) {
     return ptr;
 }
 
-/* Reallocate memory and zero it or panic */
+/* 重新分配内存，失败时触发 OOM 处理 */
 void *zrealloc(void *ptr, size_t size) {
     ptr = ztryrealloc_usable_internal(ptr, size, NULL);
     if (!ptr && size != 0) zmalloc_oom_handler(size);
     return ptr;
 }
 
-/* Try Reallocating memory, and return NULL if failed. */
+/* 尝试重新分配内存，失败时返回 NULL。 */
 void *ztryrealloc(void *ptr, size_t size) {
     ptr = ztryrealloc_usable_internal(ptr, size, NULL);
     return ptr;
 }
 
-/* Reallocate memory or panic.
- * '*usable' is set to the usable size if non NULL. */
+/* 重新分配内存，失败时触发 OOM 处理。
+ * 如果 usable 非 NULL，则将其设为可用大小。 */
 void *zrealloc_usable(void *ptr, size_t size, size_t *usable) {
     size_t usable_size = 0;
     ptr = ztryrealloc_usable(ptr, size, &usable_size);
@@ -376,9 +387,8 @@ void *zrealloc_usable(void *ptr, size_t size, size_t *usable) {
     return ptr;
 }
 
-/* Provide zmalloc_size() for systems where this function is not provided by
- * malloc itself, given that in that case we store a header with this
- * information as the first bytes of every allocation. */
+/* 为 malloc 本身不提供 zmalloc_size() 功能的系统提供实现，
+ * 在这种情况下我们在每次分配的头部存储大小信息。 */
 #ifndef HAVE_MALLOC_SIZE
 size_t zmalloc_size(void *ptr) {
     void *realptr = (char*)ptr-PREFIX_SIZE;
@@ -408,7 +418,7 @@ void zfree(void *ptr) {
 #endif
 }
 
-/* Similar to zfree, '*usable' is set to the usable size being freed. */
+/* 类似于 zfree，额外将 *usable 设为被释放的可用大小。 */
 void zfree_usable(void *ptr, size_t *usable) {
 #ifndef HAVE_MALLOC_SIZE
     void *realptr;
@@ -427,6 +437,7 @@ void zfree_usable(void *ptr, size_t *usable) {
 #endif
 }
 
+/* 复制字符串，使用 zmalloc 分配内存 */
 char *zstrdup(const char *s) {
     size_t l = strlen(s)+1;
     char *p = zmalloc(l);
@@ -435,19 +446,21 @@ char *zstrdup(const char *s) {
     return p;
 }
 
+/* 获取已使用的内存总量 */
 size_t zmalloc_used_memory(void) {
     size_t um;
     atomicGet(used_memory,um);
     return um;
 }
 
+/* 设置自定义的 OOM（内存不足）处理函数 */
 void zmalloc_set_oom_handler(void (*oom_handler)(size_t)) {
     zmalloc_oom_handler = oom_handler;
 }
 
-/* Use 'MADV_DONTNEED' to release memory to operating system quickly.
- * We do that in a fork child process to avoid CoW when the parent modifies
- * these shared pages. */
+/* 使用 'MADV_DONTNEED' 快速将内存归还给操作系统。
+ * 我们在 fork 子进程中执行此操作，以避免父进程修改
+ * 这些共享页面时触发写时复制（CoW）。 */
 void zmadvise_dontneed(void *ptr) {
 #if defined(USE_JEMALLOC) && defined(__linux__)
     static size_t page_size = 0;
@@ -457,9 +470,8 @@ void zmadvise_dontneed(void *ptr) {
     size_t real_size = zmalloc_size(ptr);
     if (real_size < page_size) return;
 
-    /* We need to align the pointer upwards according to page size, because
-     * the memory address is increased upwards and we only can free memory
-     * based on page. */
+    /* 我们需要按页面大小向上对齐指针，因为内存地址是
+     * 向上增长的，且只能按页面粒度释放内存。 */
     char *aligned_ptr = (char *)(((size_t)ptr+page_size_mask) & ~page_size_mask);
     real_size -= (aligned_ptr-(char*)ptr);
     if (real_size >= page_size) {
@@ -470,15 +482,15 @@ void zmadvise_dontneed(void *ptr) {
 #endif
 }
 
-/* Get the RSS information in an OS-specific way.
+/* 以操作系统特定的方式获取 RSS（常驻内存集）信息。
  *
- * WARNING: the function zmalloc_get_rss() is not designed to be fast
- * and may not be called in the busy loops where Redis tries to release
- * memory expiring or swapping out objects.
+ * 警告：zmalloc_get_rss() 函数不是为速度设计的，
+ * 不应在 Redis 尝试通过过期或换出对象来释放内存的
+ * 繁忙循环中调用。
  *
- * For this kind of "fast RSS reporting" usages use instead the
- * function RedisEstimateRSS() that is a much faster (and less precise)
- * version of the function. */
+ * 对于需要"快速 RSS 报告"的场景，应使用
+ * RedisEstimateRSS() 函数，它是更快速（但精度较低）
+ * 的版本。 */
 
 #if defined(HAVE_PROC_STAT)
 #include <sys/types.h>
@@ -486,7 +498,8 @@ void zmadvise_dontneed(void *ptr) {
 #include <fcntl.h>
 #endif
 
-/* Get the i'th field from "/proc/self/stat" note i is 1 based as appears in the 'proc' man page */
+/* 从 "/proc/self/stat" 中获取第 i 个字段，
+ * 注意 i 从 1 开始，与 proc man 页面中的编号一致 */
 int get_proc_stat_ll(int i, long long *res) {
 #if defined(HAVE_PROC_STAT)
     char buf[4096];
@@ -502,7 +515,7 @@ int get_proc_stat_ll(int i, long long *res) {
     buf[l] = '\0';
     if (buf[l-1] == '\n') buf[l-1] = '\0';
 
-    /* Skip pid and process name (surrounded with parentheses) */
+    /* 跳过 pid 和进程名（被括号包围的部分） */
     p = strrchr(buf, ')');
     if (!p) return 0;
     p++;
@@ -534,7 +547,7 @@ size_t zmalloc_get_rss(void) {
     int page = sysconf(_SC_PAGESIZE);
     long long rss;
 
-    /* RSS is the 24th field in /proc/<pid>/stat */
+    /* RSS 是 /proc/<pid>/stat 中的第 24 个字段 */
     if (!get_proc_stat_ll(24, &rss)) return 0;
     rss *= page;
     return rss;
@@ -644,11 +657,11 @@ size_t zmalloc_get_rss(void) {
 }
 #else
 size_t zmalloc_get_rss(void) {
-    /* If we can't get the RSS in an OS-specific way for this system just
-     * return the memory usage we estimated in zmalloc()..
+    /* 如果无法通过操作系统特定方式获取此系统的 RSS，
+     * 则直接返回 zmalloc() 估算的内存使用量。
      *
-     * Fragmentation will appear to be always 1 (no fragmentation)
-     * of course... */
+     * 碎片率将始终显示为 1（无碎片）
+     * 当然这只是近似值... */
     return zmalloc_used_memory();
 }
 #endif
@@ -657,11 +670,12 @@ size_t zmalloc_get_rss(void) {
 
 #include "redisassert.h"
 
-/* Compute the total memory wasted in fragmentation of inside small arena bins.
- * Done by summing the memory in unused regs in all slabs of all small bins.
+/* 计算 small arena bins 内部碎片浪费的总内存。
+ * 通过对所有 small bins 的 slabs 中未使用的 regs
+ * 内存求和来完成。
  *
- * Pass in arena to get the information of the specified arena, otherwise pass
- * in MALLCTL_ARENAS_ALL to get all. */
+ * 传入 arena 参数可获取指定 arena 的信息，
+ * 传入 MALLCTL_ARENAS_ALL 可获取所有 arena 的信息。 */
 size_t zmalloc_get_frag_smallbins_by_arena(unsigned int arena) {
     unsigned nbins;
     size_t sz, frag = 0;
@@ -673,51 +687,52 @@ size_t zmalloc_get_frag_smallbins_by_arena(unsigned int arena) {
         size_t curregs, curslabs, reg_size;
         uint32_t nregs;
 
-        /* The size of the current bin */
+        /* 当前 bin 的大小 */
         snprintf(buf, sizeof(buf), "arenas.bin.%u.size", j);
         sz = sizeof(size_t);
         assert(!je_mallctl(buf, &reg_size, &sz, NULL, 0));
 
-        /* Number of used regions in the bin */
+        /* bin 中已使用的 region 数量 */
         snprintf(buf, sizeof(buf), "stats.arenas.%u.bins.%u.curregs", arena, j);
         sz = sizeof(size_t);
         assert(!je_mallctl(buf, &curregs, &sz, NULL, 0));
 
-        /* Number of regions per slab */
+        /* 每个 slab 的 region 数量 */
         snprintf(buf, sizeof(buf), "arenas.bin.%u.nregs", j);
         sz = sizeof(uint32_t);
         assert(!je_mallctl(buf, &nregs, &sz, NULL, 0));
 
-        /* Number of current slabs in the bin */
+        /* bin 中当前 slab 的数量 */
         snprintf(buf, sizeof(buf), "stats.arenas.%u.bins.%u.curslabs", arena, j);
         sz = sizeof(size_t);
         assert(!je_mallctl(buf, &curslabs, &sz, NULL, 0));
 
-        /* Calculate the fragmentation bytes for the current bin and add it to the total. */
+        /* 计算当前 bin 的碎片字节数并累加到总数中。 */
         frag += ((nregs * curslabs) - curregs) * reg_size;
     }
 
     return frag;
 }
 
-/* Compute the total memory wasted in fragmentation of inside small arena bins.
- * Done by summing the memory in unused regs in all slabs of all small bins. */
+/* 计算所有 small arena bins 内部碎片浪费的总内存。
+ * 通过对所有 small bins 的 slabs 中未使用的 regs
+ * 内存求和来完成。 */
 size_t zmalloc_get_frag_smallbins(void) {
     return zmalloc_get_frag_smallbins_by_arena(MALLCTL_ARENAS_ALL);
 }
 
-/* Get memory allocation information from allocator.
+/* 从分配器获取内存分配信息。
  *
- * refresh_stats indicates whether to refresh cached statistics.
- * For the meaning of the other parameters, please refer to the function implementation
- * and INFO's allocator_* in redis-doc. */
+ * refresh_stats 指示是否刷新缓存的统计信息。
+ * 其他参数的含义请参考函数实现和 redis-doc 中
+ * INFO 的 allocator_* 部分。 */
 int zmalloc_get_allocator_info(int refresh_stats, size_t *allocated, size_t *active, size_t *resident,
                                size_t *retained, size_t *muzzy, size_t *frag_smallbins_bytes)
 {
     size_t sz;
     *allocated = *resident = *active = 0;
 
-    /* Update the statistics cached by mallctl. */
+    /* 更新 mallctl 缓存的统计数据。 */
     if (refresh_stats) {
         uint64_t epoch = 1;
         sz = sizeof(epoch);
@@ -725,26 +740,26 @@ int zmalloc_get_allocator_info(int refresh_stats, size_t *allocated, size_t *act
     }
 
     sz = sizeof(size_t);
-    /* Unlike RSS, this does not include RSS from shared libraries and other non
-     * heap mappings. */
+    /* 与 RSS 不同，此处不包含共享库和其他非堆映射的 RSS。 */
     je_mallctl("stats.resident", resident, &sz, NULL, 0);
-    /* Unlike resident, this doesn't not include the pages jemalloc reserves
-     * for re-use (purge will clean that). */
+    /* 与 resident 不同，此处不包含 jemalloc 预留待重用的
+     * 页面（purge 操作会清理这些页面）。 */
     je_mallctl("stats.active", active, &sz, NULL, 0);
-    /* Unlike zmalloc_used_memory, this matches the stats.resident by taking
-     * into account all allocations done by this process (not only zmalloc). */
+    /* 与 zmalloc_used_memory 不同，此值通过计入进程的
+     * 所有分配（不仅仅是 zmalloc）来匹配 stats.resident。 */
     je_mallctl("stats.allocated", allocated, &sz, NULL, 0);
 
-    /* Retained memory is memory released by `madvised(..., MADV_DONTNEED)`, which is not part
-     * of RSS or mapped memory, and doesn't have a strong association with physical memory in the OS.
-     * It is still part of the VM-Size, and may be used again in later allocations. */
+    /* Retained 内存是通过 `madvised(..., MADV_DONTNEED)` 释放的内存，
+     * 不属于 RSS 或映射内存，与操作系统中的物理内存没有强关联。
+     * 它仍然是 VM-Size 的一部分，可能在后续分配中被再次使用。 */
     if (retained) {
         *retained = 0;
         je_mallctl("stats.retained", retained, &sz, NULL, 0);
     }
 
-    /* Unlike retained, Muzzy representats memory released with `madvised(..., MADV_FREE)`.
-     * These pages will show as RSS for the process, until the OS decides to re-use them. */
+    /* 与 retained 不同，Muzzy 表示通过 `madvised(..., MADV_FREE)`
+     * 释放的内存。这些页面在操作系统决定重用之前
+     * 仍会显示为进程的 RSS。 */
     if (muzzy) {
         char buf[100];
         size_t pmuzzy, page;
@@ -754,16 +769,16 @@ int zmalloc_get_allocator_info(int refresh_stats, size_t *allocated, size_t *act
         *muzzy = pmuzzy * page;
     }
 
-    /* Total size of consumed meomry in unused regs in small bins (AKA external fragmentation). */
+    /* small bins 中未使用 regs 的已消耗内存总量（即外部碎片）。 */
     *frag_smallbins_bytes = zmalloc_get_frag_smallbins();
     return 1;
 }
 
-/* Get the specified arena memory allocation information from allocator.
+/* 从分配器获取指定 arena 的内存分配信息。
  *
- * refresh_stats indicates whether to refresh cached statistics.
- * For the meaning of the other parameters, please refer to the function implementation
- * and INFO's allocator_* in redis-doc. */
+ * refresh_stats 指示是否刷新缓存的统计信息。
+ * 其他参数的含义请参考函数实现和 redis-doc 中
+ * INFO 的 allocator_* 部分。 */
 int zmalloc_get_allocator_info_by_arena(unsigned int arena, int refresh_stats, size_t *allocated,
                                         size_t *active, size_t *resident, size_t *frag_smallbins_bytes)
 {
@@ -771,7 +786,7 @@ int zmalloc_get_allocator_info_by_arena(unsigned int arena, int refresh_stats, s
     size_t sz;
     *allocated = *resident = *active = 0;
 
-    /* Update the statistics cached by mallctl. */
+    /* 更新 mallctl 缓存的统计数据。 */
     if (refresh_stats) {
         uint64_t epoch = 1;
         sz = sizeof(epoch);
@@ -779,19 +794,18 @@ int zmalloc_get_allocator_info_by_arena(unsigned int arena, int refresh_stats, s
     }
 
     sz = sizeof(size_t);
-    /* Unlike RSS, this does not include RSS from shared libraries and other non
-     * heap mappings. */
+    /* 与 RSS 不同，此处不包含共享库和其他非堆映射的 RSS。 */
     snprintf(buf, sizeof(buf), "stats.arenas.%u.small.resident", arena);
     je_mallctl(buf, resident, &sz, NULL, 0);
-    /* Unlike resident, this doesn't not include the pages jemalloc reserves
-     * for re-use (purge will clean that). */
+    /* 与 resident 不同，此处不包含 jemalloc 预留待重用的
+     * 页面（purge 操作会清理这些页面）。 */
     size_t pactive, page;
     snprintf(buf, sizeof(buf), "stats.arenas.%u.pactive", arena);
     assert(!je_mallctl(buf, &pactive, &sz, NULL, 0));
     assert(!je_mallctl("arenas.page", &page, &sz, NULL, 0));
     *active = pactive * page;
-    /* Unlike zmalloc_used_memory, this matches the stats.resident by taking
-     * into account all allocations done by this process (not only zmalloc). */
+    /* 与 zmalloc_used_memory 不同，此值通过计入进程的
+     * 所有分配（不仅仅是 zmalloc）来匹配 stats.resident。 */
     size_t small_allcated, large_allacted;
     snprintf(buf, sizeof(buf), "stats.arenas.%u.small.allocated", arena);
     assert(!je_mallctl(buf, &small_allcated, &sz, NULL, 0));
@@ -800,21 +814,21 @@ int zmalloc_get_allocator_info_by_arena(unsigned int arena, int refresh_stats, s
     assert(!je_mallctl(buf, &large_allacted, &sz, NULL, 0));
     *allocated += large_allacted;
 
-    /* Total size of consumed meomry in unused regs in small bins (AKA external fragmentation). */
+    /* small bins 中未使用 regs 的已消耗内存总量（即外部碎片）。 */
     *frag_smallbins_bytes = zmalloc_get_frag_smallbins_by_arena(arena);
     return 1;
 }
 
 
 void set_jemalloc_bg_thread(int enable) {
-    /* let jemalloc do purging asynchronously, required when there's no traffic 
-     * after flushdb */
+    /* 让 jemalloc 异步执行清理（purging）操作，
+     * 这在 flushdb 之后没有流量时是必需的 */
     char val = !!enable;
     je_mallctl("background_thread", NULL, 0, &val, 1);
 }
 
 int jemalloc_purge(void) {
-    /* return all unused (reserved) pages to the OS */
+    /* 将所有未使用的（已预留的）页面归还给操作系统 */
     char tmp[32];
     unsigned narenas = 0;
     size_t sz = sizeof(unsigned);
@@ -859,22 +873,20 @@ int jemalloc_purge(void) {
 #endif
 
 #if defined(__APPLE__)
-/* For proc_pidinfo() used later in zmalloc_get_smap_bytes_by_field().
- * Note that this file cannot be included in zmalloc.h because it includes
- * a Darwin queue.h file where there is a "LIST_HEAD" macro (!) defined
- * conficting with Redis user code. */
+/* 用于 zmalloc_get_smap_bytes_by_field() 中的 proc_pidinfo()。
+ * 注意此头文件不能包含在 zmalloc.h 中，因为它包含了一个
+ * Darwin queue.h 文件，其中定义了与 Redis 用户代码冲突的
+ * "LIST_HEAD" 宏。 */
 #include <libproc.h>
 #endif
 
-/* Get the sum of the specified field (converted form kb to bytes) in
- * /proc/self/smaps. The field must be specified with trailing ":" as it
- * apperas in the smaps output.
+/* 获取 /proc/self/smaps 中指定字段的总和（从 kb 转换为字节）。
+ * 字段名必须带尾部 ":"，与 smaps 输出中的格式一致。
  *
- * If a pid is specified, the information is extracted for such a pid,
- * otherwise if pid is -1 the information is reported is about the
- * current process.
+ * 如果指定了 pid，则提取该 pid 的信息；
+ * 如果 pid 为 -1，则报告当前进程的信息。
  *
- * Example: zmalloc_get_smap_bytes_by_field("Rss:",-1);
+ * 示例：zmalloc_get_smap_bytes_by_field("Rss:",-1);
  */
 #if defined(HAVE_PROC_SMAPS)
 size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
@@ -905,12 +917,11 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
     return bytes;
 }
 #else
-/* Get sum of the specified field from libproc api call.
- * As there are per page value basis we need to convert
- * them accordingly.
+/* 通过 libproc API 调用获取指定字段的总和。
+ * 由于返回的是每页的值，需要相应地进行转换。
  *
- * Note that AnonHugePages is a no-op as THP feature
- * is not supported in this platform
+ * 注意 AnonHugePages 在此平台上不操作，
+ * 因为 THP（透明大页）功能不受支持
  */
 size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
 #if defined(__APPLE__)
@@ -936,27 +947,27 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
 }
 #endif
 
-/* Return the total number bytes in pages marked as Private Dirty.
+/* 返回标记为 Private Dirty 的页面总字节数。
  *
- * Note: depending on the platform and memory footprint of the process, this
- * call can be slow, exceeding 1000ms!
+ * 注意：根据平台和进程的内存占用情况，
+ * 此调用可能很慢，超过 1000ms！
  */
 size_t zmalloc_get_private_dirty(long pid) {
     return zmalloc_get_smap_bytes_by_field("Private_Dirty:",pid);
 }
 
-/* Returns the size of physical memory (RAM) in bytes.
- * It looks ugly, but this is the cleanest way to achieve cross platform results.
- * Cleaned up from:
+/* 返回物理内存（RAM）的大小，以字节为单位。
+ * 虽然看起来不太优雅，但这是实现跨平台获取
+ * 物理内存大小最简洁的方式。整理自：
  *
  * http://nadeausoftware.com/articles/2012/09/c_c_tip_how_get_physical_memory_size_system
  *
- * Note that this function:
- * 1) Was released under the following CC attribution license:
- *    http://creativecommons.org/licenses/by/3.0/deed.en_US.
- * 2) Was originally implemented by David Robert Nadeau.
- * 3) Was modified for Redis by Matt Stancliff.
- * 4) This note exists in order to comply with the original license.
+ * 注意此函数：
+ * 1) 在以下 CC 署名许可下发布：
+ *    http://creativecommons.org/licenses/by/3.0/deed.en_US
+ * 2) 最初由 David Robert Nadeau 实现。
+ * 3) 由 Matt Stancliff 为 Redis 进行了修改。
+ * 4) 此注释是为了遵守原始许可要求。
  */
 size_t zmalloc_get_memory_size(void) {
 #if defined(__unix__) || defined(__unix) || defined(unix) || \
@@ -965,39 +976,39 @@ size_t zmalloc_get_memory_size(void) {
     int mib[2];
     mib[0] = CTL_HW;
 #if defined(HW_MEMSIZE)
-    mib[1] = HW_MEMSIZE;            /* OSX. --------------------- */
+    mib[1] = HW_MEMSIZE;            /* OSX 系统。 ----------------- */
 #elif defined(HW_PHYSMEM64)
-    mib[1] = HW_PHYSMEM64;          /* NetBSD, OpenBSD. --------- */
+    mib[1] = HW_PHYSMEM64;          /* NetBSD, OpenBSD 系统。 --- */
 #endif
-    int64_t size = 0;               /* 64-bit */
+    int64_t size = 0;               /* 64 位 */
     size_t len = sizeof(size);
     if (sysctl( mib, 2, &size, &len, NULL, 0) == 0)
         return (size_t)size;
-    return 0L;          /* Failed? */
+    return 0L;          /* 失败 */
 
 #elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    /* FreeBSD, Linux, OpenBSD, and Solaris. -------------------- */
+    /* FreeBSD, Linux, OpenBSD 和 Solaris 系统。 --------------- */
     return (size_t)sysconf(_SC_PHYS_PAGES) * (size_t)sysconf(_SC_PAGESIZE);
 
 #elif defined(CTL_HW) && (defined(HW_PHYSMEM) || defined(HW_REALMEM))
-    /* DragonFly BSD, FreeBSD, NetBSD, OpenBSD, and OSX. -------- */
+    /* DragonFly BSD, FreeBSD, NetBSD, OpenBSD 和 OSX 系统。 --- */
     int mib[2];
     mib[0] = CTL_HW;
 #if defined(HW_REALMEM)
-    mib[1] = HW_REALMEM;        /* FreeBSD. ----------------- */
+    mib[1] = HW_REALMEM;        /* FreeBSD 系统。 ------------- */
 #elif defined(HW_PHYSMEM)
-    mib[1] = HW_PHYSMEM;        /* Others. ------------------ */
+    mib[1] = HW_PHYSMEM;        /* 其他系统。 ----------------- */
 #endif
-    unsigned int size = 0;      /* 32-bit */
+    unsigned int size = 0;      /* 32 位 */
     size_t len = sizeof(size);
     if (sysctl(mib, 2, &size, &len, NULL, 0) == 0)
         return (size_t)size;
-    return 0L;          /* Failed? */
+    return 0L;          /* 失败 */
 #else
-    return 0L;          /* Unknown method to get the data. */
+    return 0L;          /* 获取数据的方法未知。 */
 #endif
 #else
-    return 0L;          /* Unknown OS. */
+    return 0L;          /* 未知操作系统。 */
 #endif
 }
 

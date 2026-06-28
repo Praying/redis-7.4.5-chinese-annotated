@@ -7,15 +7,14 @@
  */
 
 /*
- * function_lua.c unit provides the Lua engine functionality.
- * Including registering the engine and implementing the engine
- * callbacks:
- * * Create a function from blob (usually text)
- * * Invoke a function
- * * Free function memory
- * * Get memory usage
+ * function_lua.c 提供 Lua 引擎功能。
+ * 包括注册引擎和实现引擎回调：
+ * * 从代码文本（blob）创建函数
+ * * 调用函数
+ * * 释放函数内存
+ * * 获取内存使用量
  *
- * Uses script_lua.c to run the Lua code.
+ * 使用 script_lua.c 来运行 Lua 代码。
  */
 
 #include "functions.h"
@@ -27,32 +26,34 @@
 #include <lstate.h>
 #endif
 
-#define LUA_ENGINE_NAME "LUA"
-#define REGISTRY_ENGINE_CTX_NAME "__ENGINE_CTX__"
-#define REGISTRY_ERROR_HANDLER_NAME "__ERROR_HANDLER__"
-#define REGISTRY_LOAD_CTX_NAME "__LIBRARY_CTX__"
-#define LIBRARY_API_NAME "__LIBRARY_API__"
-#define GLOBALS_API_NAME "__GLOBALS_API__"
+#define LUA_ENGINE_NAME "LUA"                       /* Lua 引擎名称 */
+#define REGISTRY_ENGINE_CTX_NAME "__ENGINE_CTX__"   /* Lua 注册表中引擎上下文的键名 */
+#define REGISTRY_ERROR_HANDLER_NAME "__ERROR_HANDLER__" /* Lua 注册表中错误处理器的键名 */
+#define REGISTRY_LOAD_CTX_NAME "__LIBRARY_CTX__"    /* Lua 注册表中加载上下文的键名 */
+#define LIBRARY_API_NAME "__LIBRARY_API__"          /* 函数库 API 表名 */
+#define GLOBALS_API_NAME "__GLOBALS_API__"          /* 全局 API 表名 */
 
-static int gc_count = 0; /* Counter for the number of GC requests, reset after each GC execution */
+static int gc_count = 0; /* GC 请求计数器，每次 GC 执行后重置 */
 
-/* Lua engine ctx */
+/* Lua 引擎上下文，包含 Lua 状态机 */
 typedef struct luaEngineCtx {
     lua_State *lua;
 } luaEngineCtx;
 
-/* Lua function ctx */
+/* Lua 函数上下文，通过引用从注册表获取函数对象 */
 typedef struct luaFunctionCtx {
-    /* Special ID that allows getting the Lua function object from the Lua registry */
+    /* 特殊 ID，用于从 Lua 注册表中获取 Lua 函数对象 */
     int lua_function_ref;
 } luaFunctionCtx;
 
+/* FUNCTION LOAD 执行期间的上下文信息 */
 typedef struct loadCtx {
     functionLibInfo *li;
     monotime start_time;
     size_t timeout;
 } loadCtx;
 
+/* 注册函数时的参数集合 */
 typedef struct registerFunctionArgs {
     sds name;
     sds desc;
@@ -60,14 +61,16 @@ typedef struct registerFunctionArgs {
     uint64_t f_flags;
 } registerFunctionArgs;
 
-/* Hook for FUNCTION LOAD execution.
- * Used to cancel the execution in case of a timeout (500ms).
- * This execution should be fast and should only register
- * functions so 500ms should be more than enough. */
+/*
+ * Lua 钩子函数，用于在 FUNCTION LOAD 执行超时时取消执行。
+ * 当执行超时（500ms）时取消执行。
+ * 此执行应该很快，只注册函数，
+ * 因此 500ms 应该绰绰有余。
+ */
 static void luaEngineLoadHook(lua_State *lua, lua_Debug *ar) {
     UNUSED(ar);
     loadCtx *load_ctx = luaGetFromRegistry(lua, REGISTRY_LOAD_CTX_NAME);
-    serverAssert(load_ctx); /* Only supported inside script invocation */
+    serverAssert(load_ctx); /* 仅在脚本调用上下文中有效 */
     uint64_t duration = elapsedMs(load_ctx->start_time);
     if (load_ctx->timeout > 0 && duration > load_ctx->timeout) {
         lua_sethook(lua, luaEngineLoadHook, LUA_MASKLINE, 0);
@@ -78,29 +81,28 @@ static void luaEngineLoadHook(lua_State *lua, lua_Debug *ar) {
 }
 
 /*
- * Compile a given blob and save it on the registry.
- * Return a function ctx with Lua ref that allows to later retrieve the
- * function from the registry.
+ * 编译给定代码文本（blob）并保存到 Lua 注册表中。
+ * 返回一个函数上下文，包含可用于后续从注册表获取函数的 Lua 引用。
  *
- * Return NULL on compilation error and set the error to the err variable
+ * 编译出错时返回 NULL，并将错误信息设置到 err 变量中。
  */
 static int luaEngineCreate(void *engine_ctx, functionLibInfo *li, sds blob, size_t timeout, sds *err) {
     int ret = C_ERR;
     luaEngineCtx *lua_engine_ctx = engine_ctx;
     lua_State *lua = lua_engine_ctx->lua;
 
-    /* set load library globals */
+    /* 设置加载库的全局变量 */
     lua_getmetatable(lua, LUA_GLOBALSINDEX);
-    lua_enablereadonlytable(lua, -1, 0); /* disable global protection */
+    lua_enablereadonlytable(lua, -1, 0); /* 禁用全局保护 */
     lua_getfield(lua, LUA_REGISTRYINDEX, LIBRARY_API_NAME);
     lua_setfield(lua, -2, "__index");
-    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1); /* enable global protection */
-    lua_pop(lua, 1); /* pop the metatable */
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1); /* 启用全局表保护 */
+    lua_pop(lua, 1); /* 弹出元表 */
 
-    /* compile the code */
+    /* 编译代码 */
     if (luaL_loadbuffer(lua, blob, sdslen(blob), "@user_function")) {
         *err = sdscatprintf(sdsempty(), "Error compiling function: %s", lua_tostring(lua, -1));
-        lua_pop(lua, 1); /* pops the error */
+        lua_pop(lua, 1); /* 弹出错误信息 */
         goto done;
     }
     serverAssert(lua_isfunction(lua, -1));
@@ -113,12 +115,12 @@ static int luaEngineCreate(void *engine_ctx, functionLibInfo *li, sds blob, size
     luaSaveOnRegistry(lua, REGISTRY_LOAD_CTX_NAME, &load_ctx);
 
     lua_sethook(lua,luaEngineLoadHook,LUA_MASKCOUNT,100000);
-    /* Run the compiled code to allow it to register functions */
+    /* 运行编译后的代码，使其注册函数 */
     if (lua_pcall(lua,0,0,0)) {
         errorInfo err_info = {0};
         luaExtractErrorInformation(lua, &err_info);
         *err = sdscatprintf(sdsempty(), "Error registering functions: %s", err_info.msg);
-        lua_pop(lua, 1); /* pops the error */
+        lua_pop(lua, 1); /* 弹出错误信息 */
         luaErrorInformationDiscard(&err_info);
         goto done;
     }
@@ -126,22 +128,22 @@ static int luaEngineCreate(void *engine_ctx, functionLibInfo *li, sds blob, size
     ret = C_OK;
 
 done:
-    /* restore original globals */
+    /* 恢复原始全局变量 */
     lua_getmetatable(lua, LUA_GLOBALSINDEX);
-    lua_enablereadonlytable(lua, -1, 0); /* disable global protection */
+    lua_enablereadonlytable(lua, -1, 0); /* 禁用全局保护 */
     lua_getfield(lua, LUA_REGISTRYINDEX, GLOBALS_API_NAME);
     lua_setfield(lua, -2, "__index");
-    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1); /* enable global protection */
-    lua_pop(lua, 1); /* pop the metatable */
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1); /* 启用全局表保护 */
+    lua_pop(lua, 1); /* 弹出元表 */
 
-    lua_sethook(lua,NULL,0,0); /* Disable hook */
+    lua_sethook(lua,NULL,0,0); /* 禁用钩子 */
     luaSaveOnRegistry(lua, REGISTRY_LOAD_CTX_NAME, NULL);
     luaGC(lua, &gc_count);
     return ret;
 }
 
 /*
- * Invole the give function with the given keys and args
+ * 调用已编译的 Lua 函数，传入给定的 keys 和 args 参数。
  */
 static void luaEngineCall(scriptRunCtx *run_ctx,
                           void *engine_ctx,
@@ -155,7 +157,7 @@ static void luaEngineCall(scriptRunCtx *run_ctx,
     lua_State *lua = lua_engine_ctx->lua;
     luaFunctionCtx *f_ctx = compiled_function;
 
-    /* Push error handler */
+    /* 压入错误处理器 */
     lua_pushstring(lua, REGISTRY_ERROR_HANDLER_NAME);
     lua_gettable(lua, LUA_REGISTRYINDEX);
 
@@ -164,24 +166,28 @@ static void luaEngineCall(scriptRunCtx *run_ctx,
     serverAssert(lua_isfunction(lua, -1));
 
     luaCallFunction(run_ctx, lua, keys, nkeys, args, nargs, 0);
-    lua_pop(lua, 1); /* Pop error handler */
+    lua_pop(lua, 1); /* 弹出错误处理器 */
     luaGC(lua, &gc_count);
 }
 
+/* 获取 Lua 引擎已使用的内存 */
 static size_t luaEngineGetUsedMemoy(void *engine_ctx) {
     luaEngineCtx *lua_engine_ctx = engine_ctx;
     return luaMemory(lua_engine_ctx->lua);
 }
 
+/* 获取单个函数的内存开销 */
 static size_t luaEngineFunctionMemoryOverhead(void *compiled_function) {
     return zmalloc_size(compiled_function);
 }
 
+/* 获取 Lua 引擎的内存开销 */
 static size_t luaEngineMemoryOverhead(void *engine_ctx) {
     luaEngineCtx *lua_engine_ctx = engine_ctx;
     return zmalloc_size(lua_engine_ctx);
 }
 
+/* 释放已编译的 Lua 函数内存 */
 static void luaEngineFreeFunction(void *engine_ctx, void *compiled_function) {
     luaEngineCtx *lua_engine_ctx = engine_ctx;
     lua_State *lua = lua_engine_ctx->lua;
@@ -190,10 +196,11 @@ static void luaEngineFreeFunction(void *engine_ctx, void *compiled_function) {
     zfree(f_ctx);
 }
 
+/* 释放 Lua 引擎上下文，关闭 Lua 状态机 */
 static void luaEngineFreeCtx(void *engine_ctx) {
     luaEngineCtx *lua_engine_ctx = engine_ctx;
 #if defined(USE_JEMALLOC)
-    /* When lua is closed, destroy the previously used private tcache. */
+    /* 当 Lua 关闭时，销毁之前使用的私有 tcache。 */
     void *ud = (global_State*)G(lua_engine_ctx->lua)->ud;
     unsigned int lua_tcache = (unsigned int)(uintptr_t)ud;
 #endif
@@ -207,6 +214,7 @@ static void luaEngineFreeCtx(void *engine_ctx) {
 #endif
 }
 
+/* 初始化注册函数参数结构体 */
 static void luaRegisterFunctionArgsInitialize(registerFunctionArgs *register_f_args,
     sds name,
     sds desc,
@@ -221,6 +229,7 @@ static void luaRegisterFunctionArgsInitialize(registerFunctionArgs *register_f_a
     };
 }
 
+/* 清理注册函数参数，释放相关资源 */
 static void luaRegisterFunctionArgsDispose(lua_State *lua, registerFunctionArgs *register_f_args) {
     sdsfree(register_f_args->name);
     if (register_f_args->desc) sdsfree(register_f_args->desc);
@@ -228,9 +237,11 @@ static void luaRegisterFunctionArgsDispose(lua_State *lua, registerFunctionArgs 
     zfree(register_f_args->lua_f_ctx);
 }
 
-/* Read function flags located on the top of the Lua stack.
- * On success, return C_OK and set the flags to 'flags' out parameter
- * Return C_ERR if encounter an unknown flag. */
+/*
+ * 从 Lua 栈顶读取函数标志。
+ * 成功时返回 C_OK 并将标志设置到 flags 输出参数中。
+ * 遇到未知标志时返回 C_ERR。
+ */
 static int luaRegisterFunctionReadFlags(lua_State *lua, uint64_t *flags) {
     int j = 1;
     int ret = C_ERR;
@@ -257,10 +268,10 @@ static int luaRegisterFunctionReadFlags(lua_State *lua, uint64_t *flags) {
                 break;
             }
         }
-        /* pops the value to continue the iteration */
+        /* 弹出值以继续迭代 */
         lua_pop(lua,1);
         if (!found) {
-            /* flag not found */
+            /* 未找到匹配的标志 */
             goto done;
         }
     }
@@ -272,6 +283,7 @@ done:
     return ret;
 }
 
+/* 从 Lua 表中读取命名参数形式的注册函数参数 */
 static int luaRegisterFunctionReadNamedArgs(lua_State *lua, registerFunctionArgs *register_f_args) {
     char *err = NULL;
     sds name = NULL;
@@ -283,10 +295,10 @@ static int luaRegisterFunctionReadNamedArgs(lua_State *lua, registerFunctionArgs
         goto error;
     }
 
-    /* Iterating on all the named arguments */
+    /* 遍历所有命名参数 */
     lua_pushnil(lua);
     while (lua_next(lua, -2)) {
-        /* Stack now: table, key, value */
+        /* 当前栈状态：table, key, value */
         if (!lua_isstring(lua, -2)) {
             err = "named argument key given to redis.register_function is not a string";
             goto error;
@@ -311,7 +323,7 @@ static int luaRegisterFunctionReadNamedArgs(lua_State *lua, registerFunctionArgs
 
             lua_f_ctx = zmalloc(sizeof(*lua_f_ctx));
             lua_f_ctx->lua_function_ref = lua_function_ref;
-            continue; /* value was already popped, so no need to pop it out. */
+            continue; /* 值已被弹出，无需再次弹出 */
         } else if (!strcasecmp(key, "flags")) {
             if (!lua_istable(lua, -1)) {
                 err = "flags argument to redis.register_function must be a table representing function flags";
@@ -322,11 +334,11 @@ static int luaRegisterFunctionReadNamedArgs(lua_State *lua, registerFunctionArgs
                 goto error;
             }
         } else {
-            /* unknown argument was given, raise an error */
+            /* 传入了未知参数，抛出错误 */
             err = "unknown argument given to redis.register_function";
             goto error;
         }
-        lua_pop(lua, 1); /* pop the value to continue the iteration */
+        lua_pop(lua, 1); /* 弹出值以继续迭代 */
     }
 
     if (!name) {
@@ -354,6 +366,7 @@ error:
     return C_ERR;
 }
 
+/* 读取位置参数形式的注册函数参数 */
 static int luaRegisterFunctionReadPositionalArgs(lua_State *lua, registerFunctionArgs *register_f_args) {
     char *err = NULL;
     sds name = NULL;
@@ -385,6 +398,7 @@ error:
     return C_ERR;
 }
 
+/* 读取 redis.register_function 的参数（自动判断命名/位置参数） */
 static int luaRegisterFunctionReadArgs(lua_State *lua, registerFunctionArgs *register_f_args) {
     int argc = lua_gettop(lua);
     if (argc < 1 || argc > 2) {
@@ -399,6 +413,7 @@ static int luaRegisterFunctionReadArgs(lua_State *lua, registerFunctionArgs *reg
     }
 }
 
+/* redis.register_function 的 C 实现，将 Lua 函数注册到函数库中 */
 static int luaRegisterFunction(lua_State *lua) {
     registerFunctionArgs register_f_args = {0};
 
@@ -423,16 +438,16 @@ static int luaRegisterFunction(lua_State *lua) {
     return 0;
 }
 
-/* Initialize Lua engine, should be called once on start. */
+/* 初始化 Lua 引擎，应在启动时调用一次 */
 int luaEngineInitEngine(void) {
     luaEngineCtx *lua_engine_ctx = zmalloc(sizeof(*lua_engine_ctx));
     lua_engine_ctx->lua = createLuaState();
 
     luaRegisterRedisAPI(lua_engine_ctx->lua);
 
-    /* Register the library commands table and fields and store it to registry */
-    lua_newtable(lua_engine_ctx->lua); /* load library globals */
-    lua_newtable(lua_engine_ctx->lua); /* load library `redis` table */
+    /* 注册函数库命令表和字段，并保存到注册表 */
+    lua_newtable(lua_engine_ctx->lua); /* 创建函数库全局表 */
+    lua_newtable(lua_engine_ctx->lua); /* 创建函数库 redis 表 */
 
     lua_pushstring(lua_engine_ctx->lua, "register_function");
     lua_pushcfunction(lua_engine_ctx->lua, luaRegisterFunction);
@@ -445,10 +460,10 @@ int luaEngineInitEngine(void) {
     lua_setfield(lua_engine_ctx->lua, -2, REDIS_API_NAME);
 
     luaSetErrorMetatable(lua_engine_ctx->lua);
-    luaSetTableProtectionRecursively(lua_engine_ctx->lua); /* protect load library globals */
+    luaSetTableProtectionRecursively(lua_engine_ctx->lua); /* 保护函数库全局表 */
     lua_setfield(lua_engine_ctx->lua, LUA_REGISTRYINDEX, LIBRARY_API_NAME);
 
-    /* Save error handler to registry */
+    /* 将错误处理器保存到注册表 */
     lua_pushstring(lua_engine_ctx->lua, REGISTRY_ERROR_HANDLER_NAME);
     char *errh_func =       "local dbg = debug\n"
                             "debug = nil\n"
@@ -473,26 +488,25 @@ int luaEngineInitEngine(void) {
 
     lua_pushvalue(lua_engine_ctx->lua, LUA_GLOBALSINDEX);
     luaSetErrorMetatable(lua_engine_ctx->lua);
-    luaSetTableProtectionRecursively(lua_engine_ctx->lua); /* protect globals */
+    luaSetTableProtectionRecursively(lua_engine_ctx->lua); /* 保护全局表 */
     lua_pop(lua_engine_ctx->lua, 1);
 
-    /* Save default globals to registry */
+    /* 将默认全局变量保存到注册表 */
     lua_pushvalue(lua_engine_ctx->lua, LUA_GLOBALSINDEX);
     lua_setfield(lua_engine_ctx->lua, LUA_REGISTRYINDEX, GLOBALS_API_NAME);
 
-    /* save the engine_ctx on the registry so we can get it from the Lua interpreter */
+    /* 将 engine_ctx 保存到注册表，以便从 Lua 解释器中获取 */
     luaSaveOnRegistry(lua_engine_ctx->lua, REGISTRY_ENGINE_CTX_NAME, lua_engine_ctx);
 
-    /* Create new empty table to be the new globals, we will be able to control the real globals
-     * using metatable */
-    lua_newtable(lua_engine_ctx->lua); /* new globals */
-    lua_newtable(lua_engine_ctx->lua); /* new globals metatable */
+    /* 创建新的空表作为新的全局变量表，通过元表控制真正的全局变量 */
+    lua_newtable(lua_engine_ctx->lua); /* 新的全局表 */
+    lua_newtable(lua_engine_ctx->lua); /* 新全局表的元表 */
     lua_pushvalue(lua_engine_ctx->lua, LUA_GLOBALSINDEX);
     lua_setfield(lua_engine_ctx->lua, -2, "__index");
-    lua_enablereadonlytable(lua_engine_ctx->lua, -1, 1); /* protect the metatable */
+    lua_enablereadonlytable(lua_engine_ctx->lua, -1, 1); /* 保护元表 */
     lua_setmetatable(lua_engine_ctx->lua, -2);
-    lua_enablereadonlytable(lua_engine_ctx->lua, -1, 1); /* protect the new global table */
-    lua_replace(lua_engine_ctx->lua, LUA_GLOBALSINDEX); /* set new global table as the new globals */
+    lua_enablereadonlytable(lua_engine_ctx->lua, -1, 1); /* 保护新全局表 */
+    lua_replace(lua_engine_ctx->lua, LUA_GLOBALSINDEX); /* 将新全局表设置为全局变量 */
 
 
     engine *lua_engine = zmalloc(sizeof(*lua_engine));
