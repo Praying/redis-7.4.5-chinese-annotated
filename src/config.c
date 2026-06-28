@@ -1,4 +1,4 @@
-/* Configuration file parsing and CONFIG GET/SET commands implementation.
+/* 配置文件解析与 CONFIG GET/SET 命令实现。
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -6,7 +6,8 @@
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  *
- * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+ * Portions of this file are available under BSD3 terms;
+ * see REDISCONTRIBUTIONS for more information.
  */
 
 #include "server.h"
@@ -22,15 +23,19 @@
 #include <ctype.h>
 
 /*-----------------------------------------------------------------------------
- * Config file name-value maps.
+ * 配置文件名称-值映射。
  *----------------------------------------------------------------------------*/
 
+/* 已废弃配置项结构体。
+ * 用于在解析配置文件时识别并跳过已废弃的配置参数。 */
 typedef struct deprecatedConfig {
-    const char *name;
-    const int argc_min;
-    const int argc_max;
+    const char *name;       /* 配置项名称 */
+    const int argc_min;     /* 最小参数数量 */
+    const int argc_max;     /* 最大参数数量 */
 } deprecatedConfig;
 
+/* 内存淘汰策略枚举。
+ * 定义了当内存达到 maxmemory 上限时的键淘汰算法。 */
 configEnum maxmemory_policy_enum[] = {
     {"volatile-lru", MAXMEMORY_VOLATILE_LRU},
     {"volatile-lfu", MAXMEMORY_VOLATILE_LFU},
@@ -43,6 +48,7 @@ configEnum maxmemory_policy_enum[] = {
     {NULL, 0}
 };
 
+/* syslog 设施（facility）枚举。 */
 configEnum syslog_facility_enum[] = {
     {"user",    LOG_USER},
     {"local0",  LOG_LOCAL0},
@@ -56,6 +62,7 @@ configEnum syslog_facility_enum[] = {
     {NULL, 0}
 };
 
+/* 日志级别枚举。 */
 configEnum loglevel_enum[] = {
     {"debug", LL_DEBUG},
     {"verbose", LL_VERBOSE},
@@ -65,6 +72,7 @@ configEnum loglevel_enum[] = {
     {NULL,0}
 };
 
+/* 进程管理器（supervised）模式枚举。 */
 configEnum supervised_mode_enum[] = {
     {"upstart", SUPERVISED_UPSTART},
     {"systemd", SUPERVISED_SYSTEMD},
@@ -73,6 +81,7 @@ configEnum supervised_mode_enum[] = {
     {NULL, 0}
 };
 
+/* AOF fsync 策略枚举。 */
 configEnum aof_fsync_enum[] = {
     {"everysec", AOF_FSYNC_EVERYSEC},
     {"always", AOF_FSYNC_ALWAYS},
@@ -80,6 +89,7 @@ configEnum aof_fsync_enum[] = {
     {NULL, 0}
 };
 
+/* 收到信号时的关闭行为枚举。 */
 configEnum shutdown_on_sig_enum[] = {
     {"default", 0},
     {"save", SHUTDOWN_SAVE},
@@ -89,6 +99,7 @@ configEnum shutdown_on_sig_enum[] = {
     {NULL, 0}
 };
 
+/* 无盘复制加载策略枚举。 */
 configEnum repl_diskless_load_enum[] = {
     {"disabled", REPL_DISKLESS_LOAD_DISABLED},
     {"on-empty-db", REPL_DISKLESS_LOAD_WHEN_DB_EMPTY},
@@ -96,6 +107,7 @@ configEnum repl_diskless_load_enum[] = {
     {NULL, 0}
 };
 
+/* TLS 客户端认证模式枚举。 */
 configEnum tls_auth_clients_enum[] = {
     {"no", TLS_CLIENT_AUTH_NO},
     {"yes", TLS_CLIENT_AUTH_YES},
@@ -103,6 +115,7 @@ configEnum tls_auth_clients_enum[] = {
     {NULL, 0}
 };
 
+/* OOM 评分调整模式枚举。 */
 configEnum oom_score_adj_enum[] = {
     {"no", OOM_SCORE_ADJ_NO},
     {"yes", OOM_SCORE_RELATIVE},
@@ -111,12 +124,14 @@ configEnum oom_score_adj_enum[] = {
     {NULL, 0}
 };
 
+/* ACL Pub/Sub 默认权限枚举。 */
 configEnum acl_pubsub_default_enum[] = {
     {"allchannels", SELECTOR_FLAG_ALLCHANNELS},
     {"resetchannels", 0},
     {NULL, 0}
 };
 
+/* DUMP 载荷净化模式枚举。 */
 configEnum sanitize_dump_payload_enum[] = {
     {"no", SANITIZE_DUMP_NO},
     {"yes", SANITIZE_DUMP_YES},
@@ -124,6 +139,7 @@ configEnum sanitize_dump_payload_enum[] = {
     {NULL, 0}
 };
 
+/* 受保护操作的访问控制枚举。 */
 configEnum protected_action_enum[] = {
     {"no", PROTECTED_ACTION_ALLOWED_NO},
     {"yes", PROTECTED_ACTION_ALLOWED_YES},
@@ -131,6 +147,7 @@ configEnum protected_action_enum[] = {
     {NULL, 0}
 };
 
+/* 集群首选端点类型枚举。 */
 configEnum cluster_preferred_endpoint_type_enum[] = {
     {"ip", CLUSTER_ENDPOINT_TYPE_IP},
     {"hostname", CLUSTER_ENDPOINT_TYPE_HOSTNAME},
@@ -138,6 +155,7 @@ configEnum cluster_preferred_endpoint_type_enum[] = {
     {NULL, 0}
 };
 
+/* 命令传播错误行为枚举。 */
 configEnum propagation_error_behavior_enum[] = {
     {"ignore", PROPAGATION_ERR_BEHAVIOR_IGNORE},
     {"panic", PROPAGATION_ERR_BEHAVIOR_PANIC},
@@ -145,66 +163,78 @@ configEnum propagation_error_behavior_enum[] = {
     {NULL, 0}
 };
 
-/* Output buffer limits presets. */
+/* 输出缓冲区限制预设值。
+ * 格式为：{硬限制, 软限制, 软限制超时秒数} */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
-    {0, 0, 0}, /* normal */
-    {1024*1024*256, 1024*1024*64, 60}, /* slave */
-    {1024*1024*32, 1024*1024*8, 60}  /* pubsub */
+    {0, 0, 0}, /* normal（普通客户端） */
+    {1024*1024*256, 1024*1024*64, 60}, /* slave（从节点客户端） */
+    {1024*1024*32, 1024*1024*8, 60}  /* pubsub（发布订阅客户端） */
 };
 
-/* OOM Score defaults */
+/* OOM Score 调整值默认值。
+ * 分别对应：主进程、副本进程、后台子进程。 */
 int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT] = { 0, 200, 800 };
 
-/* Generic config infrastructure function pointers
+/* 通用配置基础设施函数指针。
  * int is_valid_fn(val, err)
- *     Return 1 when val is valid, and 0 when invalid.
- *     Optionally set err to a static error string.
+ *     当值有效时返回 1，无效时返回 0。
+ *     可选地将 err 设置为静态错误字符串。
  */
 
-/* Configuration values that require no special handling to set, get, load or
- * rewrite. */
+/* 在设置、获取、加载或重写时无需特殊处理的配置值。 */
+
+/* 布尔类型配置数据结构。
+ * 用于 yes/no 类型的配置项。 */
 typedef struct boolConfigData {
-    int *config; /* The pointer to the server config this value is stored in */
-    int default_value; /* The default value of the config on rewrite */
-    int (*is_valid_fn)(int val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int *config; /* 该值存储在 server 配置中的指针 */
+    int default_value; /* 重写时的默认值 */
+    int (*is_valid_fn)(int val, const char **err); /* 可选函数，检查新值的有效性 */
 } boolConfigData;
 
+/* 字符串类型配置数据结构。
+ * 用于 char* 类型的配置项。 */
 typedef struct stringConfigData {
-    char **config; /* Pointer to the server config this value is stored in. */
-    const char *default_value; /* Default value of the config on rewrite. */
-    int (*is_valid_fn)(char* val, const char **err); /* Optional function to check validity of new value (generic doc above) */
-    int convert_empty_to_null; /* Boolean indicating if empty strings should
-                                  be stored as a NULL value. */
+    char **config; /* 该值存储在 server 配置中的指针 */
+    const char *default_value; /* 重写时的默认值 */
+    int (*is_valid_fn)(char* val, const char **err); /* 可选函数，检查新值的有效性 */
+    int convert_empty_to_null; /* 布尔值，指示空字符串是否应存储为 NULL */
 } stringConfigData;
 
+/* SDS 字符串类型配置数据结构。
+ * 用于 SDS 类型的配置项。 */
 typedef struct sdsConfigData {
-    sds *config; /* Pointer to the server config this value is stored in. */
-    char *default_value; /* Default value of the config on rewrite. */
-    int (*is_valid_fn)(sds val, const char **err); /* Optional function to check validity of new value (generic doc above) */
-    int convert_empty_to_null; /* Boolean indicating if empty SDS strings should
-                                  be stored as a NULL value. */
+    sds *config; /* 该值存储在 server 配置中的指针 */
+    char *default_value; /* 重写时的默认值 */
+    int (*is_valid_fn)(sds val, const char **err); /* 可选函数，检查新值的有效性 */
+    int convert_empty_to_null; /* 布尔值，指示空 SDS 字符串是否应存储为 NULL */
 } sdsConfigData;
 
+/* 枚举类型配置数据结构。
+ * 用于可选枚举值的配置项。 */
 typedef struct enumConfigData {
-    int *config; /* The pointer to the server config this value is stored in */
-    configEnum *enum_value; /* The underlying enum type this data represents */
-    int default_value; /* The default value of the config on rewrite */
-    int (*is_valid_fn)(int val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    int *config; /* 该值存储在 server 配置中的指针 */
+    configEnum *enum_value; /* 该数据对应的底层枚举类型 */
+    int default_value; /* 重写时的默认值 */
+    int (*is_valid_fn)(int val, const char **err); /* 可选函数，检查新值的有效性 */
 } enumConfigData;
 
+/* 数值类型枚举。
+ * 用于标识 numericConfigData 中存储的具体 C 数值类型。 */
 typedef enum numericType {
-    NUMERIC_TYPE_INT,
-    NUMERIC_TYPE_UINT,
-    NUMERIC_TYPE_LONG,
-    NUMERIC_TYPE_ULONG,
-    NUMERIC_TYPE_LONG_LONG,
-    NUMERIC_TYPE_ULONG_LONG,
-    NUMERIC_TYPE_SIZE_T,
-    NUMERIC_TYPE_SSIZE_T,
-    NUMERIC_TYPE_OFF_T,
-    NUMERIC_TYPE_TIME_T,
+    NUMERIC_TYPE_INT,           /* int */
+    NUMERIC_TYPE_UINT,          /* unsigned int */
+    NUMERIC_TYPE_LONG,          /* long */
+    NUMERIC_TYPE_ULONG,         /* unsigned long */
+    NUMERIC_TYPE_LONG_LONG,     /* long long */
+    NUMERIC_TYPE_ULONG_LONG,    /* unsigned long long */
+    NUMERIC_TYPE_SIZE_T,        /* size_t */
+    NUMERIC_TYPE_SSIZE_T,       /* ssize_t */
+    NUMERIC_TYPE_OFF_T,         /* off_t */
+    NUMERIC_TYPE_TIME_T,        /* time_t */
 } numericType;
 
+/* 数值类型配置数据结构。
+ * 通过联合体存储各种 C 数值类型。 */
 typedef struct numericConfigData {
     union {
         int *i;
@@ -217,67 +247,77 @@ typedef struct numericConfigData {
         ssize_t *sst;
         off_t *ot;
         time_t *tt;
-    } config; /* The pointer to the numeric config this value is stored in */
-    unsigned int flags;
-    numericType numeric_type; /* An enum indicating the type of this value */
-    long long lower_bound; /* The lower bound of this numeric value */
-    long long upper_bound; /* The upper bound of this numeric value */
-    long long default_value; /* The default value of the config on rewrite */
-    int (*is_valid_fn)(long long val, const char **err); /* Optional function to check validity of new value (generic doc above) */
+    } config; /* 该数值配置值存储位置的指针（联合体） */
+    unsigned int flags;     /* 配置标志（如 MEMORY_CONFIG、PERCENT_CONFIG 等） */
+    numericType numeric_type; /* 标识此值类型的枚举 */
+    long long lower_bound;  /* 此数值的下界 */
+    long long upper_bound;  /* 此数值的上界 */
+    long long default_value; /* 重写时的默认值 */
+    int (*is_valid_fn)(long long val, const char **err); /* 可选函数，检查新值的有效性 */
 } numericConfigData;
 
+/* 类型特定数据联合体。
+ * 根据配置类型，选择对应的数据结构。 */
 typedef union typeData {
-    boolConfigData yesno;
-    stringConfigData string;
-    sdsConfigData sds;
-    enumConfigData enumd;
-    numericConfigData numeric;
+    boolConfigData yesno;       /* 布尔类型数据 */
+    stringConfigData string;    /* 字符串类型数据 */
+    sdsConfigData sds;          /* SDS 字符串类型数据 */
+    enumConfigData enumd;       /* 枚举类型数据 */
+    numericConfigData numeric;  /* 数值类型数据 */
 } typeData;
 
 typedef struct standardConfig standardConfig;
 
+/* 应用配置变更的函数指针类型。 */
 typedef int (*apply_fn)(const char **err);
+
+/* 类型接口：定义了各配置类型的操作方法。
+ * 每种配置类型（布尔、字符串、枚举、数值等）都通过此接口
+ * 实现统一的初始化、设置、获取和重写操作。 */
 typedef struct typeInterface {
-    /* Called on server start, to init the server with default value */
+    /* 服务器启动时调用，使用默认值初始化配置 */
     void (*init)(standardConfig *config);
-    /* Called on server startup and CONFIG SET, returns 1 on success,
-     * 2 meaning no actual change done, 0 on error and can set a verbose err
-     * string */
+    /* 服务器启动和 CONFIG SET 时调用。
+     * 返回值：1 表示成功，2 表示未发生实际变更，0 表示失败。 */
     int (*set)(standardConfig *config, sds *argv, int argc, const char **err);
-    /* Optional: called after `set()` to apply the config change. Used only in
-     * the context of CONFIG SET. Returns 1 on success, 0 on failure.
-     * Optionally set err to a static error string. */
+    /* 可选：在 set() 之后调用以应用配置变更。
+     * 仅在 CONFIG SET 上下文中使用。
+     * 返回值：1 表示成功，0 表示失败。 */
     apply_fn apply;
-    /* Called on CONFIG GET, returns sds to be used in reply */
+    /* CONFIG GET 时调用，返回 sds 用于回复 */
     sds (*get)(standardConfig *config);
-    /* Called on CONFIG REWRITE, required to rewrite the config state */
-    void (*rewrite)(standardConfig *config, const char *name, struct rewriteConfigState *state);
+    /* CONFIG REWRITE 时调用，用于重写配置状态 */
+    void (*rewrite)(standardConfig *config, const char *name,
+                    struct rewriteConfigState *state);
 } typeInterface;
 
+/* 标准配置项结构体。
+ * 描述一个配置项的完整信息，包括名称、类型、接口、数据等。
+ * 所有内置配置项和模块配置项都使用此结构体表示。 */
 struct standardConfig {
-    const char *name; /* The user visible name of this config */
-    const char *alias; /* An alias that can also be used for this config */
-    unsigned int flags; /* Flags for this specific config */
-    typeInterface interface; /* The function pointers that define the type interface */
-    typeData data; /* The type specific data exposed used by the interface */
-    configType type; /* The type of config this is. */
-    void *privdata; /* privdata for this config, for module configs this is a ModuleConfig struct */
+    const char *name;       /* 用户可见的配置项名称 */
+    const char *alias;      /* 可选的别名 */
+    unsigned int flags;     /* 此配置项的标志位 */
+    typeInterface interface; /* 定义类型接口的函数指针集合 */
+    typeData data;          /* 接口使用的类型特定数据 */
+    configType type;        /* 此配置项的类型 */
+    void *privdata;         /* 私有数据，对于模块配置是 ModuleConfig 结构体 */
 };
 
-dict *configs = NULL; /* Runtime config values */
+dict *configs = NULL; /* 运行时配置值字典，存储所有配置项 */
 
-/* Lookup a config by the provided sds string name, or return NULL
- * if the config does not exist */
+/* 通过 sds 名称查找配置项，若不存在则返回 NULL。 */
 static standardConfig *lookupConfig(sds name) {
     dictEntry *de = dictFind(configs, name);
     return de ? dictGetVal(de) : NULL;
 }
 
 /*-----------------------------------------------------------------------------
- * Enum access functions
+ * 枚举访问函数
  *----------------------------------------------------------------------------*/
 
-/* Get enum value from name. If there is no match INT_MIN is returned. */
+/* 根据名称获取枚举值。若无匹配项则返回 INT_MIN。
+ * 当 bitflags 为真时，支持多个枚举值的按位或组合。 */
 int configEnumGetValue(configEnum *ce, sds *argv, int argc, int bitflags) {
     if (argc == 0 || (!bitflags && argc != 1)) return INT_MIN;
     int values = 0;
@@ -294,7 +334,8 @@ int configEnumGetValue(configEnum *ce, sds *argv, int argc, int bitflags) {
     return values;
 }
 
-/* Get enum name/s from value. If no matches are found "unknown" is returned. */
+/* 根据值获取枚举名称。若无匹配则返回 "unknown"。
+ * 当 bitflags 为真时，支持从组合值中提取多个名称。 */
 static sds configEnumGetName(configEnum *ce, int values, int bitflags) {
     sds names = NULL;
     int unmatched = values;
@@ -318,7 +359,7 @@ static sds configEnumGetName(configEnum *ce, int values, int bitflags) {
     return names;
 }
 
-/* Used for INFO generation. */
+/* 将当前淘汰策略转换为字符串，用于 INFO 命令输出。 */
 const char *evictPolicyToString(void) {
     for (configEnum *ce = maxmemory_policy_enum; ce->name != NULL; ce++) {
         if (server.maxmemory_policy == ce->val)
@@ -328,15 +369,18 @@ const char *evictPolicyToString(void) {
 }
 
 /*-----------------------------------------------------------------------------
- * Config file parsing
+ * 配置文件解析
  *----------------------------------------------------------------------------*/
 
+/* 将 "yes"/"no" 字符串转换为整数。
+ * 返回值：1 (yes), 0 (no), -1 (无效输入)。 */
 int yesnotoi(char *s) {
     if (!strcasecmp(s,"yes")) return 1;
     else if (!strcasecmp(s,"no")) return 0;
     else return -1;
 }
 
+/* 添加一组 RDB 快照保存参数（秒数 + 变更数）。 */
 void appendServerSaveParams(time_t seconds, int changes) {
     server.saveparams = zrealloc(server.saveparams,sizeof(struct saveparam)*(server.saveparamslen+1));
     server.saveparams[server.saveparamslen].seconds = seconds;
@@ -344,12 +388,14 @@ void appendServerSaveParams(time_t seconds, int changes) {
     server.saveparamslen++;
 }
 
+/* 重置所有 RDB 快照保存参数。 */
 void resetServerSaveParams(void) {
     zfree(server.saveparams);
     server.saveparams = NULL;
     server.saveparamslen = 0;
 }
 
+/* 将模块加载请求加入队列，稍后在服务器启动时加载。 */
 void queueLoadModule(sds path, sds *argv, int argc) {
     int i;
     struct moduleLoadQueueEntry *loadmod;
@@ -364,9 +410,9 @@ void queueLoadModule(sds path, sds *argv, int argc) {
     listAddNodeTail(server.loadmodule_queue,loadmod);
 }
 
-/* Parse an array of `arg_len` sds strings, validate and populate
- * server.client_obuf_limits if valid.
- * Used in CONFIG SET and configuration file parsing. */
+/* 解析长度为 arg_len 的 sds 字符串数组，验证并填充
+ * server.client_obuf_limits（如果有效）。
+ * 用于 CONFIG SET 和配置文件解析。 */
 static int updateClientOutputBufferLimit(sds *args, int arg_len, const char **err) {
     int j;
     int class;
@@ -420,11 +466,14 @@ static int updateClientOutputBufferLimit(sds *args, int arg_len, const char **er
     return 1;
 }
 
-/* Note this is here to support detecting we're running a config set from
- * within conf file parsing. This is only needed to support the deprecated
- * abnormal aggregate `save T C` functionality. Remove in the future. */
+/* 标记是否正在从配置文件中读取配置。
+ * 用于支持已废弃的 `save T C` 聚合功能。 */
 static int reading_config_file;
 
+/* 从配置字符串加载服务器配置。
+ * 解析传入的配置文本，逐行处理每个配置项。
+ * 支持 include 指令、rename-command、user 定义、
+ * loadmodule 以及标准配置参数。 */
 void loadServerConfigFromString(char *config) {
     deprecatedConfig deprecated_configs[] = {
         {"list-max-ziplist-entries", 2, 2},
@@ -625,13 +674,14 @@ loaderr:
     exit(1);
 }
 
-/* Load the server configuration from the specified filename.
- * The function appends the additional configuration directives stored
- * in the 'options' string to the config file before loading.
+/* 从指定文件名加载服务器配置。
+ * 该函数在加载前将 'options' 字符串中存储的附加配置指令
+ * 追加到配置文件内容之后。
  *
- * Both filename and options can be NULL, in such a case are considered
- * empty. This way loadServerConfig can be used to just load a file or
- * just load a string. */
+ * filename 和 options 都可以为 NULL，此时视为空。
+ * 因此 loadServerConfig 可用于仅加载文件或仅加载字符串。
+ * 也支持通过 config_from_stdin 参数从标准输入读取配置。
+ * 支持通配符文件名（glob 模式）来包含多个配置文件。 */
 #define CONFIG_READ_LEN 1024
 void loadServerConfig(char *filename, char config_from_stdin, char *options) {
     sds config = sdsempty();
@@ -706,6 +756,8 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
     sdsfree(config);
 }
 
+/* 对配置项执行 set 接口调用。
+ * 对于 MULTI_ARG_CONFIG，先按空格拆分值再传递给 set 接口。 */
 static int performInterfaceSet(standardConfig *config, sds value, const char **errstr) {
     sds *argv;
     int argc, res;
@@ -723,7 +775,8 @@ static int performInterfaceSet(standardConfig *config, sds value, const char **e
     return res;
 }
 
-/* Find the config by name and attempt to set it to value. */
+/* 根据名称查找配置并尝试将其设置为指定值。
+ * 用于模块配置的设置。 */
 int performModuleConfigSetFromName(sds name, sds value, const char **err) {
     standardConfig *config = lookupConfig(name);
     if (!config || !(config->flags & MODULE_CONFIG)) {
@@ -733,7 +786,8 @@ int performModuleConfigSetFromName(sds name, sds value, const char **err) {
     return performInterfaceSet(config, value, err);
 }
 
-/* Find config by name and attempt to set it to its default value. */
+/* 根据名称查找配置并尝试将其设置为默认值。
+ * 用于模块配置的重置。 */
 int performModuleConfigSetDefaultFromName(sds name, const char **err) {
     standardConfig *config = lookupConfig(name);
     serverAssert(config);
@@ -756,10 +810,13 @@ int performModuleConfigSetDefaultFromName(sds name, const char **err) {
     return 0;
 }
 
+/* 恢复备份的配置值。
+ * 当 CONFIG SET 中某个配置应用失败时，将所有已设置的配置
+ * 回滚到之前的值，以保证配置变更的原子性。 */
 static void restoreBackupConfig(standardConfig **set_configs, sds *old_values, int count, apply_fn *apply_fns, list *module_configs) {
     int i;
     const char *errstr = "unknown error";
-    /* Set all backup values */
+    /* 设置所有备份值 */
     for (i = 0; i < count; i++) {
         if (!performInterfaceSet(set_configs[i], old_values[i], &errstr))
             serverLog(LL_WARNING, "Failed restoring failed CONFIG SET command. Error setting %s to '%s': %s",
@@ -779,9 +836,19 @@ static void restoreBackupConfig(standardConfig **set_configs, sds *old_values, i
 }
 
 /*-----------------------------------------------------------------------------
- * CONFIG SET implementation
+ * CONFIG SET 实现
  *----------------------------------------------------------------------------*/
 
+/* CONFIG SET 命令处理函数。
+ * 支持一次设置多个配置项，具有原子性——如果任何一个配置项
+ * 设置或应用失败，所有已设置的值都会回滚。
+ * 处理流程：
+ * 1. 解析参数，查找所有相关配置
+ * 2. 检查权限（不可变配置、受保护配置、加载中配置等）
+ * 3. 备份旧值
+ * 4. 设置新值（不立即应用）
+ * 5. 依次应用所有配置变更
+ * 6. 若应用失败则回滚所有备份值 */
 void configSetCommand(client *c) {
     const char *errstr = NULL;
     const char *invalid_arg_name = NULL;
@@ -945,14 +1012,17 @@ end:
 }
 
 /*-----------------------------------------------------------------------------
- * CONFIG GET implementation
+ * CONFIG GET 实现
  *----------------------------------------------------------------------------*/
 
+/* CONFIG GET 命令处理函数。
+ * 根据一个或多个模式（支持 glob 匹配）返回匹配的配置项及其值。
+ * 隐藏配置项需要精确匹配（不支持模式匹配）。 */
 void configGetCommand(client *c) {
     int i;
     dictEntry *de;
     dictIterator *di;
-    /* Create a dictionary to store the matched configs */
+    /* 创建字典存储匹配到的配置项 */
     dict *matches = dictCreate(&externalStringType);
     for (i = 0; i < c->argc - 2; i++) {
         robj *o = c->argv[2+i];
@@ -997,18 +1067,19 @@ void configGetCommand(client *c) {
 }
 
 /*-----------------------------------------------------------------------------
- * CONFIG REWRITE implementation
+ * CONFIG REWRITE 实现
  *----------------------------------------------------------------------------*/
 
+/* CONFIG REWRITE 生成的签名标记。
+ * 用于标识配置文件中由 CONFIG REWRITE 自动生成的部分。 */
 #define REDIS_CONFIG_REWRITE_SIGNATURE "# Generated by CONFIG REWRITE"
 
-/* We use the following dictionary type to store where a configuration
- * option is mentioned in the old configuration file, so it's
- * like "maxmemory" -> list of line numbers (first line is zero). */
+/* 以下字典类型用于存储配置选项在旧配置文件中出现的位置。
+ * 例如："maxmemory" -> 行号列表（第一行为零）。 */
 void dictListDestructor(dict *d, void *val);
 
-/* Sentinel config rewriting is implemented inside sentinel.c by
- * rewriteConfigSentinelOption(). */
+/* Sentinel 配置重写在 sentinel.c 中通过
+ * rewriteConfigSentinelOption() 实现。 */
 void rewriteConfigSentinelOption(struct rewriteConfigState *state);
 
 dictType optionToLineDictType = {
@@ -1031,20 +1102,20 @@ dictType optionSetDictType = {
     NULL                        /* allow to expand */
 };
 
-/* The config rewrite state. */
+/* 配置重写状态结构体。
+ * 在 CONFIG REWRITE 过程中维护配置文件的中间状态，
+ * 包括行映射、已处理选项等信息。 */
 struct rewriteConfigState {
-    dict *option_to_line; /* Option -> list of config file lines map */
-    dict *rewritten;      /* Dictionary of already processed options */
-    int numlines;         /* Number of lines in current config */
-    sds *lines;           /* Current lines as an array of sds strings */
-    int needs_signature;  /* True if we need to append the rewrite
-                             signature. */
-    int force_write;      /* True if we want all keywords to be force
-                             written. Currently only used for testing
-                             and debug information. */
+    dict *option_to_line; /* 选项 -> 配置文件行号列表的映射 */
+    dict *rewritten;      /* 已处理选项的字典 */
+    int numlines;         /* 当前配置文件的行数 */
+    sds *lines;           /* 当前行内容的 sds 字符串数组 */
+    int needs_signature;  /* 是否需要追加重写签名 */
+    int force_write;      /* 是否强制写入所有关键字。
+                             目前仅用于测试和调试。 */
 };
 
-/* Free the configuration rewrite state. */
+/* 释放配置重写状态。 */
 void rewriteConfigReleaseState(struct rewriteConfigState *state) {
     sdsfreesplitres(state->lines,state->numlines);
     dictRelease(state->option_to_line);
@@ -1052,7 +1123,7 @@ void rewriteConfigReleaseState(struct rewriteConfigState *state) {
     zfree(state);
 }
 
-/* Create the configuration rewrite state */
+/* 创建配置重写状态。 */
 struct rewriteConfigState *rewriteConfigCreateState(void) {
     struct rewriteConfigState *state = zmalloc(sizeof(*state));
     state->option_to_line = dictCreate(&optionToLineDictType);
@@ -1064,13 +1135,13 @@ struct rewriteConfigState *rewriteConfigCreateState(void) {
     return state;
 }
 
-/* Append the new line to the current configuration state. */
+/* 将新行追加到当前配置状态中。 */
 void rewriteConfigAppendLine(struct rewriteConfigState *state, sds line) {
     state->lines = zrealloc(state->lines, sizeof(char*) * (state->numlines+1));
     state->lines[state->numlines++] = line;
 }
 
-/* Populate the option -> list of line numbers map. */
+/* 填充选项 -> 行号列表映射。 */
 void rewriteConfigAddLineNumberToOption(struct rewriteConfigState *state, sds option, int linenum) {
     list *l = dictFetchValue(state->option_to_line,option);
 
@@ -1081,21 +1152,20 @@ void rewriteConfigAddLineNumberToOption(struct rewriteConfigState *state, sds op
     listAddNodeTail(l,(void*)(long)linenum);
 }
 
-/* Add the specified option to the set of processed options.
- * This is useful as only unused lines of processed options will be blanked
- * in the config file, while options the rewrite process does not understand
- * remain untouched. */
+/* 将指定选项添加到已处理选项集合中。
+ * 只有已处理选项的未使用行才会被清空，
+ * 重写过程不理解的选项将保持不变。 */
 void rewriteConfigMarkAsProcessed(struct rewriteConfigState *state, const char *option) {
     sds opt = sdsnew(option);
 
     if (dictAdd(state->rewritten,opt,NULL) != DICT_OK) sdsfree(opt);
 }
 
-/* Read the old file, split it into lines to populate a newly created
- * config rewrite state, and return it to the caller.
+/* 读取旧配置文件，将其拆分为行来填充新创建的配置重写状态，
+ * 并将其返回给调用者。
  *
- * If it is impossible to read the old file, NULL is returned.
- * If the old file does not exist at all, an empty state is returned. */
+ * 如果无法读取旧文件则返回 NULL。
+ * 如果旧文件根本不存在则返回空状态。 */
 struct rewriteConfigState *rewriteConfigReadOldFile(char *path) {
     FILE *fp = fopen(path,"r");
     if (fp == NULL && errno != ENOENT) return NULL;
@@ -1203,22 +1273,18 @@ struct rewriteConfigState *rewriteConfigReadOldFile(char *path) {
     return state;
 }
 
-/* Rewrite the specified configuration option with the new "line".
- * It progressively uses lines of the file that were already used for the same
- * configuration option in the old version of the file, removing that line from
- * the map of options -> line numbers.
+/* 用新的 "line" 重写指定的配置选项。
+ * 逐步使用旧版本文件中已用于同一配置选项的行，
+ * 并从选项 -> 行号映射中移除该行。
  *
- * If there are lines associated with a given configuration option and
- * "force" is non-zero, the line is appended to the configuration file.
- * Usually "force" is true when an option has not its default value, so it
- * must be rewritten even if not present previously.
+ * 如果没有已关联的行且 "force" 非零，则将该行追加到配置文件。
+ * 通常当选项不在默认值时 "force" 为 true，
+ * 因此即使之前不存在也必须重写。
  *
- * The first time a line is appended into a configuration file, a comment
- * is added to show that starting from that point the config file was generated
- * by CONFIG REWRITE.
+ * 首次向配置文件追加行时，会添加注释标明从该点起
+ * 配置文件由 CONFIG REWRITE 生成。
  *
- * "line" is either used, or freed, so the caller does not need to free it
- * in any way. */
+ * "line" 要么被使用，要么被释放，调用者无需自行释放。 */
 int rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *option, sds line, int force) {
     sds o = sdsnew(option);
     list *l = dictFetchValue(state->option_to_line,o);
@@ -1255,8 +1321,8 @@ int rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *optio
     return 1;
 }
 
-/* Write the long long 'bytes' value as a string in a way that is parsable
- * inside redis.conf. If possible uses the GB, MB, KB notation. */
+/* 将 long long 类型的 'bytes' 值格式化为可在 redis.conf 中
+ * 解析的字符串。尽可能使用 GB、MB、KB 表示法。 */
 int rewriteConfigFormatMemory(char *buf, size_t len, long long bytes) {
     int gb = 1024*1024*1024;
     int mb = 1024*1024;
@@ -1273,7 +1339,7 @@ int rewriteConfigFormatMemory(char *buf, size_t len, long long bytes) {
     }
 }
 
-/* Rewrite a simple "option-name <bytes>" configuration option. */
+/* 重写一个简单的 "option-name <bytes>" 格式的配置选项。 */
 void rewriteConfigBytesOption(struct rewriteConfigState *state, const char *option, long long value, long long defvalue) {
     char buf[64];
     int force = value != defvalue;
@@ -1284,7 +1350,7 @@ void rewriteConfigBytesOption(struct rewriteConfigState *state, const char *opti
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite a simple "option-name n%" configuration option. */
+/* 重写 "option-name n%" 格式的百分比配置选项。 */
 void rewriteConfigPercentOption(struct rewriteConfigState *state, const char *option, long long value, long long defvalue) {
     int force = value != defvalue;
     sds line = sdscatprintf(sdsempty(),"%s %lld%%",option,value);
@@ -1292,7 +1358,7 @@ void rewriteConfigPercentOption(struct rewriteConfigState *state, const char *op
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite a yes/no option. */
+/* 重写 yes/no 选项。 */
 void rewriteConfigYesNoOption(struct rewriteConfigState *state, const char *option, int value, int defvalue) {
     int force = value != defvalue;
     sds line = sdscatprintf(sdsempty(),"%s %s",option,
@@ -1301,7 +1367,8 @@ void rewriteConfigYesNoOption(struct rewriteConfigState *state, const char *opti
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite a string option. */
+/* 重写字符串选项。
+ * 值为 NULL 的选项在配置文件中不会出现。 */
 void rewriteConfigStringOption(struct rewriteConfigState *state, const char *option, char *value, const char *defvalue) {
     int force = 1;
     sds line;
@@ -1323,7 +1390,7 @@ void rewriteConfigStringOption(struct rewriteConfigState *state, const char *opt
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite a SDS string option. */
+/* 重写 SDS 字符串选项。 */
 void rewriteConfigSdsOption(struct rewriteConfigState *state, const char *option, sds value, const char *defvalue) {
     int force = 1;
     sds line;
@@ -1345,7 +1412,7 @@ void rewriteConfigSdsOption(struct rewriteConfigState *state, const char *option
     rewriteConfigRewriteLine(state, option, line, force);
 }
 
-/* Rewrite a numerical (long long range) option. */
+/* 重写数值（long long 范围）选项。 */
 void rewriteConfigNumericalOption(struct rewriteConfigState *state, const char *option, long long value, long long defvalue) {
     int force = value != defvalue;
     sds line = sdscatprintf(sdsempty(),"%s %lld",option,value);
@@ -1353,7 +1420,7 @@ void rewriteConfigNumericalOption(struct rewriteConfigState *state, const char *
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite an octal option. */
+/* 重写八进制选项。 */
 void rewriteConfigOctalOption(struct rewriteConfigState *state, const char *option, long long value, long long defvalue) {
     int force = value != defvalue;
     sds line = sdscatprintf(sdsempty(),"%s %llo",option,value);
@@ -1361,9 +1428,7 @@ void rewriteConfigOctalOption(struct rewriteConfigState *state, const char *opti
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite an enumeration option. It takes as usually state and option name,
- * and in addition the enumeration array and the default value for the
- * option. */
+/* 重写枚举选项。除状态和选项名外，还需要枚举数组和默认值。 */
 void rewriteConfigEnumOption(struct rewriteConfigState *state, const char *option, int value, standardConfig *config) {
     int multiarg = config->flags & MULTI_ARG_CONFIG;
     sds names = configEnumGetName(config->data.enumd.enum_value,value,multiarg);
@@ -1374,7 +1439,8 @@ void rewriteConfigEnumOption(struct rewriteConfigState *state, const char *optio
     rewriteConfigRewriteLine(state,option,line,force);
 }
 
-/* Rewrite the save option. */
+/* 重写 save 选项。
+ * Sentinel 模式下不需要重写 save 参数。 */
 void rewriteConfigSaveOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     int j;
@@ -1403,7 +1469,8 @@ void rewriteConfigSaveOption(standardConfig *config, const char *name, struct re
     rewriteConfigMarkAsProcessed(state,name);
 }
 
-/* Rewrite the user option. */
+/* 重写 user 选项。
+ * 如果定义了 ACL 文件，则标记为已处理（不写入配置文件）。 */
 void rewriteConfigUserOption(struct rewriteConfigState *state) {
     /* If there is a user file defined we just mark this configuration
      * directive as processed, so that all the lines containing users
@@ -1435,7 +1502,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
     rewriteConfigMarkAsProcessed(state,"user");
 }
 
-/* Rewrite the dir option, always using absolute paths.*/
+/* 重写 dir 选项，始终使用绝对路径。 */
 void rewriteConfigDirOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     char cwd[1024];
@@ -1447,7 +1514,8 @@ void rewriteConfigDirOption(standardConfig *config, const char *name, struct rew
     rewriteConfigStringOption(state,name,cwd,NULL);
 }
 
-/* Rewrite the slaveof option. */
+/* 重写 replicaof（slaveof）选项。
+ * 主节点或集群模式下移除所有 slaveof 配置项。 */
 void rewriteConfigReplicaOfOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     sds line;
@@ -1464,7 +1532,7 @@ void rewriteConfigReplicaOfOption(standardConfig *config, const char *name, stru
     rewriteConfigRewriteLine(state,name,line,1);
 }
 
-/* Rewrite the notify-keyspace-events option. */
+/* 重写 notify-keyspace-events 选项。 */
 void rewriteConfigNotifyKeyspaceEventsOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     int force = server.notify_keyspace_events != 0;
@@ -1478,7 +1546,7 @@ void rewriteConfigNotifyKeyspaceEventsOption(standardConfig *config, const char 
     rewriteConfigRewriteLine(state,name,line,force);
 }
 
-/* Rewrite the client-output-buffer-limit option. */
+/* 重写 client-output-buffer-limit 选项。 */
 void rewriteConfigClientOutputBufferLimitOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     int j;
@@ -1506,7 +1574,7 @@ void rewriteConfigClientOutputBufferLimitOption(standardConfig *config, const ch
     }
 }
 
-/* Rewrite the oom-score-adj-values option. */
+/* 重写 oom-score-adj-values 选项。 */
 void rewriteConfigOOMScoreAdjValuesOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     int force = 0;
@@ -1526,7 +1594,7 @@ void rewriteConfigOOMScoreAdjValuesOption(standardConfig *config, const char *na
     rewriteConfigRewriteLine(state,name,line,force);
 }
 
-/* Rewrite the bind option. */
+/* 重写 bind 选项。 */
 void rewriteConfigBindOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     int force = 1;
@@ -1563,7 +1631,7 @@ void rewriteConfigBindOption(standardConfig *config, const char *name, struct re
     rewriteConfigRewriteLine(state,name,line,force);
 }
 
-/* Rewrite the loadmodule option. */
+/* 重写 loadmodule 选项。 */
 void rewriteConfigLoadmoduleOption(struct rewriteConfigState *state) {
     sds line;
 
@@ -1584,8 +1652,8 @@ void rewriteConfigLoadmoduleOption(struct rewriteConfigState *state) {
     rewriteConfigMarkAsProcessed(state,"loadmodule");
 }
 
-/* Glue together the configuration lines in the current configuration
- * rewrite state into a single string, stripping multiple empty lines. */
+/* 将当前配置重写状态中的配置行拼接成单个字符串，
+ * 并去除连续的空行（合并为一个空行）。 */
 sds rewriteConfigGetContentFromState(struct rewriteConfigState *state) {
     sds content = sdsempty();
     int j, was_empty = 0;
@@ -1604,14 +1672,12 @@ sds rewriteConfigGetContentFromState(struct rewriteConfigState *state) {
     return content;
 }
 
-/* At the end of the rewrite process the state contains the remaining
- * map between "option name" => "lines in the original config file".
- * Lines used by the rewrite process were removed by the function
- * rewriteConfigRewriteLine(), all the other lines are "orphaned" and
- * should be replaced by empty lines.
+/* 在重写过程结束时，状态中包含 "选项名" => "原始配置文件中的行"
+ * 的残余映射。
+ * 重写过程使用的行已被 rewriteConfigRewriteLine() 移除，
+ * 其余行是"孤立的"，应被替换为空行。
  *
- * This function does just this, iterating all the option names and
- * blanking all the lines still associated. */
+ * 此函数遍历所有选项名，将仍关联的行清空。 */
 void rewriteConfigRemoveOrphaned(struct rewriteConfigState *state) {
     dictIterator *di = dictGetIterator(state->option_to_line);
     dictEntry *de;
@@ -1639,8 +1705,8 @@ void rewriteConfigRemoveOrphaned(struct rewriteConfigState *state) {
     dictReleaseIterator(di);
 }
 
-/* This function returns a string representation of all the config options
- * marked with DEBUG_CONFIG, which can be used to help with debugging. */
+/* 返回所有标记为 DEBUG_CONFIG 的配置选项的字符串表示，
+ * 可用于辅助调试。 */
 sds getConfigDebugInfo(void) {
     struct rewriteConfigState *state = rewriteConfigCreateState();
     state->force_write = 1; /* Force the output */
@@ -1661,11 +1727,10 @@ sds getConfigDebugInfo(void) {
     return info;
 }
 
-/* This function replaces the old configuration file with the new content
- * in an atomic manner.
+/* 以原子方式用新内容替换旧配置文件。
+ * 通过先写入临时文件再 rename 的方式保证原子性。
  *
- * The function returns 0 on success, otherwise -1 is returned and errno
- * is set accordingly. */
+ * 成功返回 0，失败返回 -1 并设置 errno。 */
 int rewriteConfigOverwriteFile(char *configfile, sds content) {
     int fd = -1;
     int retval = -1;
@@ -1725,16 +1790,20 @@ cleanup:
     return retval;
 }
 
-/* Rewrite the configuration file at "path".
- * If the configuration file already exists, we try at best to retain comments
- * and overall structure.
+/* 重写 "path" 处的配置文件。
+ * 如果配置文件已存在，尽力保留注释和整体结构。
  *
- * Configuration parameters that are at their default value, unless already
- * explicitly included in the old configuration file, are not rewritten.
- * The force_write flag overrides this behavior and forces everything to be
- * written. This is currently only used for testing purposes.
+ * 处于默认值的配置参数（除非已在旧配置文件中显式包含）
+ * 不会被重写。force_write 标志覆盖此行为，
+ * 强制写入所有内容（目前仅用于测试）。
  *
- * On error -1 is returned and errno is set accordingly, otherwise 0. */
+ * 处理流程：
+ * 1. 读取旧配置到重写状态
+ * 2. 重写每个配置选项（替换或追加）
+ * 3. 移除孤立行
+ * 4. 生成新配置文件内容并写入原文件
+ *
+ * 失败返回 -1 并设置 errno，成功返回 0。 */
 int rewriteConfig(char *path, int force_write) {
     struct rewriteConfigState *state;
     sds newcontent;
@@ -1780,16 +1849,20 @@ int rewriteConfig(char *path, int force_write) {
 }
 
 /*-----------------------------------------------------------------------------
- * Configs that fit one of the major types and require no special handling
+ * 符合主要类型且无需特殊处理的配置。
  *----------------------------------------------------------------------------*/
+
+/* 用于加载配置时的临时缓冲区。 */
 #define LOADBUF_SIZE 256
 static char loadbuf[LOADBUF_SIZE];
 
+/* 嵌入通用配置字段的宏。 */
 #define embedCommonConfig(config_name, config_alias, config_flags) \
     .name = (config_name), \
     .alias = (config_alias), \
     .flags = (config_flags),
 
+/* 嵌入配置接口函数指针的宏。 */
 #define embedConfigInterface(initfn, setfn, getfn, rewritefn, applyfn) .interface = { \
     .init = (initfn), \
     .set = (setfn), \
@@ -1798,23 +1871,26 @@ static char loadbuf[LOADBUF_SIZE];
     .apply = (applyfn) \
 },
 
-/* What follows is the generic config types that are supported. To add a new
- * config with one of these types, add it to the standardConfig table with
- * the creation macro for each type.
+/* 以下是支持的通用配置类型。要添加使用这些类型的新配置，
+ * 请使用各类型的创建宏将其添加到 standardConfig 表中。
  *
- * Each type contains the following:
- * * A function defining how to load this type on startup.
- * * A function defining how to update this type on CONFIG SET.
- * * A function defining how to serialize this type on CONFIG SET.
- * * A function defining how to rewrite this type on CONFIG REWRITE.
- * * A Macro defining how to create this type.
+ * 每种类型包含以下内容：
+ * * 定义如何在启动时加载此类型的函数（init）。
+ * * 定义如何在 CONFIG SET 时更新此类型的函数（set）。
+ * * 定义如何在 CONFIG GET 时序列化此类型的函数（get）。
+ * * 定义如何在 CONFIG REWRITE 时重写此类型的函数（rewrite）。
+ * * 定义如何创建此类型的宏。
  */
 
-/* Bool Configs */
+/* Bool 配置类型
+ * 处理 yes/no 类型的配置项。 */
+
+/* 初始化布尔配置为默认值。 */
 static void boolConfigInit(standardConfig *config) {
     *config->data.yesno.config = config->data.yesno.default_value;
 }
 
+/* 设置布尔配置值。接受 "yes" 或 "no"。 */
 static int boolConfigSet(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(argc);
     int yn = yesnotoi(argv[0]);
@@ -1835,6 +1911,7 @@ static int boolConfigSet(standardConfig *config, sds *argv, int argc, const char
     return (config->flags & VOLATILE_CONFIG) ? 1 : 2;
 }
 
+/* 获取布尔配置值，返回 "yes" 或 "no"。 */
 static sds boolConfigGet(standardConfig *config) {
     if (config->flags & MODULE_CONFIG) {
         return sdsnew(getModuleBoolConfig(config->privdata) ? "yes" : "no");
@@ -1842,11 +1919,13 @@ static sds boolConfigGet(standardConfig *config) {
     return sdsnew(*config->data.yesno.config ? "yes" : "no");
 }
 
+/* 重写布尔配置。 */
 static void boolConfigRewrite(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     int val = config->flags & MODULE_CONFIG ? getModuleBoolConfig(config->privdata) : *(config->data.yesno.config);
     rewriteConfigYesNoOption(state, name, val, config->data.yesno.default_value);
 }
 
+/* 创建布尔类型配置项的宏。 */
 #define createBoolConfig(name, alias, flags, config_addr, default, is_valid, apply) { \
     embedCommonConfig(name, alias, flags) \
     embedConfigInterface(boolConfigInit, boolConfigSet, boolConfigGet, boolConfigRewrite, apply) \
@@ -1858,11 +1937,15 @@ static void boolConfigRewrite(standardConfig *config, const char *name, struct r
     } \
 }
 
-/* String Configs */
+/* String 配置类型
+ * 处理 char* 类型的配置项。 */
+
+/* 初始化字符串配置为默认值。 */
 static void stringConfigInit(standardConfig *config) {
     *config->data.string.config = (config->data.string.convert_empty_to_null && !config->data.string.default_value) ? NULL : zstrdup(config->data.string.default_value);
 }
 
+/* 设置字符串配置值。 */
 static int stringConfigSet(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(argc);
     if (config->data.string.is_valid_fn && !config->data.string.is_valid_fn(argv[0], err))
@@ -1877,19 +1960,25 @@ static int stringConfigSet(standardConfig *config, sds *argv, int argc, const ch
     return (config->flags & VOLATILE_CONFIG) ? 1 : 2;
 }
 
+/* 获取字符串配置值。 */
 static sds stringConfigGet(standardConfig *config) {
     return sdsnew(*config->data.string.config ? *config->data.string.config : "");
 }
 
+/* 重写字符串配置。 */
 static void stringConfigRewrite(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     rewriteConfigStringOption(state, name,*(config->data.string.config), config->data.string.default_value);
 }
 
-/* SDS Configs */
+/* SDS 配置类型
+ * 处理 SDS（Simple Dynamic Strings）类型的配置项。 */
+
+/* 初始化 SDS 配置为默认值。 */
 static void sdsConfigInit(standardConfig *config) {
     *config->data.sds.config = (config->data.sds.convert_empty_to_null && !config->data.sds.default_value) ? NULL : sdsnew(config->data.sds.default_value);
 }
 
+/* 设置 SDS 配置值。 */
 static int sdsConfigSet(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(argc);
     if (config->data.sds.is_valid_fn && !config->data.sds.is_valid_fn(argv[0], err))
@@ -1914,6 +2003,7 @@ static int sdsConfigSet(standardConfig *config, sds *argv, int argc, const char 
     return (config->flags & VOLATILE_CONFIG) ? 1 : 2;
 }
 
+/* 获取 SDS 配置值。 */
 static sds sdsConfigGet(standardConfig *config) {
     sds val = config->flags & MODULE_CONFIG ? getModuleStringConfig(config->privdata) : *config->data.sds.config;
     if (val) {
@@ -1924,6 +2014,7 @@ static sds sdsConfigGet(standardConfig *config) {
     }
 }
 
+/* 重写 SDS 配置。 */
 static void sdsConfigRewrite(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     sds val = config->flags & MODULE_CONFIG ? getModuleStringConfig(config->privdata) : *config->data.sds.config;
     rewriteConfigSdsOption(state, name, val, config->data.sds.default_value);
@@ -1931,9 +2022,11 @@ static void sdsConfigRewrite(standardConfig *config, const char *name, struct re
 }
 
 
-#define ALLOW_EMPTY_STRING 0
-#define EMPTY_STRING_IS_NULL 1
+/* 空字符串处理策略。 */
+#define ALLOW_EMPTY_STRING 0    /* 允许空字符串 */
+#define EMPTY_STRING_IS_NULL 1  /* 空字符串存储为 NULL */
 
+/* 创建字符串类型配置项的宏。 */
 #define createStringConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, apply) { \
     embedCommonConfig(name, alias, flags) \
     embedConfigInterface(stringConfigInit, stringConfigSet, stringConfigGet, stringConfigRewrite, apply) \
@@ -1946,6 +2039,7 @@ static void sdsConfigRewrite(standardConfig *config, const char *name, struct re
     } \
 }
 
+/* 创建 SDS 类型配置项的宏。 */
 #define createSDSConfig(name, alias, flags, empty_to_null, config_addr, default, is_valid, apply) { \
     embedCommonConfig(name, alias, flags) \
     embedConfigInterface(sdsConfigInit, sdsConfigSet, sdsConfigGet, sdsConfigRewrite, apply) \
@@ -1958,11 +2052,15 @@ static void sdsConfigRewrite(standardConfig *config, const char *name, struct re
     } \
 }
 
-/* Enum configs */
+/* Enum 配置类型
+ * 处理枚举类型的配置项。 */
+
+/* 初始化枚举配置为默认值。 */
 static void enumConfigInit(standardConfig *config) {
     *config->data.enumd.config = config->data.enumd.default_value;
 }
 
+/* 设置枚举配置值。验证参数是否为有效的枚举值。 */
 static int enumConfigSet(standardConfig *config, sds *argv, int argc, const char **err) {
     int enumval;
     int bitflags = !!(config->flags & MULTI_ARG_CONFIG);
@@ -1997,17 +2095,20 @@ static int enumConfigSet(standardConfig *config, sds *argv, int argc, const char
     return (config->flags & VOLATILE_CONFIG) ? 1 : 2;
 }
 
+/* 获取枚举配置值的名称。 */
 static sds enumConfigGet(standardConfig *config) {
     int val = config->flags & MODULE_CONFIG ? getModuleEnumConfig(config->privdata) : *(config->data.enumd.config);
     int bitflags = !!(config->flags & MULTI_ARG_CONFIG);
     return configEnumGetName(config->data.enumd.enum_value,val,bitflags);
 }
 
+/* 重写枚举配置。 */
 static void enumConfigRewrite(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     int val = config->flags & MODULE_CONFIG ? getModuleEnumConfig(config->privdata) : *(config->data.enumd.config);
     rewriteConfigEnumOption(state, name, val, config);
 }
 
+/* 创建枚举类型配置项的宏。 */
 #define createEnumConfig(name, alias, flags, enum, config_addr, default, is_valid, apply) { \
     embedCommonConfig(name, alias, flags) \
     embedConfigInterface(enumConfigInit, enumConfigSet, enumConfigGet, enumConfigRewrite, apply) \
@@ -2020,8 +2121,8 @@ static void enumConfigRewrite(standardConfig *config, const char *name, struct r
     } \
 }
 
-/* Gets a 'long long val' and sets it into the union, using a macro to get
- * compile time type check. */
+/* 将 long long 值设置到联合体中对应的位置。
+ * 根据 numeric_type 标识的具体类型进行类型转换。 */
 int setNumericType(standardConfig *config, long long val, const char **err) {
     if (config->data.numeric.numeric_type == NUMERIC_TYPE_INT) {
         *(config->data.numeric.config.i) = (int) val;
@@ -2049,8 +2150,8 @@ int setNumericType(standardConfig *config, long long val, const char **err) {
     return 1;
 }
 
-/* Gets a 'long long val' and sets it with the value from the union, using a
- * macro to get compile time type check. */
+/* 从联合体中获取数值配置值到 long long 变量中。
+ * 根据 numeric_type 标识的具体类型进行读取。 */
 #define GET_NUMERIC_TYPE(val) \
     if (config->data.numeric.numeric_type == NUMERIC_TYPE_INT) { \
         val = *(config->data.numeric.config.i); \
@@ -2075,11 +2176,16 @@ int setNumericType(standardConfig *config, long long val, const char **err) {
         val = *(config->data.numeric.config.tt); \
     }
 
-/* Numeric configs */
+/* Numeric 配置类型
+ * 处理各种数值类型（int、long、long long 等）的配置项。 */
+
+/* 初始化数值配置为默认值。 */
 static void numericConfigInit(standardConfig *config) {
     setNumericType(config, config->data.numeric.default_value, NULL);
 }
 
+/* 检查数值配置值是否在有效范围内。
+ * 支持有符号和无符号类型的边界检查。 */
 static int numericBoundaryCheck(standardConfig *config, long long ll, const char **err) {
     if (config->data.numeric.numeric_type == NUMERIC_TYPE_ULONG_LONG ||
         config->data.numeric.numeric_type == NUMERIC_TYPE_UINT ||
@@ -2127,6 +2233,8 @@ static int numericBoundaryCheck(standardConfig *config, long long ll, const char
     return 1;
 }
 
+/* 将字符串解析为数值。
+ * 依次尝试解析为内存值、百分比、八进制数或普通整数。 */
 static int numericParseString(standardConfig *config, sds value, const char **err, long long *res) {
     /* First try to parse as memory */
     if (config->data.numeric.flags & MEMORY_CONFIG) {
@@ -2172,6 +2280,7 @@ static int numericParseString(standardConfig *config, sds value, const char **er
     return 0;
 }
 
+/* 设置数值配置值。解析字符串并进行边界和有效性检查。 */
 static int numericConfigSet(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(argc);
     long long ll, prev = 0;
@@ -2193,6 +2302,7 @@ static int numericConfigSet(standardConfig *config, sds *argv, int argc, const c
     return (config->flags & VOLATILE_CONFIG) ? 1 : 2;
 }
 
+/* 获取数值配置值的字符串表示。 */
 static sds numericConfigGet(standardConfig *config) {
     char buf[128];
 
@@ -2214,6 +2324,7 @@ static sds numericConfigGet(standardConfig *config) {
     return sdsnew(buf);
 }
 
+/* 重写数值配置。根据标志选择合适的格式（百分比、内存、八进制、普通整数）。 */
 static void numericConfigRewrite(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     long long value = 0;
 
@@ -2311,12 +2422,16 @@ static void numericConfigRewrite(standardConfig *config, const char *name, struc
     } \
 }
 
+/* 创建特殊类型配置项的宏。
+ * 特殊配置具有自定义的 set/get/rewrite 函数。 */
 #define createSpecialConfig(name, alias, modifiable, setfn, getfn, rewritefn, applyfn) { \
     .type = SPECIAL_CONFIG, \
     embedCommonConfig(name, alias, modifiable) \
     embedConfigInterface(NULL, setfn, getfn, rewritefn, applyfn) \
 }
 
+/* 验证主动碎片整理是否可以启用。
+ * 需要编译时支持修改版的 Jemalloc。 */
 static int isValidActiveDefrag(int val, const char **err) {
 #ifndef HAVE_DEFRAG
     if (val) {
@@ -2333,6 +2448,7 @@ static int isValidActiveDefrag(int val, const char **err) {
     return 1;
 }
 
+/* 验证 RDB 文件名：不能是路径，只能是文件名。 */
 static int isValidDBfilename(char *val, const char **err) {
     if (!pathIsBaseName(val)) {
         *err = "dbfilename can't be a path, just a filename";
@@ -2341,6 +2457,7 @@ static int isValidDBfilename(char *val, const char **err) {
     return 1;
 }
 
+/* 验证 AOF 文件名：不能为空且不能是路径。 */
 static int isValidAOFfilename(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appendfilename can't be empty";
@@ -2353,6 +2470,7 @@ static int isValidAOFfilename(char *val, const char **err) {
     return 1;
 }
 
+/* 验证 AOF 目录名：不能为空且不能是路径。 */
 static int isValidAOFdirname(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appenddirname can't be empty";
@@ -2365,6 +2483,8 @@ static int isValidAOFdirname(char *val, const char **err) {
     return 1;
 }
 
+/* 验证关闭信号标志的有效组合。
+ * SAVE 和 NOSAVE 不能同时使用。 */
 static int isValidShutdownOnSigFlags(int val, const char **err) {
     /* Individual arguments are validated by createEnumConfig logic.
      * We just need to ensure valid combinations here. */
@@ -2375,6 +2495,7 @@ static int isValidShutdownOnSigFlags(int val, const char **err) {
     return 1;
 }
 
+/* 验证集群公告节点名的有效性。 */
 static int isValidAnnouncedNodename(char *val,const char **err) {
     if (!(isValidAuxString(val,sdslen(val)))) {
         *err = "Announced human node name contained invalid character";
@@ -2383,6 +2504,8 @@ static int isValidAnnouncedNodename(char *val,const char **err) {
     return 1;
 }
 
+/* 验证集群公告主机名的有效性。
+ * 主机名只能包含字母、数字、连字符和点。 */
 static int isValidAnnouncedHostname(char *val, const char **err) {
     if (strlen(val) >= NET_HOST_STR_LEN) {
         *err = "Hostnames must be less than "
@@ -2407,7 +2530,7 @@ static int isValidAnnouncedHostname(char *val, const char **err) {
     return 1;
 }
 
-/* Validate specified string is a valid proc-title-template */
+/* 验证指定字符串是否为有效的进程标题模板。 */
 static int isValidProcTitleTemplate(char *val, const char **err) {
     if (!validateProcTitleTemplate(val)) {
         *err = "template format is invalid or contains unknown variables";
@@ -2416,6 +2539,7 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
     return 1;
 }
 
+/* 更新 LC_COLLATE 区域设置。 */
 static int updateLocaleCollate(const char **err) {
     const char *s = setlocale(LC_COLLATE, server.locale_collate);
     if (s == NULL) {
@@ -2425,6 +2549,7 @@ static int updateLocaleCollate(const char **err) {
     return 1;
 }
 
+/* 更新进程标题模板。 */
 static int updateProcTitleTemplate(const char **err) {
     if (redisSetProcTitle(NULL) == C_ERR) {
         *err = "failed to set process title";
@@ -2433,6 +2558,8 @@ static int updateProcTitleTemplate(const char **err) {
     return 1;
 }
 
+/* 更新服务器 HZ（频率）设置。
+ * HZ 更多是用户的提示，因此接受超出范围的值，但会限制到合理范围。 */
 static int updateHZ(const char **err) {
     UNUSED(err);
     /* Hz is more a hint from the user, so we accept values out of range
@@ -2443,6 +2570,7 @@ static int updateHZ(const char **err) {
     return 1;
 }
 
+/* 更新监听端口。重新绑定 TCP 监听器。 */
 static int updatePort(const char **err) {
     connListener *listener = listenerByType(CONN_TYPE_SOCKET);
 
@@ -2460,24 +2588,29 @@ static int updatePort(const char **err) {
     return 1;
 }
 
+/* 标记碎片整理配置已变更。 */
 static int updateDefragConfiguration(const char **err) {
     UNUSED(err);
     server.active_defrag_configuration_changed = 1;
     return 1;
 }
 
+/* 更新 Jemalloc 后台线程设置。 */
 static int updateJemallocBgThread(const char **err) {
     UNUSED(err);
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     return 1;
 }
 
+/* 更新复制积压缓冲区大小。 */
 static int updateReplBacklogSize(const char **err) {
     UNUSED(err);
     resizeReplicationBacklog();
     return 1;
 }
 
+/* 更新最大内存限制。
+ * 如果新值小于当前内存使用量则记录警告。 */
 static int updateMaxmemory(const char **err) {
     UNUSED(err);
     if (server.maxmemory) {
@@ -2490,18 +2623,22 @@ static int updateMaxmemory(const char **err) {
     return 1;
 }
 
+/* 更新最小可用副本数量。 */
 static int updateGoodSlaves(const char **err) {
     UNUSED(err);
     refreshGoodSlavesCount();
     return 1;
 }
 
+/* 更新看门狗定时器周期。 */
 static int updateWatchdogPeriod(const char **err) {
     UNUSED(err);
     applyWatchdogPeriod();
     return 1;
 }
 
+/* 更新 AOF 持久化状态。
+ * 根据 aof_enabled 配置启用或停止 AOF。 */
 static int updateAppendonly(const char **err) {
     if (!server.aof_enabled && server.aof_state != AOF_OFF) {
         stopAppendOnly();
@@ -2514,6 +2651,7 @@ static int updateAppendonly(const char **err) {
     return 1;
 }
 
+/* 更新 AOF 自动垃圾回收设置。 */
 static int updateAofAutoGCEnabled(const char **err) {
     UNUSED(err);
     if (!server.aof_disable_auto_gc) {
@@ -2523,6 +2661,7 @@ static int updateAofAutoGCEnabled(const char **err) {
     return 1;
 }
 
+/* 更新崩溃日志信号处理器的启用状态。 */
 static int updateSighandlerEnabled(const char **err) {
     UNUSED(err);
     if (server.crashlog_enabled)
@@ -2532,6 +2671,8 @@ static int updateSighandlerEnabled(const char **err) {
     return 1;
 }
 
+/* 更新最大客户端连接数。
+ * 调整操作系统文件描述符限制和事件循环集合大小。 */
 static int updateMaxclients(const char **err) {
     unsigned int new_maxclients = server.maxclients;
     adjustOpenFilesLimit();
@@ -2554,6 +2695,7 @@ static int updateMaxclients(const char **err) {
     return 1;
 }
 
+/* 更新 OOM Score 调整值。 */
 static int updateOOMScoreAdj(const char **err) {
     if (setOOMScoreAdj(-1) == C_ERR) {
         *err = "Failed to set current oom_score_adj. Check server logs.";
@@ -2563,6 +2705,9 @@ static int updateOOMScoreAdj(const char **err) {
     return 1;
 }
 
+/* 更新 requirepass 配置。
+ * 将旧的 "requirepass" 指令转换为设置默认用户的密码，
+ * 同时保留明文密码以兼容 Redis <= 5。 */
 int updateRequirePass(const char **err) {
     UNUSED(err);
     /* The old "requirepass" directive just translates to setting
@@ -2573,6 +2718,8 @@ int updateRequirePass(const char **err) {
     return 1;
 }
 
+/* 更新 AOF fsync 策略。
+ * 当设置为 always 时，等待所有 AOF fsync 任务完成。 */
 int updateAppendFsync(const char **err) {
     UNUSED(err);
     if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
@@ -2584,7 +2731,8 @@ int updateAppendFsync(const char **err) {
     return 1;
 }
 
-/* applyBind affects both TCP and TLS (if enabled) together */
+/* 应用 bind 配置变更。
+ * 同时影响 TCP 和 TLS（如果启用）监听器。 */
 static int applyBind(const char **err) {
     connListener *tcp_listener = listenerByType(CONN_TYPE_SOCKET);
     connListener *tls_listener = listenerByType(CONN_TYPE_TLS);
@@ -2617,36 +2765,42 @@ static int applyBind(const char **err) {
     return 1;
 }
 
+/* 更新集群标志。 */
 int updateClusterFlags(const char **err) {
     UNUSED(err);
     clusterUpdateMyselfFlags();
     return 1;
 }
 
+/* 更新集群公告端口。 */
 static int updateClusterAnnouncedPort(const char **err) {
     UNUSED(err);
     clusterUpdateMyselfAnnouncedPorts();
     return 1;
 }
 
+/* 更新集群公告 IP。 */
 static int updateClusterIp(const char **err) {
     UNUSED(err);
     clusterUpdateMyselfIp();
     return 1;
 }
 
+/* 更新集群公告主机名。 */
 int updateClusterHostname(const char **err) {
     UNUSED(err);
     clusterUpdateMyselfHostname();
     return 1;
 }
 
+/* 更新集群人类可读节点名。 */
 int updateClusterHumanNodename(const char **err) {
     UNUSED(err);
     clusterUpdateMyselfHumanNodename();
     return 1;
 }
 
+/* 应用 TLS 配置变更。配置 OpenSSL。 */
 static int applyTlsCfg(const char **err) {
     UNUSED(err);
 
@@ -2659,6 +2813,7 @@ static int applyTlsCfg(const char **err) {
     return 1;
 }
 
+/* 应用 TLS 端口变更。配置 TLS 监听器。 */
 static int applyTLSPort(const char **err) {
     /* Configure TLS in case it wasn't enabled */
     if (connTypeConfigure(connectionTypeTls(), &server.tls_ctx_config, 0) == C_ERR) {
@@ -2681,6 +2836,7 @@ static int applyTLSPort(const char **err) {
     return 1;
 }
 
+/* 设置工作目录。通过 chdir 切换目录。 */
 static int setConfigDirOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
     if (argc != 1) {
@@ -2694,6 +2850,7 @@ static int setConfigDirOption(standardConfig *config, sds *argv, int argc, const
     return 1;
 }
 
+/* 获取当前工作目录。 */
 static sds getConfigDirOption(standardConfig *config) {
     UNUSED(config);
     char buf[1024];
@@ -2704,6 +2861,8 @@ static sds getConfigDirOption(standardConfig *config) {
     return sdsnew(buf);
 }
 
+/* 设置 RDB 快照保存参数。
+ * 特殊情况：单个空参数 "" 表示禁用自动保存。 */
 static int setConfigSaveOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
     int j;
@@ -2759,6 +2918,7 @@ static int setConfigSaveOption(standardConfig *config, sds *argv, int argc, cons
     return 1;
 }
 
+/* 获取当前 RDB 快照保存参数。 */
 static sds getConfigSaveOption(standardConfig *config) {
     UNUSED(config);
     sds buf = sdsempty();
@@ -2775,11 +2935,13 @@ static sds getConfigSaveOption(standardConfig *config) {
     return buf;
 }
 
+/* 设置客户端输出缓冲区限制。 */
 static int setConfigClientOutputBufferLimitOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
     return updateClientOutputBufferLimit(argv, argc, err);
 }
 
+/* 获取客户端输出缓冲区限制。 */
 static sds getConfigClientOutputBufferLimitOption(standardConfig *config) {
     UNUSED(config);
     sds buf = sdsempty();
@@ -2796,8 +2958,8 @@ static sds getConfigClientOutputBufferLimitOption(standardConfig *config) {
     return buf;
 }
 
-/* Parse an array of CONFIG_OOM_COUNT sds strings, validate and populate
- * server.oom_score_adj_values if valid.
+/* 解析 CONFIG_OOM_COUNT 个 sds 字符串数组，
+ * 验证并填充 server.oom_score_adj_values。
  */
 static int setConfigOOMScoreAdjValuesOption(standardConfig *config, sds *argv, int argc, const char **err) {
     int i;
@@ -2844,6 +3006,7 @@ static int setConfigOOMScoreAdjValuesOption(standardConfig *config, sds *argv, i
     return change ? 1 : 2;
 }
 
+/* 获取 OOM Score 调整值。 */
 static sds getConfigOOMScoreAdjValuesOption(standardConfig *config) {
     UNUSED(config);
     sds buf = sdsempty();
@@ -2858,6 +3021,7 @@ static sds getConfigOOMScoreAdjValuesOption(standardConfig *config) {
     return buf;
 }
 
+/* 设置键空间通知事件类型。 */
 static int setConfigNotifyKeyspaceEventsOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
     if (argc != 1) {
@@ -2873,11 +3037,13 @@ static int setConfigNotifyKeyspaceEventsOption(standardConfig *config, sds *argv
     return 1;
 }
 
+/* 获取键空间通知事件类型。 */
 static sds getConfigNotifyKeyspaceEventsOption(standardConfig *config) {
     UNUSED(config);
     return keyspaceEventsFlagsToString(server.notify_keyspace_events);
 }
 
+/* 设置绑定地址。支持多个地址和空参数。 */
 static int setConfigBindOption(standardConfig *config, sds* argv, int argc, const char **err) {
     UNUSED(config);
     int j;
@@ -2901,6 +3067,8 @@ static int setConfigBindOption(standardConfig *config, sds* argv, int argc, cons
     return 1;
 }
 
+/* 设置 replicaof（slaveof）选项。
+ * 参数 "no one" 表示设为主节点。 */
 static int setConfigReplicaOfOption(standardConfig *config, sds* argv, int argc, const char **err) {
     UNUSED(config);
 
@@ -2925,11 +3093,13 @@ static int setConfigReplicaOfOption(standardConfig *config, sds* argv, int argc,
     return 1;
 }
 
+/* 获取绑定地址列表。 */
 static sds getConfigBindOption(standardConfig *config) {
     UNUSED(config);
     return sdsjoin(server.bindaddr,server.bindaddr_count," ");
 }
 
+/* 获取 replicaof 配置。 */
 static sds getConfigReplicaOfOption(standardConfig *config) {
     UNUSED(config);
     char buf[256];
@@ -2941,12 +3111,15 @@ static sds getConfigReplicaOfOption(standardConfig *config) {
     return sdsnew(buf);
 }
 
+/* 检查是否允许受保护的操作。
+ * 当配置为 "yes" 或配置为 "local" 且客户端是本地连接时允许。 */
 int allowProtectedAction(int config, client *c) {
     return (config == PROTECTED_ACTION_ALLOWED_YES) ||
            (config == PROTECTED_ACTION_ALLOWED_LOCAL && (connIsLocal(c->conn) == 1));
 }
 
 
+/* 设置延迟追踪信息百分位数。 */
 static int setConfigLatencyTrackingInfoPercentilesOutputOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
     zfree(server.latency_tracking_info_percentiles);
@@ -2980,6 +3153,7 @@ configerr:
     return 0;
 }
 
+/* 获取延迟追踪信息百分位数。 */
 static sds getConfigLatencyTrackingInfoPercentilesOutputOption(standardConfig *config) {
     UNUSED(config);
     sds buf = sdsempty();
@@ -2994,7 +3168,7 @@ static sds getConfigLatencyTrackingInfoPercentilesOutputOption(standardConfig *c
     return buf;
 }
 
-/* Rewrite the latency-tracking-info-percentiles option. */
+/* 重写 latency-tracking-info-percentiles 选项。 */
 void rewriteConfigLatencyTrackingInfoPercentilesOutputOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
     sds line = sdsnew(name);
@@ -3015,6 +3189,8 @@ void rewriteConfigLatencyTrackingInfoPercentilesOutputOption(standardConfig *con
     rewriteConfigRewriteLine(state,name,line,1);
 }
 
+/* 应用客户端最大内存使用量配置。
+ * 根据 maxmemory_clients 启用或禁用客户端内存使用桶。 */
 static int applyClientMaxMemoryUsage(const char **err) {
     UNUSED(err);
     listIter li;
@@ -3046,8 +3222,11 @@ static int applyClientMaxMemoryUsage(const char **err) {
     return 1;
 }
 
+/* 所有标准配置项的静态数组。
+ * 在启动时由 initConfigValues() 初始化并注册到运行时字典中。
+ * 包含以下类型的配置：布尔、字符串、SDS、枚举、数值和特殊配置。 */
 standardConfig static_configs[] = {
-    /* Bool configs */
+    /* Bool 配置 */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
     createBoolConfig("daemonize", NULL, IMMUTABLE_CONFIG, server.daemonize, 0, NULL, NULL),
     createBoolConfig("io-threads-do-reads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, server.io_threads_do_reads, 0,NULL, NULL), /* Read + parse from threads? */
@@ -3096,7 +3275,7 @@ standardConfig static_configs[] = {
     createBoolConfig("replica-ignore-disk-write-errors", NULL, MODIFIABLE_CONFIG, server.repl_ignore_disk_write_error, 0, NULL, NULL),
     createBoolConfig("hide-user-data-from-log", NULL, MODIFIABLE_CONFIG, server.hide_user_data_from_log, 0, NULL, NULL),
 
-    /* String Configs */
+    /* String 配置 */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
     createStringConfig("unixsocket", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.unixsocket, NULL, NULL, NULL),
     createStringConfig("pidfile", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.pidfile, NULL, NULL, NULL),
@@ -3123,11 +3302,11 @@ standardConfig static_configs[] = {
 #endif
     createStringConfig("locale-collate", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.locale_collate, "", NULL, updateLocaleCollate),
 
-    /* SDS Configs */
+    /* SDS 配置 */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
     createSDSConfig("requirepass", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.requirepass, NULL, NULL, updateRequirePass),
 
-    /* Enum Configs */
+    /* Enum 配置 */
     createEnumConfig("supervised", NULL, IMMUTABLE_CONFIG, supervised_mode_enum, server.supervised_mode, SUPERVISED_NONE, NULL, NULL),
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
     createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
@@ -3145,7 +3324,7 @@ standardConfig static_configs[] = {
     createEnumConfig("shutdown-on-sigint", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigint, 0, isValidShutdownOnSigFlags, NULL),
     createEnumConfig("shutdown-on-sigterm", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigterm, 0, isValidShutdownOnSigFlags, NULL),
 
-    /* Integer configs */
+    /* 整数配置 */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort), /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, 1, 128, server.io_threads_num, 1, INTEGER_CONFIG, NULL, NULL), /* Single threaded by default */
@@ -3184,7 +3363,7 @@ standardConfig static_configs[] = {
     createIntConfig("shutdown-timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.shutdown_timeout, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("repl-diskless-sync-max-replicas", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_diskless_sync_max_replicas, 0, INTEGER_CONFIG, NULL, NULL),
 
-    /* Unsigned int configs */
+    /* 无符号整数配置 */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),
     createUIntConfig("unixsocketperm", NULL, IMMUTABLE_CONFIG, 0, 0777, server.unixsocketperm, 0, OCTAL_CONFIG, NULL, NULL),
     createUIntConfig("socket-mark-id", NULL, IMMUTABLE_CONFIG, 0, UINT_MAX, server.socket_mark_id, 0, INTEGER_CONFIG, NULL, NULL),
@@ -3194,12 +3373,12 @@ standardConfig static_configs[] = {
     createUIntConfig("client-default-resp", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 2, 3, server.client_default_resp, 2, INTEGER_CONFIG, NULL, NULL),
 #endif
 
-    /* Unsigned Long configs */
+    /* 无符号长整数配置 */
     createULongConfig("active-defrag-max-scan-fields", NULL, MODIFIABLE_CONFIG, 1, LONG_MAX, server.active_defrag_max_scan_fields, 1000, INTEGER_CONFIG, NULL, NULL), /* Default: keys with more than 1000 fields will be processed separately */
     createULongConfig("slowlog-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.slowlog_max_len, 128, INTEGER_CONFIG, NULL, NULL),
     createULongConfig("acllog-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.acllog_max_len, 128, INTEGER_CONFIG, NULL, NULL),
 
-    /* Long Long configs */
+    /* 长长整数配置 */
     createLongLongConfig("busy-reply-threshold", "lua-time-limit", MODIFIABLE_CONFIG, 0, LONG_MAX, server.busy_reply_threshold, 5000, INTEGER_CONFIG, NULL, NULL),/* milliseconds */
     createLongLongConfig("cluster-node-timeout", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.cluster_node_timeout, 15000, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("cluster-ping-interval", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, LLONG_MAX, server.cluster_ping_interval, 0, INTEGER_CONFIG, NULL, NULL),
@@ -3209,11 +3388,11 @@ standardConfig static_configs[] = {
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.repl_backlog_size, 1024*1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 1mb */
 
-    /* Unsigned Long Long configs */
+    /* 无符号长长整数配置 */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
 
-    /* Size_t configs */
+    /* size_t 配置 */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("set-max-intset-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.set_max_intset_entries, 512, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("set-max-listpack-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.set_max_listpack_entries, 128, INTEGER_CONFIG, NULL, NULL),
@@ -3228,7 +3407,7 @@ standardConfig static_configs[] = {
     createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024*1024, LONG_MAX, server.client_max_querybuf_len, 1024*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1GB max query buffer. */
     createSSizeTConfig("maxmemory-clients", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_clients, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, applyClientMaxMemoryUsage),
 
-    /* Other configs */
+    /* 其他类型配置 */
     createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60*60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */
     createOffTConfig("auto-aof-rewrite-min-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.aof_rewrite_min_size, 64*1024*1024, MEMORY_CONFIG, NULL, NULL),
     createOffTConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1024, INT_MAX, server.loading_process_events_interval_bytes, 1024*1024*2, INTEGER_CONFIG, NULL, NULL),
@@ -3254,7 +3433,7 @@ standardConfig static_configs[] = {
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, applyTlsCfg),
 
-    /* Special configs */
+    /* 特殊配置 */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),
     createSpecialConfig("save", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigSaveOption, getConfigSaveOption, rewriteConfigSaveOption, NULL),
     createSpecialConfig("client-output-buffer-limit", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigClientOutputBufferLimitOption, getConfigClientOutputBufferLimitOption, rewriteConfigClientOutputBufferLimitOption, NULL),
@@ -3264,12 +3443,13 @@ standardConfig static_configs[] = {
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
 
-    /* NULL Terminator, this is dropped when we convert to the runtime array. */
+    /* NULL 终止符，转换为运行时数组时会被丢弃。 */
     {NULL}
 };
 
-/* Create a new config by copying the passed in config. Returns 1 on success
- * or 0 when their was already a config with the same name.. */
+/* 通过复制传入的配置来创建新配置。
+ * 成功返回 1，已存在同名配置时返回 0。
+ * 当 alias 为真时，注册为别名配置。 */
 int registerConfigValue(const char *name, const standardConfig *config, int alias) {
     standardConfig *new = zmalloc(sizeof(standardConfig));
     memcpy(new, config, sizeof(standardConfig));
@@ -3282,8 +3462,9 @@ int registerConfigValue(const char *name, const standardConfig *config, int alia
     return dictAdd(configs, sdsnew(name), new) == DICT_OK;
 }
 
-/* Initialize configs to their default values and create and populate the 
- * runtime configuration dictionary. */
+/* 将配置初始化为默认值，并创建和填充运行时配置字典。
+ * 遍历 static_configs 数组，对每个配置项调用 init 函数
+ * 并注册到 configs 字典中（包括主名称和别名）。 */
 void initConfigValues(void) {
     configs = dictCreate(&sdsHashDictType);
     dictExpand(configs, sizeof(static_configs) / sizeof(standardConfig));
@@ -3302,7 +3483,8 @@ void initConfigValues(void) {
     }
 }
 
-/* Remove a config by name from the configs dict. */
+/* 从 configs 字典中按名称移除配置项。
+ * 对于模块配置，同时释放相关的名称和数据。 */
 void removeConfig(sds name) {
     standardConfig *config = lookupConfig(name);
     if (!config) return;
@@ -3323,10 +3505,11 @@ void removeConfig(sds name) {
 }
 
 /*-----------------------------------------------------------------------------
- * Module Config
+ * 模块配置
  *----------------------------------------------------------------------------*/
 
-/* Create a bool/string/enum/numeric standardConfig for a module config in the configs dictionary */
+/* 在 configs 字典中为模块配置创建 bool/string/enum/numeric 标准配置项。 */
+/* 为模块添加布尔类型配置项。 */
 void addModuleBoolConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val) {
     sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
     int config_dummy_address;
@@ -3336,6 +3519,7 @@ void addModuleBoolConfig(const char *module_name, const char *name, int flags, v
     registerConfigValue(config_name, &module_config, 0);
 }
 
+/* 为模块添加 SDS 字符串类型配置项。 */
 void addModuleStringConfig(const char *module_name, const char *name, int flags, void *privdata, sds default_val) {
     sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
     sds config_dummy_address;
@@ -3345,6 +3529,7 @@ void addModuleStringConfig(const char *module_name, const char *name, int flags,
     registerConfigValue(config_name, &module_config, 0);
 }
 
+/* 为模块添加枚举类型配置项。 */
 void addModuleEnumConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val, configEnum *enum_vals) {
     sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
     int config_dummy_address;
@@ -3354,6 +3539,7 @@ void addModuleEnumConfig(const char *module_name, const char *name, int flags, v
     registerConfigValue(config_name, &module_config, 0);
 }
 
+/* 为模块添加数值类型配置项。 */
 void addModuleNumericConfig(const char *module_name, const char *name, int flags, void *privdata, long long default_val, int conf_flags, long long lower, long long upper) {
     sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
     long long config_dummy_address;
@@ -3367,6 +3553,8 @@ void addModuleNumericConfig(const char *module_name, const char *name, int flags
  * CONFIG HELP
  *----------------------------------------------------------------------------*/
 
+/* CONFIG HELP 命令处理函数。
+ * 返回 CONFIG 子命令的帮助信息。 */
 void configHelpCommand(client *c) {
     const char *help[] = {
 "GET <pattern>",
@@ -3387,6 +3575,8 @@ NULL
  * CONFIG RESETSTAT
  *----------------------------------------------------------------------------*/
 
+/* CONFIG RESETSTAT 命令处理函数。
+ * 重置服务器统计信息、命令表统计和错误表统计。 */
 void configResetStatCommand(client *c) {
     resetServerStats();
     resetCommandTableStats(server.commands);
@@ -3398,6 +3588,8 @@ void configResetStatCommand(client *c) {
  * CONFIG REWRITE
  *----------------------------------------------------------------------------*/
 
+/* CONFIG REWRITE 命令处理函数。
+ * 将当前运行时配置重写到配置文件中。 */
 void configRewriteCommand(client *c) {
     if (server.configfile == NULL) {
         addReplyError(c,"The server is running without a config file");

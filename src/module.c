@@ -7,27 +7,22 @@
  */
 
 /* --------------------------------------------------------------------------
- * Modules API documentation information
+ * 模块 API 文档生成说明
  *
- * The comments in this file are used to generate the API documentation on the
- * Redis website.
+ * 本文件中的注释用于生成 Redis 官网上的模块 API 文档。
  *
- * Each function starting with RM_ and preceded by a block comment is included
- * in the API documentation. To hide an RM_ function, put a blank line between
- * the comment and the function definition or put the comment inside the
- * function body.
+ * 每个以 RM_ 开头、且前方有块注释的函数都会被包含在 API
+ * 文档中。如需隐藏某个 RM_ 函数，请在注释与函数定义之间
+ * 插入一个空行，或将注释放在函数体内部。
  *
- * The functions are divided into sections. Each section is preceded by a
- * documentation block, which is comment block starting with a markdown level 2
- * heading, i.e. a line starting with ##, on the first line of the comment block
- * (with the exception of a ----- line which can appear first). Other comment
- * blocks, which are not intended for the modules API user, such as this comment
- * block, do NOT start with a markdown level 2 heading, so they are included in
- * the generated a API documentation.
+ * 函数按章节（section）组织，每个章节前有一个文档块，其
+ * 第一行为 Markdown 二级标题（以 ## 开头）。
+ * ----- 行可以出现在标题之前。其他不面向模块 API 用户的
+ * 注释块（如本注释块）不以 ## 开头。
  *
- * The documentation comments may contain markdown formatting. Some automatic
- * replacements are done, such as the replacement of RM with RedisModule in
- * function names. For details, see the script src/modules/gendoc.rb.
+ * 文档注释可包含 Markdown 格式标记。脚本
+ * src/modules/gendoc.rb 会自动执行一些替换，
+ * 例如将函数名中的 RM 替换为 RedisModule。
  * -------------------------------------------------------------------------- */
 
 #include "server.h"
@@ -46,11 +41,14 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * Private data structures used by the modules system. Those are data
- * structures that are never exposed to Redis Modules, if not as void
- * pointers that have an API the module can call with them)
+ * 模块系统使用的内部数据结构。这些结构体永远不会直接暴露
+ * 给 Redis 模块，仅以 void 指针的形式提供，模块只能通过
+ * 对应的 API 函数来操作它们。
  * -------------------------------------------------------------------------- */
 
+/* RedisModuleInfoCtx: 模块 INFO 命令的上下文结构体。
+ * 用于收集模块通过 RM_InfoAddSection / RM_InfoAddField
+ * 等 API 添加的信息，最终组装为 INFO 命令的输出字符串。 */
 struct RedisModuleInfoCtx {
     struct RedisModule *module;
     dict *requested_sections;
@@ -60,119 +58,125 @@ struct RedisModuleInfoCtx {
     int in_dict_field;  /* indication that we're currently appending to a dict */
 };
 
-/* This represents a shared API. Shared APIs will be used to populate
- * the server.sharedapi dictionary, mapping names of APIs exported by
- * modules for other modules to use, to their structure specifying the
- * function pointer that can be called. */
+/* RedisModuleSharedAPI: 表示一个共享 API。
+ * 模块可以将自己导出的函数通过 RM_ExportSharedAPI 注册为
+ * 共享 API，供其他模块通过 RM_GetSharedAPI 获取并使用。
+ * server.sharedapi 字典存储这些共享 API 的映射关系。 */
 struct RedisModuleSharedAPI {
     void *func;
     RedisModule *module;
 };
 typedef struct RedisModuleSharedAPI RedisModuleSharedAPI;
 
-dict *modules; /* Hash table of modules. SDS -> RedisModule ptr.*/
+dict *modules; /* 模块哈希表。键为模块名称(SDS)，
+                   值为 RedisModule 指针。 */
 
-/* Entries in the context->amqueue array, representing objects to free
- * when the callback returns. */
+/* AutoMemEntry: 自动内存管理队列中的条目。
+ * 表示当模块回调函数返回时需要自动释放的对象。
+ * 每个模块回调上下文都有一个 amqueue 数组，
+ * 用于跟踪回调期间分配的资源。 */
 struct AutoMemEntry {
     void *ptr;
     int type;
 };
 
-/* AutoMemEntry type field values. */
-#define REDISMODULE_AM_KEY 0
-#define REDISMODULE_AM_STRING 1
-#define REDISMODULE_AM_REPLY 2
-#define REDISMODULE_AM_FREED 3 /* Explicitly freed by user already. */
-#define REDISMODULE_AM_DICT 4
-#define REDISMODULE_AM_INFO 5
+/* AutoMemEntry type 字段的取值，标识自动管理对象的类型。 */
+#define REDISMODULE_AM_KEY 0      /* Redis 键对象 */
+#define REDISMODULE_AM_STRING 1   /* RedisModuleString 对象 */
+#define REDISMODULE_AM_REPLY 2    /* 调用回复对象 */
+#define REDISMODULE_AM_FREED 3    /* 已被用户显式释放 */
+#define REDISMODULE_AM_DICT 4     /* 字典对象 */
+#define REDISMODULE_AM_INFO 5     /* INFO 上下文对象 */
 
-/* The pool allocator block. Redis Modules can allocate memory via this special
- * allocator that will automatically release it all once the callback returns.
- * This means that it can only be used for ephemeral allocations. However
- * there are two advantages for modules to use this API:
+/* 池分配器块。模块可以通过这个特殊的分配器来分配内存，
+ * 当回调函数返回时，所有通过它分配的内存会自动释放。
+ * 因此它只适用于短期临时分配。使用此 API 有两个优势：
  *
- * 1) The memory is automatically released when the callback returns.
- * 2) This allocator is faster for many small allocations since whole blocks
- *    are allocated, and small pieces returned to the caller just advancing
- *    the index of the allocation.
+ * 1) 回调返回时内存自动释放，无需手动管理。
+ * 2) 对于大量小分配的场景速度更快，因为分配的是整块内存，
+ *    小块内存只需移动分配索引即可返回给调用者。
  *
- * Allocations are always rounded to the size of the void pointer in order
- * to always return aligned memory chunks. */
+ * 分配大小总是向上对齐到 void 指针的大小，以确保返回的
+ * 内存块始终满足对齐要求。 */
 
-#define REDISMODULE_POOL_ALLOC_MIN_SIZE (1024*8)
-#define REDISMODULE_POOL_ALLOC_ALIGN (sizeof(void*))
+#define REDISMODULE_POOL_ALLOC_MIN_SIZE (1024*8) /* 池分配器块的最小大小：8KB */
+#define REDISMODULE_POOL_ALLOC_ALIGN (sizeof(void*)) /* 内存对齐粒度：指针大小 */
 
+/* RedisModulePoolAllocBlock: 池分配器的内存块。
+ * 多个块通过 next 指针形成链表，memory 数组存储实际数据。 */
 typedef struct RedisModulePoolAllocBlock {
-    uint32_t size;
-    uint32_t used;
-    struct RedisModulePoolAllocBlock *next;
-    char memory[];
+    uint32_t size;   /* 块总容量 */
+    uint32_t used;   /* 已使用的字节数 */
+    struct RedisModulePoolAllocBlock *next; /* 链表中下一个块 */
+    char memory[];   /* 柔性数组，实际内存从此处开始 */
 } RedisModulePoolAllocBlock;
 
-/* This structure represents the context in which Redis modules operate.
- * Most APIs module can access, get a pointer to the context, so that the API
- * implementation can hold state across calls, or remember what to free after
- * the call and so forth.
+/* RedisModuleCtx: 模块操作的上下文结构体。
+ * 大多数模块 API 都需要传入上下文指针，以便 API 实现
+ * 在多次调用之间保持状态，或记住回调返回后需要释放的资源。
  *
- * Note that not all the context structure is always filled with actual values
- * but only the fields needed in a given context. */
+ * 注意：并非所有字段在每次调用中都会被填充，
+ * 只有在特定上下文中需要的字段才会被设置。 */
 
 struct RedisModuleBlockedClient;
 struct RedisModuleUser;
 
 struct RedisModuleCtx {
-    void *getapifuncptr;            /* NOTE: Must be the first field. */
-    struct RedisModule *module;     /* Module reference. */
-    client *client;                 /* Client calling a command. */
-    struct RedisModuleBlockedClient *blocked_client; /* Blocked client for
-                                                        thread safe context. */
-    struct AutoMemEntry *amqueue;   /* Auto memory queue of objects to free. */
-    int amqueue_len;                /* Number of slots in amqueue. */
-    int amqueue_used;               /* Number of used slots in amqueue. */
-    int flags;                      /* REDISMODULE_CTX_... flags. */
-    void **postponed_arrays;        /* To set with RM_ReplySetArrayLength(). */
-    int postponed_arrays_count;     /* Number of entries in postponed_arrays. */
-    void *blocked_privdata;         /* Privdata set when unblocking a client. */
-    RedisModuleString *blocked_ready_key; /* Key ready when the reply callback
-                                             gets called for clients blocked
-                                             on keys. */
+    void *getapifuncptr;            /* 注意：必须是第一个字段，
+                                       用于模块获取 API 函数指针。 */
+    struct RedisModule *module;     /* 所属模块的引用。 */
+    client *client;                 /* 发起命令调用的客户端。 */
+    struct RedisModuleBlockedClient *blocked_client; /* 线程安全上下文中
+                                                        使用的阻塞客户端。 */
+    struct AutoMemEntry *amqueue;   /* 自动内存队列，存放需要释放的对象。 */
+    int amqueue_len;                /* amqueue 数组的总槽位数。 */
+    int amqueue_used;               /* amqueue 中已使用的槽位数。 */
+    int flags;                      /* REDISMODULE_CTX_... 标志位。 */
+    void **postponed_arrays;        /* 延迟数组，配合
+                                       RM_ReplySetArrayLength() 使用。 */
+    int postponed_arrays_count;     /* postponed_arrays 中的条目数。 */
+    void *blocked_privdata;         /* 解除阻塞时设置的私有数据。 */
+    RedisModuleString *blocked_ready_key; /* 当按键阻塞的客户端被解除阻塞
+                                             且回调被调用时，就绪的键名。 */
 
-    /* Used if there is the REDISMODULE_CTX_KEYS_POS_REQUEST or 
-     * REDISMODULE_CTX_CHANNEL_POS_REQUEST flag set. */
+    /* 当设置了 REDISMODULE_CTX_KEYS_POS_REQUEST 或
+     * REDISMODULE_CTX_CHANNEL_POS_REQUEST 标志时使用。 */
     getKeysResult *keys_result;
 
-    struct RedisModulePoolAllocBlock *pa_head;
-    long long next_yield_time;
+    struct RedisModulePoolAllocBlock *pa_head; /* 池分配器链表头。 */
+    long long next_yield_time;      /* 下一次让出执行的时间点(微秒)。 */
 
-    const struct RedisModuleUser *user;  /* RedisModuleUser commands executed via
-                                            RM_Call should be executed as, if set */
+    const struct RedisModuleUser *user; /* 通过 RM_Call 执行命令时所使用的
+                                           RedisModuleUser，如果已设置的话。 */
 };
 typedef struct RedisModuleCtx RedisModuleCtx;
 
-#define REDISMODULE_CTX_NONE (0)
-#define REDISMODULE_CTX_AUTO_MEMORY (1<<0)
-#define REDISMODULE_CTX_KEYS_POS_REQUEST (1<<1)
-#define REDISMODULE_CTX_BLOCKED_REPLY (1<<2)
-#define REDISMODULE_CTX_BLOCKED_TIMEOUT (1<<3)
-#define REDISMODULE_CTX_THREAD_SAFE (1<<4)
-#define REDISMODULE_CTX_BLOCKED_DISCONNECTED (1<<5)
-#define REDISMODULE_CTX_TEMP_CLIENT (1<<6) /* Return client object to the pool
-                                              when the context is destroyed */
-#define REDISMODULE_CTX_NEW_CLIENT (1<<7)  /* Free client object when the
-                                              context is destroyed */
-#define REDISMODULE_CTX_CHANNELS_POS_REQUEST (1<<8)
-#define REDISMODULE_CTX_COMMAND (1<<9) /* Context created to serve a command from call() or AOF (which calls cmd->proc directly) */
+/* RedisModuleCtx 标志位，用于标识上下文的用途和行为。 */
+#define REDISMODULE_CTX_NONE (0)               /* 无特殊标志 */
+#define REDISMODULE_CTX_AUTO_MEMORY (1<<0)     /* 启用自动内存管理 */
+#define REDISMODULE_CTX_KEYS_POS_REQUEST (1<<1) /* 获取键位置的特殊调用 */
+#define REDISMODULE_CTX_BLOCKED_REPLY (1<<2)   /* 阻塞客户端的回复回调 */
+#define REDISMODULE_CTX_BLOCKED_TIMEOUT (1<<3) /* 阻塞客户端的超时回调 */
+#define REDISMODULE_CTX_THREAD_SAFE (1<<4)     /* 线程安全上下文 */
+#define REDISMODULE_CTX_BLOCKED_DISCONNECTED (1<<5) /* 阻塞客户端断开连接 */
+#define REDISMODULE_CTX_TEMP_CLIENT (1<<6)     /* 上下文销毁时将客户端对象
+                                                  归还到临时客户端池 */
+#define REDISMODULE_CTX_NEW_CLIENT (1<<7)      /* 上下文销毁时释放客户端对象 */
+#define REDISMODULE_CTX_CHANNELS_POS_REQUEST (1<<8) /* 获取频道位置的特殊调用 */
+#define REDISMODULE_CTX_COMMAND (1<<9)         /* 由 call() 或 AOF 加载直接
+                                                  调用 cmd->proc 时创建的上下文 */
 
 
-/* This represents a Redis key opened with RM_OpenKey(). */
+/* RedisModuleKey: 通过 RM_OpenKey() 打开的 Redis 键的
+ * 表示结构体。封装了键名、所属数据库、值对象以及类型相关
+ * 的迭代器等信息，供模块 API 操作该键。 */
 struct RedisModuleKey {
-    RedisModuleCtx *ctx;
-    redisDb *db;
-    robj *key;      /* Key name object. */
-    robj *value;    /* Value object, or NULL if the key was not found. */
-    void *iter;     /* Iterator. */
-    int mode;       /* Opening mode. */
+    RedisModuleCtx *ctx;   /* 所属的模块上下文 */
+    redisDb *db;           /* 键所在的数据库 */
+    robj *key;             /* 键名对象 */
+    robj *value;           /* 值对象，键不存在时为 NULL */
+    void *iter;            /* 迭代器，用于遍历集合类型 */
+    int mode;              /* 打开模式（读/写） */
 
     union {
         struct {
@@ -200,272 +204,293 @@ struct RedisModuleKey {
     } u;
 };
 
-/* RedisModuleKey 'ztype' values. */
-#define REDISMODULE_ZSET_RANGE_NONE 0       /* This must always be 0. */
-#define REDISMODULE_ZSET_RANGE_LEX 1
-#define REDISMODULE_ZSET_RANGE_SCORE 2
-#define REDISMODULE_ZSET_RANGE_POS 3
+/* RedisModuleKey 中 zset 迭代器的范围类型。 */
+#define REDISMODULE_ZSET_RANGE_NONE 0       /* 无范围（必须始终为 0）。 */
+#define REDISMODULE_ZSET_RANGE_LEX 1        /* 按字典序范围遍历 */
+#define REDISMODULE_ZSET_RANGE_SCORE 2      /* 按分值范围遍历 */
+#define REDISMODULE_ZSET_RANGE_POS 3        /* 按位置范围遍历 */
 
-/* Function pointer type of a function representing a command inside
- * a Redis module. */
+/* 模块命令和回调的函数指针类型定义。 */
 struct RedisModuleBlockedClient;
+/* RedisModuleCmdFunc: 模块命令处理函数的签名。 */
 typedef int (*RedisModuleCmdFunc) (RedisModuleCtx *ctx, void **argv, int argc);
+/* RedisModuleAuthCallback: 模块认证回调函数的签名。 */
 typedef int (*RedisModuleAuthCallback)(RedisModuleCtx *ctx, void *username, void *password, RedisModuleString **err);
+/* RedisModuleDisconnectFunc: 客户端断开连接回调的签名。 */
 typedef void (*RedisModuleDisconnectFunc) (RedisModuleCtx *ctx, struct RedisModuleBlockedClient *bc);
 
-/* This struct holds the information about a command registered by a module.*/
+/* RedisModuleCommand: 模块注册的命令信息结构体。
+ * 作为模块命令处理函数与 Redis 命令系统之间的桥梁。 */
 struct RedisModuleCommand {
-    struct RedisModule *module;
-    RedisModuleCmdFunc func;
-    struct redisCommand *rediscmd;
+    struct RedisModule *module;    /* 注册此命令的模块 */
+    RedisModuleCmdFunc func;       /* 命令处理函数指针 */
+    struct redisCommand *rediscmd; /* 对应的 Redis 命令结构体 */
 };
 typedef struct RedisModuleCommand RedisModuleCommand;
 
-#define REDISMODULE_REPLYFLAG_NONE 0
-#define REDISMODULE_REPLYFLAG_TOPARSE (1<<0) /* Protocol must be parsed. */
-#define REDISMODULE_REPLYFLAG_NESTED (1<<1)  /* Nested reply object. No proto
-                                                or struct free. */
+/* 回复对象的标志位。 */
+#define REDISMODULE_REPLYFLAG_NONE 0          /* 无标志 */
+#define REDISMODULE_REPLYFLAG_TOPARSE (1<<0)  /* 协议数据需要解析。 */
+#define REDISMODULE_REPLYFLAG_NESTED (1<<1)   /* 嵌套回复对象，不需要
+                                                 释放协议数据或结构体。 */
 
-/* Reply of RM_Call() function. The function is filled in a lazy
- * way depending on the function called on the reply structure. By default
- * only the type, proto and protolen are filled. */
+/* RM_Call() 函数的返回类型。回复数据按需懒加载填充，
+ * 根据调用的回复访问函数来决定填充哪些字段。
+ * 默认只填充 type、proto 和 protolen。 */
 typedef struct CallReply RedisModuleCallReply;
 
-/* Structure to hold the module auth callback & the Module implementing it. */
+/* RedisModuleAuthCtx: 持有模块认证回调及其所属模块的结构体。 */
 typedef struct RedisModuleAuthCtx {
-    struct RedisModule *module;
-    RedisModuleAuthCallback auth_cb;
+    struct RedisModule *module;          /* 实现认证回调的模块 */
+    RedisModuleAuthCallback auth_cb;     /* 认证回调函数 */
 } RedisModuleAuthCtx;
 
-/* Structure representing a blocked client. We get a pointer to such
- * an object when blocking from modules. */
+/* RedisModuleBlockedClient: 阻塞客户端的表示结构体。
+ * 当模块通过 RM_BlockClient 阻塞一个客户端时，
+ * 会创建此结构体来跟踪阻塞状态和相关回调。 */
 typedef struct RedisModuleBlockedClient {
-    client *client;  /* Pointer to the blocked client. or NULL if the client
-                        was destroyed during the life of this object. */
-    RedisModule *module;    /* Module blocking the client. */
-    RedisModuleCmdFunc reply_callback; /* Reply callback on normal completion.*/
-    RedisModuleAuthCallback auth_reply_cb; /* Reply callback on completing blocking
-                                                    module authentication. */
-    RedisModuleCmdFunc timeout_callback; /* Reply callback on timeout. */
-    RedisModuleDisconnectFunc disconnect_callback; /* Called on disconnection.*/
-    void (*free_privdata)(RedisModuleCtx*,void*);/* privdata cleanup callback.*/
-    void *privdata;     /* Module private data that may be used by the reply
-                           or timeout callback. It is set via the
-                           RedisModule_UnblockClient() API. */
-    client *thread_safe_ctx_client; /* Fake client to be used for thread safe
-                                       context so that no lock is required. */
-    client *reply_client;           /* Fake client used to accumulate replies
-                                       in thread safe contexts. */
-    int dbid;           /* Database number selected by the original client. */
-    int blocked_on_keys;    /* If blocked via RM_BlockClientOnKeys(). */
-    int unblocked;          /* Already on the moduleUnblocked list. */
-    monotime background_timer; /* Timer tracking the start of background work */
-    uint64_t background_duration; /* Current command background time duration.
-                                     Used for measuring latency of blocking cmds */
-    int blocked_on_keys_explicit_unblock; /* Set to 1 only in the case of an explicit RM_Unblock on
-                                           * a client that is blocked on keys. In this case we will
-                                           * call the timeout call back from within
-                                           * moduleHandleBlockedClients which runs from the main thread */
+    client *client;  /* 被阻塞的客户端指针。如果客户端在此对象
+                        生命周期内被销毁，则为 NULL。 */
+    RedisModule *module;    /* 阻塞客户端的模块。 */
+    RedisModuleCmdFunc reply_callback; /* 正常完成时的回复回调。 */
+    RedisModuleAuthCallback auth_reply_cb; /* 完成阻塞式模块认证
+                                              时的回复回调。 */
+    RedisModuleCmdFunc timeout_callback; /* 超时时的回复回调。 */
+    RedisModuleDisconnectFunc disconnect_callback; /* 断开连接时调用。 */
+    void (*free_privdata)(RedisModuleCtx*,void*); /* 私有数据清理回调。 */
+    void *privdata;     /* 模块私有数据，供回复回调或超时回调使用。
+                           通过 RedisModule_UnblockClient() API 设置。 */
+    client *thread_safe_ctx_client; /* 线程安全上下文中使用的伪客户端，
+                                       无需加锁即可操作。 */
+    client *reply_client;           /* 线程安全上下文中用于累积回复的
+                                       伪客户端。 */
+    int dbid;           /* 原始客户端选择的数据库编号。 */
+    int blocked_on_keys;    /* 是否通过 RM_BlockClientOnKeys() 阻塞。 */
+    int unblocked;          /* 是否已在 moduleUnblocked 列表中。 */
+    monotime background_timer; /* 后台工作开始时间的计时器。 */
+    uint64_t background_duration; /* 当前命令的后台执行时长(纳秒)，
+                                     用于测量阻塞命令的延迟。 */
+    int blocked_on_keys_explicit_unblock; /* 仅在对按键阻塞的客户端执行
+                                           * 显式 RM_Unblock 时设为 1。此时
+                                           * 将从主线程的
+                                           * moduleHandleBlockedClients 中
+                                           * 调用超时回调。 */
 } RedisModuleBlockedClient;
 
-/* This is a list of Module Auth Contexts. Each time a Module registers a callback, a new ctx is
- * added to this list. Multiple modules can register auth callbacks and the same Module can have
- * multiple auth callbacks. */
+/* 模块认证回调上下文列表。每当模块注册一个新的认证回调，
+ * 就会向此列表添加一个新的上下文。多个模块可以注册认证
+ * 回调，同一个模块也可以有多个认证回调。 */
 static list *moduleAuthCallbacks;
 
+/* 已解除阻塞的模块客户端列表及其互斥锁。
+ * 当客户端在后台线程中被解除阻塞时，先加入此列表，
+ * 然后在主线程中统一处理。 */
 static pthread_mutex_t moduleUnblockedClientsMutex = PTHREAD_MUTEX_INITIALIZER;
 static list *moduleUnblockedClients;
 
-/* Pool for temporary client objects. Creating and destroying a client object is
- * costly. We manage a pool of clients to avoid this cost. Pool expands when
- * more clients are needed and shrinks when unused. Please see modulesCron()
- * for more details. */
+/* 临时客户端对象池。创建和销毁客户端对象开销较大，
+ * 因此维护一个客户端池来避免频繁的创建/销毁操作。
+ * 池在需要更多客户端时扩展，在空闲时收缩。
+ * 详见 modulesCron() 函数。 */
 static client **moduleTempClients;
-static size_t moduleTempClientCap = 0;
-static size_t moduleTempClientCount = 0;    /* Client count in pool */
-static size_t moduleTempClientMinCount = 0; /* Min client count in pool since
-                                               the last cron. */
+static size_t moduleTempClientCap = 0;        /* 池的当前容量 */
+static size_t moduleTempClientCount = 0;      /* 池中当前客户端数量 */
+static size_t moduleTempClientMinCount = 0;   /* 上次 cron 以来池中的
+                                                 最低客户端数量 */
 
-/* We need a mutex that is unlocked / relocked in beforeSleep() in order to
- * allow thread safe contexts to execute commands at a safe moment. */
+/* 模块全局互斥锁（GIL）。
+ * 在 beforeSleep() 中解锁/重新加锁，以允许线程安全上下文
+ * 在安全时刻执行命令。 */
 static pthread_mutex_t moduleGIL = PTHREAD_MUTEX_INITIALIZER;
 
-/* Function pointer type for keyspace event notification subscriptions from modules. */
+/* 键空间事件通知订阅的回调函数类型。 */
 typedef int (*RedisModuleNotificationFunc) (RedisModuleCtx *ctx, int type, const char *event, RedisModuleString *key);
 
-/* Function pointer type for post jobs */
+/* 通知后置任务的回调函数类型。 */
 typedef void (*RedisModulePostNotificationJobFunc) (RedisModuleCtx *ctx, void *pd);
 
-/* Keyspace notification subscriber information.
- * See RM_SubscribeToKeyspaceEvents() for more information. */
+/* RedisModuleKeyspaceSubscriber: 键空间通知订阅者信息。
+ * 详见 RM_SubscribeToKeyspaceEvents()。 */
 typedef struct RedisModuleKeyspaceSubscriber {
-    /* The module subscribed to the event */
-    RedisModule *module;
-    /* Notification callback in the module*/
-    RedisModuleNotificationFunc notify_callback;
-    /* A bit mask of the events the module is interested in */
-    int event_mask;
-    /* Active flag set on entry, to avoid reentrant subscribers
-     * calling themselves */
-    int active;
+    RedisModule *module;                  /* 订阅事件的模块 */
+    RedisModuleNotificationFunc notify_callback; /* 模块的通知回调函数 */
+    int event_mask;                       /* 模块感兴趣的事件位掩码 */
+    int active;                           /* 活跃标志，防止可重入
+                                             导致回调重复调用 */
 } RedisModuleKeyspaceSubscriber;
 
+/* RedisModulePostExecUnitJob: 键空间通知后的延迟任务。
+ * 在通知回调返回后、执行单元结束前执行。 */
 typedef struct RedisModulePostExecUnitJob {
-    /* The module subscribed to the event */
-    RedisModule *module;
-    RedisModulePostNotificationJobFunc callback;
-    void *pd;
-    void (*free_pd)(void*);
-    int dbid;
+    RedisModule *module;                           /* 所属模块 */
+    RedisModulePostNotificationJobFunc callback;   /* 后置任务回调 */
+    void *pd;                                      /* 回调的私有数据 */
+    void (*free_pd)(void*);                        /* 私有数据释放函数 */
+    int dbid;                                      /* 操作的数据库 ID */
 } RedisModulePostExecUnitJob;
 
-/* The module keyspace notification subscribers list */
+/* 模块键空间通知订阅者列表。 */
 static list *moduleKeyspaceSubscribers;
 
-/* The module post keyspace jobs list */
+/* 模块键空间通知后置任务列表。 */
 static list *modulePostExecUnitJobs;
 
-/* Data structures related to the exported dictionary data structure. */
+/* RedisModuleDict: 模块导出的字典数据结构。
+ * 内部使用基数树（rax）实现，支持前缀匹配和范围查询。 */
 typedef struct RedisModuleDict {
-    rax *rax;                       /* The radix tree. */
+    rax *rax;                       /* 底层基数树。 */
 } RedisModuleDict;
 
+/* RedisModuleDictIter: 模块字典的迭代器。 */
 typedef struct RedisModuleDictIter {
-    RedisModuleDict *dict;
-    raxIterator ri;
+    RedisModuleDict *dict;  /* 被迭代的字典 */
+    raxIterator ri;         /* 基数树迭代器 */
 } RedisModuleDictIter;
 
+/* RedisModuleCommandFilterCtx: 命令过滤器上下文。
+ * 过滤器可以修改命令的参数数组（argv）。 */
 typedef struct RedisModuleCommandFilterCtx {
-    RedisModuleString **argv;
-    int argv_len;
-    int argc;
-    client *c;
+    RedisModuleString **argv;  /* 命令参数数组 */
+    int argv_len;              /* 参数数组容量 */
+    int argc;                  /* 参数个数 */
+    client *c;                 /* 发起命令的客户端 */
 } RedisModuleCommandFilterCtx;
 
+/* 模块命令过滤器的回调函数类型。 */
 typedef void (*RedisModuleCommandFilterFunc) (RedisModuleCommandFilterCtx *filter);
 
+/* RedisModuleCommandFilter: 注册的命令过滤器结构体。 */
 typedef struct RedisModuleCommandFilter {
-    /* The module that registered the filter */
-    RedisModule *module;
-    /* Filter callback function */
-    RedisModuleCommandFilterFunc callback;
-    /* REDISMODULE_CMDFILTER_* flags */
-    int flags;
+    RedisModule *module;                 /* 注册过滤器的模块 */
+    RedisModuleCommandFilterFunc callback; /* 过滤器回调函数 */
+    int flags;                           /* REDISMODULE_CMDFILTER_* 标志 */
 } RedisModuleCommandFilter;
 
-/* Registered filters */
+/* 已注册的命令过滤器列表。 */
 static list *moduleCommandFilters;
 
+/* 模块 fork 操作完成时的回调函数类型。 */
 typedef void (*RedisModuleForkDoneHandler) (int exitcode, int bysignal, void *user_data);
 
+/* 模块 fork 信息，存储 fork 完成的回调和用户数据。 */
 static struct RedisModuleForkInfo {
-    RedisModuleForkDoneHandler done_handler;
-    void* done_handler_user_data;
+    RedisModuleForkDoneHandler done_handler;      /* 完成回调 */
+    void* done_handler_user_data;                 /* 回调的用户数据 */
 } moduleForkInfo = {0};
 
+/* RedisModuleServerInfoData: 服务器 INFO 数据的解析结果。
+ * 模块可以通过 RM_ServerInfoGetField 等 API 查询各字段。 */
 typedef struct RedisModuleServerInfoData {
-    rax *rax;                       /* parsed info data. */
+    rax *rax;                       /* 已解析的 INFO 数据，
+                                       存储在基数树中。 */
 } RedisModuleServerInfoData;
 
-/* Flags for moduleCreateArgvFromUserFormat(). */
-#define REDISMODULE_ARGV_REPLICATE (1<<0)
-#define REDISMODULE_ARGV_NO_AOF (1<<1)
-#define REDISMODULE_ARGV_NO_REPLICAS (1<<2)
-#define REDISMODULE_ARGV_RESP_3 (1<<3)
-#define REDISMODULE_ARGV_RESP_AUTO (1<<4)
-#define REDISMODULE_ARGV_RUN_AS_USER (1<<5)
-#define REDISMODULE_ARGV_SCRIPT_MODE (1<<6)
-#define REDISMODULE_ARGV_NO_WRITES (1<<7)
-#define REDISMODULE_ARGV_CALL_REPLIES_AS_ERRORS (1<<8)
-#define REDISMODULE_ARGV_RESPECT_DENY_OOM (1<<9)
-#define REDISMODULE_ARGV_DRY_RUN (1<<10)
-#define REDISMODULE_ARGV_ALLOW_BLOCK (1<<11)
+/* moduleCreateArgvFromUserFormat() 的标志位。
+ * 这些标志控制 RM_Call 的行为。 */
+#define REDISMODULE_ARGV_REPLICATE (1<<0)       /* 将命令复制到副本和AOF */
+#define REDISMODULE_ARGV_NO_AOF (1<<1)          /* 不写入AOF，仅发给副本 */
+#define REDISMODULE_ARGV_NO_REPLICAS (1<<2)     /* 不发给副本，仅写入AOF */
+#define REDISMODULE_ARGV_RESP_3 (1<<3)          /* 返回 RESP3 格式回复 */
+#define REDISMODULE_ARGV_RESP_AUTO (1<<4)       /* 自动匹配客户端的协议版本 */
+#define REDISMODULE_ARGV_RUN_AS_USER (1<<5)     /* 以当前上下文用户身份执行 */
+#define REDISMODULE_ARGV_SCRIPT_MODE (1<<6)     /* 脚本模式执行 */
+#define REDISMODULE_ARGV_NO_WRITES (1<<7)       /* 禁止执行写命令 */
+#define REDISMODULE_ARGV_CALL_REPLIES_AS_ERRORS (1<<8) /* 错误以 CallReply
+                                                          形式返回 */
+#define REDISMODULE_ARGV_RESPECT_DENY_OOM (1<<9) /* 内存不足时拒绝执行 */
+#define REDISMODULE_ARGV_DRY_RUN (1<<10)        /* 试运行模式，不实际执行 */
+#define REDISMODULE_ARGV_ALLOW_BLOCK (1<<11)    /* 允许执行阻塞命令 */
 
-/* Determine whether Redis should signalModifiedKey implicitly.
- * In case 'ctx' has no 'module' member (and therefore no module->options),
- * we assume default behavior, that is, Redis signals.
- * (see RM_GetThreadSafeContext) */
+/* 判断是否需要隐式调用 signalModifiedKey。
+ * 如果 ctx 没有 module 成员（因此没有 module->options），
+ * 则采用默认行为，即触发信号。
+ * 参见 RM_GetThreadSafeContext */
 #define SHOULD_SIGNAL_MODIFIED_KEYS(ctx) \
     ((ctx)->module? !((ctx)->module->options & REDISMODULE_OPTION_NO_IMPLICIT_SIGNAL_MODIFIED) : 1)
 
-/* Server events hooks data structures and defines: this modules API
- * allow modules to subscribe to certain events in Redis, such as
- * the start and end of an RDB or AOF save, the change of role in replication,
- * and similar other events. */
+/* 服务器事件钩子的数据结构和定义：此模块 API 允许模块
+ * 订阅 Redis 中的特定事件，如 RDB/AOF 保存的开始和结束、
+ * 复制角色的变更等类似事件。 */
 
+/* RedisModuleEventListener: 服务器事件监听器结构体。 */
 typedef struct RedisModuleEventListener {
-    RedisModule *module;
-    RedisModuleEvent event;
-    RedisModuleEventCallback callback;
+    RedisModule *module;             /* 注册监听器的模块 */
+    RedisModuleEvent event;          /* 监听的事件类型 */
+    RedisModuleEventCallback callback; /* 事件回调函数 */
 } RedisModuleEventListener;
 
-list *RedisModule_EventListeners; /* Global list of all the active events. */
+list *RedisModule_EventListeners; /* 全局活跃事件监听器列表。 */
 
-/* Data structures related to the redis module users */
+/* Redis 模块用户相关的数据结构。 */
 
-/* This is the object returned by RM_CreateModuleUser(). The module API is
- * able to create users, set ACLs to such users, and later authenticate
- * clients using such newly created users. */
+/* RedisModuleUser: RM_CreateModuleUser() 返回的用户对象。
+ * 模块 API 可以创建用户、为用户设置 ACL 规则，
+ * 然后使用这些新创建的用户对客户端进行认证。 */
 typedef struct RedisModuleUser {
-    user *user; /* Reference to the real redis user */
-    int free_user; /* Indicates that user should also be freed when this object is freed */
+    user *user;      /* 对实际 Redis 用户的引用 */
+    int free_user;   /* 指示释放此对象时是否同时释放底层用户 */
 } RedisModuleUser;
 
-/* This is a structure used to export some meta-information such as dbid to the module. */
+/* RedisModuleKeyOptCtx: 向模块导出元信息（如数据库 ID）的结构体。 */
 typedef struct RedisModuleKeyOptCtx {
-    struct redisObject *from_key, *to_key; /* Optional name of key processed, NULL when unknown. 
-                                              In most cases, only 'from_key' is valid, but in callbacks 
-                                              such as `copy2`, both 'from_key' and 'to_key' are valid. */
-    int from_dbid, to_dbid;                /* The dbid of the key being processed, -1 when unknown.
-                                              In most cases, only 'from_dbid' is valid, but in callbacks such 
-                                              as `copy2`, 'from_dbid' and 'to_dbid' are both valid. */
+    struct redisObject *from_key, *to_key; /* 处理的键名（可选），未知时为
+                                              NULL。大多数情况下只有 from_key
+                                              有效，但在 copy2 等回调中，
+                                              from_key 和 to_key 都有效。 */
+    int from_dbid, to_dbid;                /* 正在处理的键所在的数据库 ID，
+                                              未知时为 -1。大多数情况下只有
+                                              from_dbid 有效，但在 copy2 等
+                                              回调中两者都有效。 */
 } RedisModuleKeyOptCtx;
 
-/* Data structures related to redis module configurations */
-/* The function signatures for module config get callbacks. These are identical to the ones exposed in redismodule.h. */
+/* 模块配置相关的数据结构。 */
+/* 模块配置 get 回调的函数签名，与 redismodule.h 中暴露的一致。 */
 typedef RedisModuleString * (*RedisModuleConfigGetStringFunc)(const char *name, void *privdata);
 typedef long long (*RedisModuleConfigGetNumericFunc)(const char *name, void *privdata);
 typedef int (*RedisModuleConfigGetBoolFunc)(const char *name, void *privdata);
 typedef int (*RedisModuleConfigGetEnumFunc)(const char *name, void *privdata);
-/* The function signatures for module config set callbacks. These are identical to the ones exposed in redismodule.h. */
+/* 模块配置 set 回调的函数签名，与 redismodule.h 中暴露的一致。 */
 typedef int (*RedisModuleConfigSetStringFunc)(const char *name, RedisModuleString *val, void *privdata, RedisModuleString **err);
 typedef int (*RedisModuleConfigSetNumericFunc)(const char *name, long long val, void *privdata, RedisModuleString **err);
 typedef int (*RedisModuleConfigSetBoolFunc)(const char *name, int val, void *privdata, RedisModuleString **err);
 typedef int (*RedisModuleConfigSetEnumFunc)(const char *name, int val, void *privdata, RedisModuleString **err);
-/* Apply signature, identical to redismodule.h */
+/* 配置应用回调的函数签名，与 redismodule.h 一致。 */
 typedef int (*RedisModuleConfigApplyFunc)(RedisModuleCtx *ctx, void *privdata, RedisModuleString **err);
 
-/* Struct representing a module config. These are stored in a list in the module struct */
+/* ModuleConfig: 模块配置结构体。存储在模块结构体的列表中。 */
 struct ModuleConfig {
-    sds name; /* Name of config without the module name appended to the front */
-    void *privdata; /* Optional data passed into the module config callbacks */
-    union get_fn { /* The get callback specified by the module */
+    sds name;     /* 配置名称（不含模块名前缀） */
+    void *privdata; /* 传入模块配置回调的可选数据 */
+    union get_fn { /* 模块指定的 get 回调 */
         RedisModuleConfigGetStringFunc get_string;
         RedisModuleConfigGetNumericFunc get_numeric;
         RedisModuleConfigGetBoolFunc get_bool;
         RedisModuleConfigGetEnumFunc get_enum;
     } get_fn;
-    union set_fn { /* The set callback specified by the module */
+    union set_fn { /* 模块指定的 set 回调 */
         RedisModuleConfigSetStringFunc set_string;
         RedisModuleConfigSetNumericFunc set_numeric;
         RedisModuleConfigSetBoolFunc set_bool;
         RedisModuleConfigSetEnumFunc set_enum;
     } set_fn;
-    RedisModuleConfigApplyFunc apply_fn;
-    RedisModule *module;
+    RedisModuleConfigApplyFunc apply_fn; /* 配置应用回调 */
+    RedisModule *module;                 /* 所属模块 */
 };
 
+/* RedisModuleAsyncRMCallPromise: 异步 RM_Call 的 Promise 对象。
+ * 当 RM_Call 使用 'K' 标志调用阻塞命令时返回此对象，
+ * 用于跟踪异步命令的执行状态和结果。 */
 typedef struct RedisModuleAsyncRMCallPromise{
-    size_t ref_count;
-    void *private_data;
-    RedisModule *module;
-    RedisModuleOnUnblocked on_unblocked;
-    client *c;
-    RedisModuleCtx *ctx;
+    size_t ref_count;                    /* 引用计数 */
+    void *private_data;                  /* 模块私有数据 */
+    RedisModule *module;                 /* 所属模块 */
+    RedisModuleOnUnblocked on_unblocked; /* 解除阻塞时的回调 */
+    client *c;                           /* 执行命令的客户端 */
+    RedisModuleCtx *ctx;                 /* 模块上下文 */
 } RedisModuleAsyncRMCallPromise;
 
 /* --------------------------------------------------------------------------
- * Prototypes
+ * 前向声明（Prototypes）
  * -------------------------------------------------------------------------- */
 
 void RM_FreeCallReply(RedisModuleCallReply *reply);
@@ -493,17 +518,16 @@ void moduleCreateContext(RedisModuleCtx *out_ctx, RedisModule *module, int ctx_f
 int moduleVerifyResourceName(const char *name);
 
 /* --------------------------------------------------------------------------
- * ## Heap allocation raw functions
+ * ## 堆内存分配函数
  *
- * Memory allocated with these functions are taken into account by Redis key
- * eviction algorithms and are reported in Redis memory usage information.
+ * 使用这些函数分配的内存会被纳入 Redis 键淘汰算法的考量，
+ * 并在 Redis 内存使用信息中报告。
  * -------------------------------------------------------------------------- */
 
-/* Use like malloc(). Memory allocated with this function is reported in
- * Redis INFO memory, used for keys eviction according to maxmemory settings
- * and in general is taken into account as memory allocated by Redis.
- * You should avoid using malloc().
- * This function panics if unable to allocate enough memory. */
+/* RM_Alloc: 类似于 malloc()。使用此函数分配的会计入 Redis
+ * INFO memory 的统计，参与基于 maxmemory 的键淘汰，
+ * 总体上被视为 Redis 分配的内存。应避免使用 malloc()。
+ * 内存不足时会 panic。 */
 void *RM_Alloc(size_t bytes) {
     /* Use 'zmalloc_usable()' instead of 'zmalloc()' to allow the compiler
      * to recognize the additional memory size, which means that modules can
@@ -515,54 +539,52 @@ void *RM_Alloc(size_t bytes) {
     return zmalloc_usable(bytes,NULL);
 }
 
-/* Similar to RM_Alloc, but returns NULL in case of allocation failure, instead
- * of panicking. */
+/* RM_TryAlloc: 类似于 RM_Alloc，但分配失败时返回 NULL
+ * 而不是 panic。 */
 void *RM_TryAlloc(size_t bytes) {
     return ztrymalloc_usable(bytes,NULL);
 }
 
-/* Use like calloc(). Memory allocated with this function is reported in
- * Redis INFO memory, used for keys eviction according to maxmemory settings
- * and in general is taken into account as memory allocated by Redis.
- * You should avoid using calloc() directly. */
+/* RM_Calloc: 类似于 calloc()。内存分配计入 Redis 统计。
+ * 应避免直接使用 calloc()。 */
 void *RM_Calloc(size_t nmemb, size_t size) {
     return zcalloc_usable(nmemb*size,NULL);
 }
 
-/* Similar to RM_Calloc, but returns NULL in case of allocation failure, instead
- * of panicking. */
+/* RM_TryCalloc: 类似于 RM_Calloc，分配失败时返回 NULL。 */
 void *RM_TryCalloc(size_t nmemb, size_t size) {
     return ztrycalloc_usable(nmemb*size,NULL);
 }
 
-/* Use like realloc() for memory obtained with RedisModule_Alloc(). */
+/* RM_Realloc: 类似于 realloc()，用于重新分配通过
+ * RedisModule_Alloc() 获得的内存。 */
 void* RM_Realloc(void *ptr, size_t bytes) {
     return zrealloc_usable(ptr,bytes,NULL);
 }
 
-/* Similar to RM_Realloc, but returns NULL in case of allocation failure,
- * instead of panicking. */
+/* RM_TryRealloc: 类似于 RM_Realloc，分配失败时返回 NULL。 */
 void *RM_TryRealloc(void *ptr, size_t bytes) {
     return ztryrealloc_usable(ptr,bytes,NULL);
 }
 
-/* Use like free() for memory obtained by RedisModule_Alloc() and
- * RedisModule_Realloc(). However you should never try to free with
- * RedisModule_Free() memory allocated with malloc() inside your module. */
+/* RM_Free: 类似于 free()，用于释放通过 RedisModule_Alloc()
+ * 和 RedisModule_Realloc() 获得的内存。注意：绝不要用
+ * RedisModule_Free() 去释放模块中用 malloc() 分配的内存。 */
 void RM_Free(void *ptr) {
     zfree(ptr);
 }
 
-/* Like strdup() but returns memory allocated with RedisModule_Alloc(). */
+/* RM_Strdup: 类似于 strdup()，但使用 RedisModule_Alloc()
+ * 分配内存。 */
 char *RM_Strdup(const char *str) {
     return zstrdup(str);
 }
 
 /* --------------------------------------------------------------------------
- * Pool allocator
+ * 池分配器
  * -------------------------------------------------------------------------- */
 
-/* Release the chain of blocks used for pool allocations. */
+/* poolAllocRelease: 释放池分配器使用的内存块链表。 */
 void poolAllocRelease(RedisModuleCtx *ctx) {
     RedisModulePoolAllocBlock *head = ctx->pa_head, *next;
 
@@ -574,18 +596,16 @@ void poolAllocRelease(RedisModuleCtx *ctx) {
     ctx->pa_head = NULL;
 }
 
-/* Return heap allocated memory that will be freed automatically when the
- * module callback function returns. Mostly suitable for small allocations
- * that are short living and must be released when the callback returns
- * anyway. The returned memory is aligned to the architecture word size
- * if at least word size bytes are requested, otherwise it is just
- * aligned to the next power of two, so for example a 3 bytes request is
- * 4 bytes aligned while a 2 bytes request is 2 bytes aligned.
+/* RM_PoolAlloc: 返回堆分配的内存，当模块回调函数返回时自动释放。
+ * 适用于短期的、回调返回后必须释放的小块分配。
+ * 返回的内存按架构字大小对齐（请求至少一个字大小时），
+ * 否则按下一个 2 的幂对齐。例如 3 字节请求按 4 字节对齐，
+ * 2 字节请求按 2 字节对齐。
  *
- * There is no realloc style function since when this is needed to use the
- * pool allocator is not a good idea.
+ * 没有 realloc 风格的函数，因为需要 realloc 时
+ * 使用池分配器并不合适。
  *
- * The function returns NULL if `bytes` is 0. */
+ * 当 bytes 为 0 时返回 NULL。 */
 void *RM_PoolAlloc(RedisModuleCtx *ctx, size_t bytes) {
     if (bytes == 0) return NULL;
     RedisModulePoolAllocBlock *b = ctx->pa_head;
@@ -617,9 +637,11 @@ void *RM_PoolAlloc(RedisModuleCtx *ctx, size_t bytes) {
 }
 
 /* --------------------------------------------------------------------------
- * Helpers for modules API implementation
+ * 模块 API 实现的辅助函数
  * -------------------------------------------------------------------------- */
 
+/* moduleAllocTempClient: 从临时客户端池中分配一个客户端。
+ * 池为空时创建新的客户端对象。 */
 client *moduleAllocTempClient(void) {
     client *c = NULL;
 
@@ -645,6 +667,8 @@ static void freeRedisModuleAsyncRMCallPromise(RedisModuleAsyncRMCallPromise *pro
     zfree(promise);
 }
 
+/* moduleReleaseTempClient: 将临时客户端归还到池中。
+ * 清理客户端状态以便复用。 */
 void moduleReleaseTempClient(client *c) {
     if (moduleTempClientCount == moduleTempClientCap) {
         moduleTempClientCap = moduleTempClientCap ? moduleTempClientCap*2 : 32;
@@ -668,17 +692,16 @@ void moduleReleaseTempClient(client *c) {
     moduleTempClients[moduleTempClientCount++] = c;
 }
 
-/* Create an empty key of the specified type. `key` must point to a key object
- * opened for writing where the `.value` member is set to NULL because the
- * key was found to be non existing.
+/* moduleCreateEmptyKey: 创建指定类型的空键。
+ * key 必须指向一个以写模式打开的键对象，且 .value 为 NULL
+ * （因为键不存在）。
  *
- * On success REDISMODULE_OK is returned and the key is populated with
- * the value of the specified type. The function fails and returns
- * REDISMODULE_ERR if:
+ * 成功时返回 REDISMODULE_OK 并用指定类型的值填充键。
+ * 以下情况返回 REDISMODULE_ERR：
  *
- * 1. The key is not open for writing.
- * 2. The key is not empty.
- * 3. The specified type is unknown.
+ * 1. 键未以写模式打开。
+ * 2. 键不为空（已存在）。
+ * 3. 指定的类型未知。
  */
 int moduleCreateEmptyKey(RedisModuleKey *key, int type) {
     robj *obj;
@@ -708,7 +731,7 @@ int moduleCreateEmptyKey(RedisModuleKey *key, int type) {
     return REDISMODULE_OK;
 }
 
-/* Frees key->iter and sets it to NULL. */
+/* moduleFreeKeyIterator: 释放键的迭代器并将其设为 NULL。 */
 static void moduleFreeKeyIterator(RedisModuleKey *key) {
     serverAssert(key->iter != NULL);
     switch (key->value->type) {
@@ -722,24 +745,21 @@ static void moduleFreeKeyIterator(RedisModuleKey *key) {
     key->iter = NULL;
 }
 
-/* Callback for listTypeTryConversion().
- * Frees list iterator and sets it to NULL. */
+/* moduleFreeListIterator: listTypeTryConversion() 的回调函数。
+ * 释放列表迭代器并将其设为 NULL。 */
 static void moduleFreeListIterator(void *data) {
     RedisModuleKey *key = (RedisModuleKey*)data;
     serverAssert(key->value->type == OBJ_LIST);
     if (key->iter) moduleFreeKeyIterator(key);
 }
 
-/* This function is called in low-level API implementation functions in order
- * to check if the value associated with the key remained empty after an
- * operation that removed elements from an aggregate data type.
+/* moduleDelKeyIfEmpty: 在底层 API 实现函数中调用，用于检查
+ * 从聚合数据类型中移除元素后，键关联的值是否变为空。
  *
- * If this happens, the key is deleted from the DB and the key object state
- * is set to the right one in order to be targeted again by write operations
- * possibly recreating the key if needed.
+ * 如果值为空，则从数据库中删除该键，并将键对象状态重置，
+ * 以便后续写操作可以按需重新创建键。
  *
- * The function returns 1 if the key value object is found empty and is
- * deleted, otherwise 0 is returned. */
+ * 如果键值对象为空且被删除则返回 1，否则返回 0。 */
 int moduleDelKeyIfEmpty(RedisModuleKey *key) {
     if (!(key->mode & REDISMODULE_WRITE) || key->value == NULL) return 0;
     int isempty;
@@ -765,15 +785,17 @@ int moduleDelKeyIfEmpty(RedisModuleKey *key) {
 }
 
 /* --------------------------------------------------------------------------
- * Service API exported to modules
+ * 导出给模块的服务 API
  *
- * Note that all the exported APIs are called RM_<funcname> in the core
- * and RedisModule_<funcname> in the module side (defined as function
- * pointers in redismodule.h). In this way the dynamic linker does not
- * mess with our global function pointers, overriding it with the symbols
- * defined in the main executable having the same names.
+ * 注意：所有导出的 API 在核心中命名为 RM_<funcname>，
+ * 在模块端命名为 RedisModule_<funcname>（在 redismodule.h 中
+ * 定义为函数指针）。这样动态链接器就不会用主可执行文件中
+ * 同名的符号覆盖我们的全局函数指针。
  * -------------------------------------------------------------------------- */
 
+/* RM_GetApi: 根据函数名查找模块 API 并将函数指针存储到目标位置。
+ * 模块开发者不应直接使用此函数，它仅被 redismodule.h 中的
+ * 初始化代码隐式调用。 */
 int RM_GetApi(const char *funcname, void **targetPtrPtr) {
     /* Lookup the requested module API and store the function pointer into the
      * target pointer. The function returns REDISMODULE_ERR if there is no such
@@ -787,6 +809,8 @@ int RM_GetApi(const char *funcname, void **targetPtrPtr) {
     return REDISMODULE_OK;
 }
 
+/* modulePostExecutionUnitOperations: 执行单元结束后的操作。
+ * 处理模块让出（yield）相关的清理工作。 */
 void modulePostExecutionUnitOperations(void) {
     if (server.execution_nesting)
         return;
@@ -800,7 +824,8 @@ void modulePostExecutionUnitOperations(void) {
     }
 }
 
-/* Free the context after the user function was called. */
+/* moduleFreeContext: 在用户函数调用完成后释放上下文。
+ * 包括自动内存回收、池分配器释放、临时客户端归还等清理操作。 */
 void moduleFreeContext(RedisModuleCtx *ctx) {
     /* See comment in moduleCreateContext */
     if (!(ctx->flags & (REDISMODULE_CTX_THREAD_SAFE|REDISMODULE_CTX_COMMAND))) {
@@ -829,6 +854,7 @@ void moduleFreeContext(RedisModuleCtx *ctx) {
         freeClient(ctx->client);
 }
 
+/* moduleParseReply: 将客户端的回复数据解析为 CallReply 对象。 */
 static CallReply *moduleParseReply(client *c, RedisModuleCtx *ctx) {
     /* Convert the result of the Redis command into a module reply. */
     sds proto = sdsnewlen(c->buf,c->bufpos);
@@ -844,6 +870,8 @@ static CallReply *moduleParseReply(client *c, RedisModuleCtx *ctx) {
     return reply;
 }
 
+/* moduleCallCommandUnblockedHandler: 当异步 RM_Call 的阻塞命令
+ * 被解除阻塞时，调用模块注册的 on_unblocked 回调。 */
 void moduleCallCommandUnblockedHandler(client *c) {
     RedisModuleCtx ctx;
     RedisModuleAsyncRMCallPromise *promise = c->bstate.async_rm_call_handle;
@@ -865,12 +893,12 @@ void moduleCallCommandUnblockedHandler(client *c) {
     moduleReleaseTempClient(c);
 }
 
-/* Create a module ctx and keep track of the nesting level.
+/* moduleCreateContext: 创建模块上下文并跟踪嵌套级别。
  *
- * Note: When creating ctx for threads (RM_GetThreadSafeContext and
- * RM_GetDetachedThreadSafeContext) we do not bump up the nesting level
- * because we only need to track of nesting level in the main thread
- * (only the main thread uses propagatePendingCommands) */
+ * 注意：为线程创建上下文（RM_GetThreadSafeContext 和
+ * RM_GetDetachedThreadSafeContext）时不增加嵌套级别，
+ * 因为只需要在主线程中跟踪嵌套级别
+ * （只有主线程使用 propagatePendingCommands）。 */
 void moduleCreateContext(RedisModuleCtx *out_ctx, RedisModule *module, int ctx_flags) {
     memset(out_ctx, 0 ,sizeof(RedisModuleCtx));
     out_ctx->getapifuncptr = (void*)(unsigned long)&RM_GetApi;
@@ -905,8 +933,9 @@ void moduleCreateContext(RedisModuleCtx *out_ctx, RedisModule *module, int ctx_f
     }
 }
 
-/* This Redis command binds the normal Redis command invocation with commands
- * exported by modules. */
+/* RedisModuleCommandDispatcher: Redis 命令分发器。
+ * 将普通的 Redis 命令调用绑定到模块导出的命令处理函数。
+ * 这是所有模块命令的统一入口点。 */
 void RedisModuleCommandDispatcher(client *c) {
     RedisModuleCommand *cp = c->cmd->module_cmd;
     RedisModuleCtx ctx;
@@ -933,15 +962,13 @@ void RedisModuleCommandDispatcher(client *c) {
     }
 }
 
-/* This function returns the list of keys, with the same interface as the
- * 'getkeys' function of the native commands, for module commands that exported
- * the "getkeys-api" flag during the registration. This is done when the
- * list of keys are not at fixed positions, so that first/last/step cannot
- * be used.
+/* moduleGetCommandKeysViaAPI: 返回键列表，接口与原生命令的
+ * 'getkeys' 函数相同。适用于注册时声明了 "getkeys-api" 标志
+ * 的模块命令（当键不在固定位置、无法使用 first/last/step 时）。
  *
- * In order to accomplish its work, the module command is called, flagging
- * the context in a way that the command can recognize this is a special
- * "get keys" call by calling RedisModule_IsKeysPositionRequest(ctx). */
+ * 工作原理：调用模块命令，通过标记上下文让命令能够识别这是
+ * 特殊的"获取键"调用（通过调用
+ * RedisModule_IsKeysPositionRequest(ctx) 来判断）。 */
 int moduleGetCommandKeysViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     RedisModuleCommand *cp = cmd->module_cmd;
     RedisModuleCtx ctx;
@@ -959,9 +986,9 @@ int moduleGetCommandKeysViaAPI(struct redisCommand *cmd, robj **argv, int argc, 
     return result->numkeys;
 }
 
-/* This function returns the list of channels, with the same interface as
- * moduleGetCommandKeysViaAPI, for modules that declare "getchannels-api"
- * during registration. Unlike keys, this is the only way to declare channels. */
+/* moduleGetCommandChannelsViaAPI: 返回频道列表，接口与
+ * moduleGetCommandKeysViaAPI 相同。适用于注册时声明了
+ * "getchannels-api" 的模块。与键不同，这是声明频道的唯一方式。 */
 int moduleGetCommandChannelsViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     RedisModuleCommand *cp = cmd->module_cmd;
     RedisModuleCtx ctx;
@@ -979,39 +1006,39 @@ int moduleGetCommandChannelsViaAPI(struct redisCommand *cmd, robj **argv, int ar
 }
 
 /* --------------------------------------------------------------------------
- * ## Commands API
+ * ## 命令 API
  *
- * These functions are used to implement custom Redis commands.
+ * 这些函数用于实现自定义 Redis 命令。
  *
- * For examples, see https://redis.io/topics/modules-intro.
+ * 示例参见 https://redis.io/topics/modules-intro。
  * -------------------------------------------------------------------------- */
 
-/* Return non-zero if a module command, that was declared with the
- * flag "getkeys-api", is called in a special way to get the keys positions
- * and not to get executed. Otherwise zero is returned. */
+/* RM_IsKeysPositionRequest: 如果声明了 "getkeys-api" 标志的
+ * 模块命令是以特殊方式调用（获取键位置而非实际执行），
+ * 则返回非零值。否则返回零。 */
 int RM_IsKeysPositionRequest(RedisModuleCtx *ctx) {
     return (ctx->flags & REDISMODULE_CTX_KEYS_POS_REQUEST) != 0;
 }
 
-/* When a module command is called in order to obtain the position of
- * keys, since it was flagged as "getkeys-api" during the registration,
- * the command implementation checks for this special call using the
- * RedisModule_IsKeysPositionRequest() API and uses this function in
- * order to report keys.
+/* RM_KeyAtPosWithFlags: 当模块命令被调用以获取键位置时
+ * （注册时标记了 "getkeys-api"），命令实现通过调用
+ * RedisModule_IsKeysPositionRequest() API 检查此特殊调用，
+ * 并使用此函数报告键的位置。
  *
- * The supported flags are the ones used by RM_SetCommandInfo, see REDISMODULE_CMD_KEY_*.
+ * 支持的标志与 RM_SetCommandInfo 中使用的一致，
+ * 参见 REDISMODULE_CMD_KEY_*。
  *
- *
- * The following is an example of how it could be used:
+ * 使用示例：
  *
  *     if (RedisModule_IsKeysPositionRequest(ctx)) {
- *         RedisModule_KeyAtPosWithFlags(ctx, 2, REDISMODULE_CMD_KEY_RO | REDISMODULE_CMD_KEY_ACCESS);
- *         RedisModule_KeyAtPosWithFlags(ctx, 1, REDISMODULE_CMD_KEY_RW | REDISMODULE_CMD_KEY_UPDATE | REDISMODULE_CMD_KEY_ACCESS);
+ *         RedisModule_KeyAtPosWithFlags(ctx, 2,
+ *             REDISMODULE_CMD_KEY_RO | REDISMODULE_CMD_KEY_ACCESS);
+ *         RedisModule_KeyAtPosWithFlags(ctx, 1,
+ *             REDISMODULE_CMD_KEY_RW | REDISMODULE_CMD_KEY_UPDATE);
  *     }
  *
- *  Note: in the example above the get keys API could have been handled by key-specs (preferred).
- *  Implementing the getkeys-api is required only when is it not possible to declare key-specs that cover all keys.
- *
+ *  注意：上述示例中的 get keys API 也可以通过 key-specs 来处理（推荐方式）。
+ *  只有在无法声明覆盖所有键的 key-specs 时，才需要实现 getkeys-api。
  */
 void RM_KeyAtPosWithFlags(RedisModuleCtx *ctx, int pos, int flags) {
     if (!(ctx->flags & REDISMODULE_CTX_KEYS_POS_REQUEST) || !ctx->keys_result) return;
@@ -1030,18 +1057,17 @@ void RM_KeyAtPosWithFlags(RedisModuleCtx *ctx, int pos, int flags) {
     res->numkeys++;
 }
 
-/* This API existed before RM_KeyAtPosWithFlags was added, now deprecated and
- * can be used for compatibility with older versions, before key-specs and flags
- * were introduced. */
+/* RM_KeyAtPos: 此 API 在 RM_KeyAtPosWithFlags 添加之前就已存在，
+ * 现已弃用，仅用于兼容引入 key-specs 和标志之前的旧版本。 */
 void RM_KeyAtPos(RedisModuleCtx *ctx, int pos) {
     /* Default flags require full access */
     int flags = moduleConvertKeySpecsFlags(CMD_KEY_FULL_ACCESS, 0);
     RM_KeyAtPosWithFlags(ctx, pos, flags);
 }
 
-/* Return non-zero if a module command, that was declared with the
- * flag "getchannels-api", is called in a special way to get the channel positions
- * and not to get executed. Otherwise zero is returned. */
+/* RM_IsChannelsPositionRequest: 如果声明了 "getchannels-api" 标志
+ * 的模块命令是以特殊方式调用（获取频道位置而非实际执行），
+ * 则返回非零值。否则返回零。 */
 int RM_IsChannelsPositionRequest(RedisModuleCtx *ctx) {
     return (ctx->flags & REDISMODULE_CTX_CHANNELS_POS_REQUEST) != 0;
 }
@@ -1095,18 +1121,15 @@ void RM_ChannelAtPosWithFlags(RedisModuleCtx *ctx, int pos, int flags) {
     res->numkeys++;
 }
 
-/* Returns 1 if name is valid, otherwise returns 0.
+/* isCommandNameValid: 检查命令名称是否有效。
+ * 有效时返回 1，否则返回 0。
  *
- * We want to block some chars in module command names that we know can
- * mess things up.
- *
- * There are these characters:
- * ' ' (space) - issues with old inline protocol.
- * '\r', '\n' (newline) - can mess up the protocol on acl error replies.
- * '|' - sub-commands.
- * '@' - ACL categories.
- * '=', ',' - info and client list fields (':' handled by getSafeInfoString).
- * */
+ * 需要阻止模块命令名称中包含以下字符：
+ * ' ' (空格) - 与旧的内联协议冲突。
+ * '\r', '\n' (换行) - 在 ACL 错误回复中可能破坏协议。
+ * '|' - 子命令分隔符。
+ * '@' - ACL 类别前缀。
+ * '=', ',' - info 和 client list 字段（':' 由 getSafeInfoString 处理）。 */
 int isCommandNameValid(const char *name) {
     const char *block_chars = " \r\n|@=,";
 
@@ -1115,10 +1138,10 @@ int isCommandNameValid(const char *name) {
     return 1;
 }
 
-/* Helper for RM_CreateCommand(). Turns a string representing command
- * flags into the command flags used by the Redis core.
+/* commandFlagsFromString: RM_CreateCommand() 的辅助函数。
+ * 将表示命令标志的字符串转换为 Redis 核心使用的命令标志位。
  *
- * It returns the set of flags, or -1 if unknown flags are found. */
+ * 返回标志位集合，如果发现未知标志则返回 -1。 */
 int64_t commandFlagsFromString(char *s) {
     int count, j;
     int64_t flags = 0;
@@ -1154,135 +1177,118 @@ int64_t commandFlagsFromString(char *s) {
 
 RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds declared_name, sds fullname, RedisModuleCmdFunc cmdfunc, int64_t flags, int firstkey, int lastkey, int keystep);
 
-/* Register a new command in the Redis server, that will be handled by
- * calling the function pointer 'cmdfunc' using the RedisModule calling
- * convention.
+/* RM_CreateCommand: 在 Redis 服务器中注册一个新命令，该命令将通过
+ * 使用 RedisModule 调用约定的函数指针 'cmdfunc' 来处理。
  *
- * The function returns REDISMODULE_ERR in these cases:
- * - If creation of module command is called outside the RedisModule_OnLoad.
- * - The specified command is already busy.
- * - The command name contains some chars that are not allowed.
- * - A set of invalid flags were passed.
+ * 以下情况返回 REDISMODULE_ERR：
+ * - 在 RedisModule_OnLoad 之外调用此函数。
+ * - 指定的命令名已被占用。
+ * - 命令名称包含不允许的字符。
+ * - 传递了无效的标志集。
  *
- * Otherwise REDISMODULE_OK is returned and the new command is registered.
+ * 否则返回 REDISMODULE_OK 并注册新命令。
  *
- * This function must be called during the initialization of the module
- * inside the RedisModule_OnLoad() function. Calling this function outside
- * of the initialization function is not defined.
+ * 此函数必须在模块初始化函数 RedisModule_OnLoad() 中调用。
+ * 在初始化函数之外调用此函数是未定义行为。
  *
- * The command function type is the following:
+ * 命令函数类型如下：
  *
- *      int MyCommand_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
+ *      int MyCommand_RedisCommand(RedisModuleCtx *ctx,
+ *                                 RedisModuleString **argv, int argc);
  *
- * And is supposed to always return REDISMODULE_OK.
+ * 应始终返回 REDISMODULE_OK。
  *
- * The set of flags 'strflags' specify the behavior of the command, and should
- * be passed as a C string composed of space separated words, like for
- * example "write deny-oom". The set of flags are:
+ * 标志字符串 'strflags' 指定命令的行为，应以空格分隔的单词
+ * 形式传入，例如 "write deny-oom"。可选标志如下：
  *
- * * **"write"**:     The command may modify the data set (it may also read
- *                    from it).
- * * **"readonly"**:  The command returns data from keys but never writes.
- * * **"admin"**:     The command is an administrative command (may change
- *                    replication or perform similar tasks).
- * * **"deny-oom"**:  The command may use additional memory and should be
- *                    denied during out of memory conditions.
- * * **"deny-script"**:   Don't allow this command in Lua scripts.
- * * **"allow-loading"**: Allow this command while the server is loading data.
- *                        Only commands not interacting with the data set
- *                        should be allowed to run in this mode. If not sure
- *                        don't use this flag.
- * * **"pubsub"**:    The command publishes things on Pub/Sub channels.
- * * **"random"**:    The command may have different outputs even starting
- *                    from the same input arguments and key values.
- *                    Starting from Redis 7.0 this flag has been deprecated.
- *                    Declaring a command as "random" can be done using
- *                    command tips, see https://redis.io/topics/command-tips.
- * * **"allow-stale"**: The command is allowed to run on slaves that don't
- *                      serve stale data. Don't use if you don't know what
- *                      this means.
- * * **"no-monitor"**: Don't propagate the command on monitor. Use this if
- *                     the command has sensitive data among the arguments.
- * * **"no-slowlog"**: Don't log this command in the slowlog. Use this if
- *                     the command has sensitive data among the arguments.
- * * **"fast"**:      The command time complexity is not greater
- *                    than O(log(N)) where N is the size of the collection or
- *                    anything else representing the normal scalability
- *                    issue with the command.
- * * **"getkeys-api"**: The command implements the interface to return
- *                      the arguments that are keys. Used when start/stop/step
- *                      is not enough because of the command syntax.
- * * **"no-cluster"**: The command should not register in Redis Cluster
- *                     since is not designed to work with it because, for
- *                     example, is unable to report the position of the
- *                     keys, programmatically creates key names, or any
- *                     other reason.
- * * **"no-auth"**:    This command can be run by an un-authenticated client.
- *                     Normally this is used by a command that is used
- *                     to authenticate a client.
- * * **"may-replicate"**: This command may generate replication traffic, even
- *                        though it's not a write command.
- * * **"no-mandatory-keys"**: All the keys this command may take are optional
- * * **"blocking"**: The command has the potential to block the client.
- * * **"allow-busy"**: Permit the command while the server is blocked either by
- *                     a script or by a slow module command, see
- *                     RM_Yield.
- * * **"getchannels-api"**: The command implements the interface to return
- *                          the arguments that are channels.
+ * * **"write"**:     命令可能修改数据集（也可能读取）。
+ * * **"readonly"**:  命令只从键读取数据，从不写入。
+ * * **"admin"**:     命令是管理命令（可能改变复制状态或执行类似任务）。
+ * * **"deny-oom"**:  命令可能使用额外内存，在内存不足时应被拒绝。
+ * * **"deny-script"**:   不允许在 Lua 脚本中使用此命令。
+ * * **"allow-loading"**: 允许在服务器加载数据时使用此命令。
+ *                        只有不与数据集交互的命令才应在此模式下运行。
+ *                        不确定时请不要使用此标志。
+ * * **"pubsub"**:    命令在 Pub/Sub 频道上发布内容。
+ * * **"random"**:    即使从相同的输入参数和键值开始，命令也可能产生
+ *                    不同的输出。从 Redis 7.0 开始此标志已弃用。
+ *                    声明命令为 "random" 可通过命令提示完成，
+ *                    参见 https://redis.io/topics/command-tips。
+ * * **"allow-stale"**: 允许在不提供过期数据的从节点上运行此命令。
+ *                      如果不了解其含义请不要使用。
+ * * **"no-monitor"**: 不在 monitor 上传播此命令。如果命令参数中
+ *                     包含敏感数据，请使用此标志。
+ * * **"no-slowlog"**: 不在慢查询日志中记录此命令。如果命令参数中
+ *                     包含敏感数据，请使用此标志。
+ * * **"fast"**:      命令的时间复杂度不超过 O(log(N))，
+ *                    其中 N 是集合的大小或其他代表命令正常
+ *                    可扩展性问题的量。
+ * * **"getkeys-api"**: 命令实现了返回键参数位置的接口。
+ *                      当 start/stop/step 不足以描述命令语法时使用。
+ * * **"no-cluster"**: 命令不应在 Redis Cluster 中注册，因为未设计
+ *                     为与集群配合使用（例如无法报告键的位置、
+ *                     以编程方式创建键名等原因）。
+ * * **"no-auth"**:    未经认证的客户端也可以运行此命令。
+ *                     通常用于客户端认证命令。
+ * * **"may-replicate"**: 此命令可能生成复制流量，即使它不是写命令。
+ * * **"no-mandatory-keys"**: 此命令可能接受的所有键都是可选的。
+ * * **"blocking"**: 此命令可能会阻塞客户端。
+ * * **"allow-busy"**: 允许在服务器被脚本或慢模块命令阻塞时执行此命令，
+ *                     参见 RM_Yield。
+ * * **"getchannels-api"**: 命令实现了返回频道参数位置的接口。
  *
- * The last three parameters specify which arguments of the new command are
- * Redis keys. See https://redis.io/commands/command for more information.
+ * 最后三个参数指定新命令的哪些参数是 Redis 键。
+ * 更多信息参见 https://redis.io/commands/command。
  *
- * * `firstkey`: One-based index of the first argument that's a key.
- *               Position 0 is always the command name itself.
- *               0 for commands with no keys.
- * * `lastkey`:  One-based index of the last argument that's a key.
- *               Negative numbers refer to counting backwards from the last
- *               argument (-1 means the last argument provided)
- *               0 for commands with no keys.
- * * `keystep`:  Step between first and last key indexes.
- *               0 for commands with no keys.
+ * * `firstkey`: 第一个键参数的从 1 开始的索引。
+ *               位置 0 始终是命令名称本身。
+ *               无键的命令传 0。
+ * * `lastkey`:  最后一个键参数的从 1 开始的索引。
+ *               负数表示从最后一个参数向前计数
+ *               （-1 表示最后一个参数）。无键的命令传 0。
+ * * `keystep`:  第一个和最后一个键索引之间的步长。
+ *               无键的命令传 0。
  *
- * This information is used by ACL, Cluster and the `COMMAND` command.
+ * 此信息被 ACL、Cluster 和 `COMMAND` 命令使用。
  *
- * NOTE: The scheme described above serves a limited purpose and can
- * only be used to find keys that exist at constant indices.
- * For non-trivial key arguments, you may pass 0,0,0 and use
- * RedisModule_SetCommandInfo to set key specs using a more advanced scheme and use
- * RedisModule_SetCommandACLCategories to set Redis ACL categories of the commands. */
+ * 注意：上述方案用途有限，只能用于查找位于固定索引处的键。
+ * 对于复杂的键参数，可以传 0,0,0 并使用
+ * RedisModule_SetCommandInfo 设置更高级的 key specs，
+ * 使用 RedisModule_SetCommandACLCategories 设置命令的 ACL 类别。 */
 int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc cmdfunc, const char *strflags, int firstkey, int lastkey, int keystep) {
+    /* 必须在 OnLoad 回调中调用 */
     if (!ctx->module->onload)
         return REDISMODULE_ERR;
     int64_t flags = strflags ? commandFlagsFromString((char*)strflags) : 0;
     if (flags == -1) return REDISMODULE_ERR;
+    /* 标记了 no-cluster 的命令在集群模式下不能注册 */
     if ((flags & CMD_MODULE_NO_CLUSTER) && server.cluster_enabled)
         return REDISMODULE_ERR;
 
-    /* Check if the command name is valid. */
+    /* 检查命令名称是否有效。 */
     if (!isCommandNameValid(name))
         return REDISMODULE_ERR;
 
-    /* Check if the command name is busy. */
+    /* 检查命令名称是否已被占用。 */
     if (lookupCommandByCString(name) != NULL)
         return REDISMODULE_ERR;
 
     sds declared_name = sdsnew(name);
     RedisModuleCommand *cp = moduleCreateCommandProxy(ctx->module, declared_name, sdsdup(declared_name), cmdfunc, flags, firstkey, lastkey, keystep);
-    cp->rediscmd->arity = cmdfunc ? -1 : -2; /* Default value, can be changed later via dedicated API */
+    cp->rediscmd->arity = cmdfunc ? -1 : -2; /* 默认值，可通过专用 API 后续修改 */
 
     serverAssert(dictAdd(server.commands, sdsdup(declared_name), cp->rediscmd) == DICT_OK);
     serverAssert(dictAdd(server.orig_commands, sdsdup(declared_name), cp->rediscmd) == DICT_OK);
-    cp->rediscmd->id = ACLGetCommandID(declared_name); /* ID used for ACL. */
+    cp->rediscmd->id = ACLGetCommandID(declared_name); /* ACL 使用的命令 ID。 */
     return REDISMODULE_OK;
 }
 
-/* A proxy that help create a module command / subcommand.
+/* moduleCreateCommandProxy: 创建模块命令/子命令的代理。
  *
- * 'declared_name': it contains the sub_name, which is just the fullname for non-subcommands.
- * 'fullname': sds string representing the command fullname.
+ * 'declared_name': 包含子命令名，对于非子命令即为全名。
+ * 'fullname': 表示命令全名的 SDS 字符串。
  *
- * Function will take the ownership of both 'declared_name' and 'fullname' SDS.
- */
+ * 函数会接管 'declared_name' 和 'fullname' SDS 的所有权。 */
 RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds declared_name, sds fullname, RedisModuleCmdFunc cmdfunc, int64_t flags, int firstkey, int lastkey, int keystep) {
     struct redisCommand *rediscmd;
     RedisModuleCommand *cp;
@@ -1325,14 +1331,14 @@ RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds dec
     return cp;
 }
 
-/* Get an opaque structure, representing a module command, by command name.
- * This structure is used in some of the command-related APIs.
+/* RM_GetCommand: 通过命令名获取表示模块命令的不透明结构体。
+ * 此结构体用于一些命令相关的 API。
  *
- * NULL is returned in case of the following errors:
+ * 以下情况返回 NULL：
  *
- * * Command not found
- * * The command is not a module command
- * * The command doesn't belong to the calling module
+ * * 命令未找到
+ * * 命令不是模块命令
+ * * 命令不属于调用它的模块
  */
 RedisModuleCommand *RM_GetCommand(RedisModuleCtx *ctx, const char *name) {
     struct redisCommand *cmd = lookupCommandByCString(name);
@@ -2982,19 +2988,19 @@ void RM_TrimStringAllocation(RedisModuleString *str) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Reply APIs
+ * ## 回复 API
  *
- * These functions are used for sending replies to the client.
+ * 这些函数用于向客户端发送回复。
  *
- * Most functions always return REDISMODULE_OK so you can use it with
- * 'return' in order to return from the command implementation with:
+ * 大多数函数始终返回 REDISMODULE_OK，因此可以使用 'return'
+ * 从命令实现中返回：
  *
- *     if (... some condition ...)
+ *     if (... 某个条件 ...)
  *         return RedisModule_ReplyWithLongLong(ctx,mycount);
  *
- * ### Reply with collection functions
+ * ### 集合回复函数
  *
- * After starting a collection reply, the module must make calls to other
+ * 开始集合回复后，模块必须调用其他
  * `ReplyWith*` style functions in order to emit the elements of the collection.
  * Collection types include: Array, Map, Set and Attribute.
  *
@@ -3031,6 +3037,8 @@ int RM_WrongArity(RedisModuleCtx *ctx) {
  * context of a thread safe context that was not initialized with a blocked
  * client object. Other contexts without associated clients are the ones
  * initialized to run the timers callbacks. */
+/* moduleGetReplyClient: 获取用于发送回复的客户端。
+ * 线程安全上下文中返回 reply_client，否则返回关联的客户端。 */
 client *moduleGetReplyClient(RedisModuleCtx *ctx) {
     if (ctx->flags & REDISMODULE_CTX_THREAD_SAFE) {
         if (ctx->blocked_client)
@@ -3038,16 +3046,15 @@ client *moduleGetReplyClient(RedisModuleCtx *ctx) {
         else
             return NULL;
     } else {
-        /* If this is a non thread safe context, just return the client
-         * that is running the command if any. This may be NULL as well
-         * in the case of contexts that are not executed with associated
-         * clients, like timer contexts. */
+        /* 非线程安全上下文，直接返回正在执行命令的客户端。
+         * 在没有关联客户端的上下文中（如定时器上下文），
+         * 此处也可能返回 NULL。 */
         return ctx->client;
     }
 }
 
-/* Send an integer reply to the client, with the specified `long long` value.
- * The function always returns REDISMODULE_OK. */
+/* RM_ReplyWithLongLong: 向客户端发送整数回复，值为指定的 `long long`。
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithLongLong(RedisModuleCtx *ctx, long long ll) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3055,11 +3062,10 @@ int RM_ReplyWithLongLong(RedisModuleCtx *ctx, long long ll) {
     return REDISMODULE_OK;
 }
 
-/* Reply with the error 'err'.
+/* RM_ReplyWithError: 以错误 'err' 回复。
  *
- * Note that 'err' must contain all the error, including
- * the initial error code. The function only provides the initial "-", so
- * the usage is, for example:
+ * 注意：'err' 必须包含完整的错误信息，包括初始错误码。
+ * 此函数只提供开头的 "-"，使用方式例如：
  *
  *     RedisModule_ReplyWithError(ctx,"ERR Wrong Type");
  *
@@ -3173,49 +3179,46 @@ int moduleReplyWithCollection(RedisModuleCtx *ctx, long len, int type) {
     return REDISMODULE_OK;
 }
 
-/* Reply with an array type of 'len' elements.
+/* RM_ReplyWithArray: 回复一个包含 'len' 个元素的数组。
  *
- * After starting an array reply, the module must make `len` calls to other
- * `ReplyWith*` style functions in order to emit the elements of the array.
- * See Reply APIs section for more details.
+ * 开始数组回复后，模块必须调用 'len' 次其他 `ReplyWith*` 风格的
+ * 函数来输出数组元素。详见回复 API 章节。
  *
- * Use RM_ReplySetArrayLength() to set deferred length.
+ * 使用 RM_ReplySetArrayLength() 设置延迟长度。
  *
- * The function always returns REDISMODULE_OK. */
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
     return moduleReplyWithCollection(ctx, len, COLLECTION_REPLY_ARRAY);
 }
 
-/* Reply with a RESP3 Map type of 'len' pairs.
- * Visit https://github.com/antirez/RESP3/blob/master/spec.md for more info about RESP3.
+/* RM_ReplyWithMap: 回复一个 RESP3 Map 类型，包含 'len' 对。
+ * 关于 RESP3 的更多信息参见
+ * https://github.com/antirez/RESP3/blob/master/spec.md。
  *
- * After starting a map reply, the module must make `len*2` calls to other
- * `ReplyWith*` style functions in order to emit the elements of the map.
- * See Reply APIs section for more details.
+ * 开始 map 回复后，模块必须调用 `len*2` 次其他 `ReplyWith*` 风格的
+ * 函数来输出 map 元素。详见回复 API 章节。
  *
- * If the connected client is using RESP2, the reply will be converted to a flat
- * array.
- * 
- * Use RM_ReplySetMapLength() to set deferred length.
- * 
- * The function always returns REDISMODULE_OK. */
+ * 如果连接的客户端使用 RESP2，回复将被转换为普通数组。
+ *
+ * 使用 RM_ReplySetMapLength() 设置延迟长度。
+ *
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithMap(RedisModuleCtx *ctx, long len) {
     return moduleReplyWithCollection(ctx, len, COLLECTION_REPLY_MAP);
 }
 
-/* Reply with a RESP3 Set type of 'len' elements.
- * Visit https://github.com/antirez/RESP3/blob/master/spec.md for more info about RESP3.
+/* RM_ReplyWithSet: 回复一个 RESP3 Set 类型，包含 'len' 个元素。
+ * 关于 RESP3 的更多信息参见
+ * https://github.com/antirez/RESP3/blob/master/spec.md。
  *
- * After starting a set reply, the module must make `len` calls to other
- * `ReplyWith*` style functions in order to emit the elements of the set.
- * See Reply APIs section for more details.
+ * 开始 set 回复后，模块必须调用 'len' 次其他 `ReplyWith*` 风格的
+ * 函数来输出 set 元素。详见回复 API 章节。
  *
- * If the connected client is using RESP2, the reply will be converted to an
- * array type.
+ * 如果连接的客户端使用 RESP2，回复将被转换为数组类型。
  *
- * Use RM_ReplySetSetLength() to set deferred length.
- * 
- * The function always returns REDISMODULE_OK. */
+ * 使用 RM_ReplySetSetLength() 设置延迟长度。
+ *
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithSet(RedisModuleCtx *ctx, long len) {
     return moduleReplyWithCollection(ctx, len, COLLECTION_REPLY_SET);
 }
@@ -3410,9 +3413,9 @@ int RM_ReplyWithVerbatimString(RedisModuleCtx *ctx, const char *buf, size_t len)
 	return RM_ReplyWithVerbatimStringType(ctx, buf, len, "txt");
 }
 
-/* Reply to the client with a NULL.
+/* RM_ReplyWithNull: 向客户端回复 NULL。
  *
- * The function always returns REDISMODULE_OK. */
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithNull(RedisModuleCtx *ctx) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3420,13 +3423,14 @@ int RM_ReplyWithNull(RedisModuleCtx *ctx) {
     return REDISMODULE_OK;
 }
 
-/* Reply with a RESP3 Boolean type.
- * Visit https://github.com/antirez/RESP3/blob/master/spec.md for more info about RESP3.
+/* RM_ReplyWithBool: 回复一个 RESP3 布尔类型。
+ * 关于 RESP3 的更多信息参见
+ * https://github.com/antirez/RESP3/blob/master/spec.md。
  *
- * In RESP3, this is boolean type
- * In RESP2, it's a string response of "1" and "0" for true and false respectively.
+ * 在 RESP3 中，这是布尔类型。
+ * 在 RESP2 中，true 和 false 分别对应字符串 "1" 和 "0"。
  *
- * The function always returns REDISMODULE_OK. */
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithBool(RedisModuleCtx *ctx, int b) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3434,19 +3438,16 @@ int RM_ReplyWithBool(RedisModuleCtx *ctx, int b) {
     return REDISMODULE_OK;
 }
 
-/* Reply exactly what a Redis command returned us with RedisModule_Call().
- * This function is useful when we use RedisModule_Call() in order to
- * execute some command, as we want to reply to the client exactly the
- * same reply we obtained by the command.
+/* RM_ReplyWithCallReply: 将 RedisModule_Call() 返回的命令回复原样
+ * 转发给客户端。当我们使用 RedisModule_Call() 执行某个命令并希望
+ * 将获得的回复原样返回给客户端时，此函数非常有用。
  *
- * Return:
- * - REDISMODULE_OK on success.
- * - REDISMODULE_ERR if the given reply is in RESP3 format but the client expects RESP2.
- *   In case of an error, it's the module writer responsibility to translate the reply
- *   to RESP2 (or handle it differently by returning an error). Notice that for
- *   module writer convenience, it is possible to pass `0` as a parameter to the fmt
- *   argument of `RM_Call` so that the RedisModuleCallReply will return in the same
- *   protocol (RESP2 or RESP3) as set in the current client's context. */
+ * 返回值：
+ * - 成功返回 REDISMODULE_OK。
+ * - 如果给定回复是 RESP3 格式但客户端期望 RESP2，返回 REDISMODULE_ERR。
+ *   出错时，模块编写者有责任将回复转换为 RESP2（或通过返回错误来处理）。
+ *   注意：为方便模块编写者，可以向 `RM_Call` 的 fmt 参数传 `0`，
+ *   使 RedisModuleCallReply 以当前客户端上下文中设置的协议版本返回。 */
 int RM_ReplyWithCallReply(RedisModuleCtx *ctx, RedisModuleCallReply *reply) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3489,14 +3490,15 @@ int RM_ReplyWithDouble(RedisModuleCtx *ctx, double d) {
     return REDISMODULE_OK;
 }
 
-/* Reply with a RESP3 BigNumber type.
- * Visit https://github.com/antirez/RESP3/blob/master/spec.md for more info about RESP3.
+/* RM_ReplyWithBigNumber: 回复一个 RESP3 BigNumber 类型。
+ * 关于 RESP3 的更多信息参见
+ * https://github.com/antirez/RESP3/blob/master/spec.md。
  *
- * In RESP3, this is a string of length `len` that is tagged as a BigNumber, 
- * however, it's up to the caller to ensure that it's a valid BigNumber.
- * In RESP2, this is just a plain bulk string response.
+ * 在 RESP3 中，这是一个长度为 `len` 且标记为 BigNumber 的字符串，
+ * 但调用者有责任确保它是有效的 BigNumber。
+ * 在 RESP2 中，这只是普通的批量字符串响应。
  *
- * The function always returns REDISMODULE_OK. */
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithBigNumber(RedisModuleCtx *ctx, const char *bignum, size_t len) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3504,14 +3506,13 @@ int RM_ReplyWithBigNumber(RedisModuleCtx *ctx, const char *bignum, size_t len) {
     return REDISMODULE_OK;
 }
 
-/* Send a string reply obtained converting the long double 'ld' into a bulk
- * string. This function is basically equivalent to converting a long double
- * into a string into a C buffer, and then calling the function
- * RedisModule_ReplyWithStringBuffer() with the buffer and length.
- * The double string uses human readable formatting (see
- * `addReplyHumanLongDouble` in networking.c).
+/* RM_ReplyWithLongDouble: 发送将 long double 'ld' 转换为批量字符串的回复。
+ * 此函数基本等同于将 long double 转换为 C 缓冲区中的字符串，
+ * 然后调用 RedisModule_ReplyWithStringBuffer()。
+ * 双精度字符串使用人类可读格式（参见 networking.c 中的
+ * `addReplyHumanLongDouble`）。
  *
- * The function always returns REDISMODULE_OK. */
+ * 此函数始终返回 REDISMODULE_OK。 */
 int RM_ReplyWithLongDouble(RedisModuleCtx *ctx, long double ld) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
@@ -3520,11 +3521,11 @@ int RM_ReplyWithLongDouble(RedisModuleCtx *ctx, long double ld) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Commands replication API
+ * ## 命令复制 API
  * -------------------------------------------------------------------------- */
 
-/* Replicate the specified command and arguments to slaves and AOF, as effect
- * of execution of the calling command implementation.
+/* RM_Replicate: 将指定的命令和参数复制到从节点和 AOF，
+ * 作为调用命令实现的执行效果。
  *
  * The replicated commands are always wrapped into the MULTI/EXEC that
  * contains all the commands replicated in a given module command
@@ -4052,23 +4053,20 @@ static void moduleInitKeyTypeSpecific(RedisModuleKey *key) {
  * to call other APIs with the key handle as argument to perform
  * operations on the key.
  *
- * The return value is the handle representing the key, that must be
- * closed with RM_CloseKey().
+ * 返回值是表示键的句柄，必须使用 RM_CloseKey() 关闭。
  *
- * If the key does not exist and REDISMODULE_WRITE mode is requested, the handle
- * is still returned, since it is possible to perform operations on
- * a yet not existing key (that will be created, for example, after
- * a list push operation). If the mode is just REDISMODULE_READ instead, and the
- * key does not exist, NULL is returned. However it is still safe to
- * call RedisModule_CloseKey() and RedisModule_KeyType() on a NULL
- * value.
+ * 如果键不存在且请求了 REDISMODULE_WRITE 模式，仍然会返回句柄，
+ * 因为可以对尚不存在的键执行操作（例如列表推入后键会被创建）。
+ * 如果模式仅为 REDISMODULE_READ 且键不存在，则返回 NULL。
+ * 但在 NULL 值上调用 RedisModule_CloseKey() 和
+ * RedisModule_KeyType() 仍然是安全的。
  *
- * Extra flags that can be pass to the API under the mode argument:
- * * REDISMODULE_OPEN_KEY_NOTOUCH - Avoid touching the LRU/LFU of the key when opened.
- * * REDISMODULE_OPEN_KEY_NONOTIFY - Don't trigger keyspace event on key misses.
- * * REDISMODULE_OPEN_KEY_NOSTATS - Don't update keyspace hits/misses counters.
- * * REDISMODULE_OPEN_KEY_NOEXPIRE - Avoid deleting lazy expired keys.
- * * REDISMODULE_OPEN_KEY_NOEFFECTS - Avoid any effects from fetching the key. */
+ * mode 参数可传递的额外标志：
+ * * REDISMODULE_OPEN_KEY_NOTOUCH - 打开键时不更新 LRU/LFU。
+ * * REDISMODULE_OPEN_KEY_NONOTIFY - 键未命中时不触发键空间事件。
+ * * REDISMODULE_OPEN_KEY_NOSTATS - 不更新键空间命中/未命中计数器。
+ * * REDISMODULE_OPEN_KEY_NOEXPIRE - 避免删除惰性过期的键。
+ * * REDISMODULE_OPEN_KEY_NOEFFECTS - 避免获取键时的任何副作用。 */
 RedisModuleKey *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
     RedisModuleKey *kp;
     robj *value;
@@ -4134,7 +4132,7 @@ static void moduleCloseKey(RedisModuleKey *key) {
     decrRefCount(key->key);
 }
 
-/* Close a key handle. */
+/* RM_CloseKey: 关闭键句柄。 */
 void RM_CloseKey(RedisModuleKey *key) {
     if (key == NULL) return;
     moduleCloseKey(key);
@@ -4142,8 +4140,8 @@ void RM_CloseKey(RedisModuleKey *key) {
     zfree(key);
 }
 
-/* Return the type of the key. If the key pointer is NULL then
- * REDISMODULE_KEYTYPE_EMPTY is returned. */
+/* RM_KeyType: 返回键的类型。如果键指针为 NULL，
+ * 则返回 REDISMODULE_KEYTYPE_EMPTY。 */
 int RM_KeyType(RedisModuleKey *key) {
     if (key == NULL || key->value ==  NULL) return REDISMODULE_KEYTYPE_EMPTY;
     /* We map between defines so that we are free to change the internal
@@ -4160,11 +4158,11 @@ int RM_KeyType(RedisModuleKey *key) {
     }
 }
 
-/* Return the length of the value associated with the key.
- * For strings this is the length of the string. For all the other types
- * is the number of elements (just counting keys for hashes).
+/* RM_ValueLength: 返回键关联值的长度。
+ * 对于字符串，返回字符串长度。对于其他类型，
+ * 返回元素数量（对于哈希仅计算键数）。
  *
- * If the key pointer is NULL or the key is empty, zero is returned. */
+ * 如果键指针为 NULL 或键为空，返回零。 */
 size_t RM_ValueLength(RedisModuleKey *key) {
     if (key == NULL || key->value == NULL) return 0;
     switch(key->value->type) {
@@ -4178,10 +4176,10 @@ size_t RM_ValueLength(RedisModuleKey *key) {
     }
 }
 
-/* If the key is open for writing, remove it, and setup the key to
- * accept new writes as an empty key (that will be created on demand).
- * On success REDISMODULE_OK is returned. If the key is not open for
- * writing REDISMODULE_ERR is returned. */
+/* RM_DeleteKey: 如果键以写模式打开，则删除它，并将键设置为
+ * 接受新写入的空键状态（按需创建）。
+ * 成功返回 REDISMODULE_OK。如果键未以写模式打开，
+ * 返回 REDISMODULE_ERR。 */
 int RM_DeleteKey(RedisModuleKey *key) {
     if (!(key->mode & REDISMODULE_WRITE)) return REDISMODULE_ERR;
     if (key->value) {
@@ -4309,15 +4307,14 @@ int RM_GetToDbIdFromOptCtx(RedisModuleKeyOptCtx *ctx) {
     return ctx->to_dbid;
 }
 /* --------------------------------------------------------------------------
- * ## Key API for String type
+ * ## 字符串类型的键 API
  *
- * See also RM_ValueLength(), which returns the length of a string.
+ * 另见 RM_ValueLength()，返回字符串的长度。
  * -------------------------------------------------------------------------- */
 
-/* If the key is open for writing, set the specified string 'str' as the
- * value of the key, deleting the old value if any.
- * On success REDISMODULE_OK is returned. If the key is not open for
- * writing or there is an active iterator, REDISMODULE_ERR is returned. */
+/* RM_StringSet: 如果键以写模式打开，将指定字符串 'str' 设为键的值，
+ * 如有旧值则删除。成功返回 REDISMODULE_OK。
+ * 如果键未以写模式打开或有活跃迭代器，返回 REDISMODULE_ERR。 */
 int RM_StringSet(RedisModuleKey *key, RedisModuleString *str) {
     if (!(key->mode & REDISMODULE_WRITE) || key->iter) return REDISMODULE_ERR;
     RM_DeleteKey(key);
@@ -4421,15 +4418,13 @@ int RM_StringTruncate(RedisModuleKey *key, size_t newlen) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Key API for List type
+ * ## 列表类型的键 API
  *
- * Many of the list functions access elements by index. Since a list is in
- * essence a doubly-linked list, accessing elements by index is generally an
- * O(N) operation. However, if elements are accessed sequentially or with
- * indices close together, the functions are optimized to seek the index from
- * the previous index, rather than seeking from the ends of the list.
+ * 许多列表函数通过索引访问元素。由于列表本质上是双向链表，
+ * 通过索引访问元素通常是 O(N) 操作。但如果顺序访问或索引相近，
+ * 函数会优化为从上一个索引位置查找，而非从列表两端查找。
  *
- * This enables iteration to be done efficiently using a simple for loop:
+ * 这使得使用简单 for 循环进行高效迭代成为可能：
  *
  *     long n = RM_ValueLength(key);
  *     for (long i = 0; i < n; i++) {
@@ -4715,13 +4710,13 @@ int RM_ListDelete(RedisModuleKey *key, long index) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Key API for Sorted Set type
+ * ## 有序集合类型的键 API
  *
- * See also RM_ValueLength(), which returns the length of a sorted set.
+ * 另见 RM_ValueLength()，返回有序集合的长度。
  * -------------------------------------------------------------------------- */
 
-/* Conversion from/to public flags of the Modules API and our private flags,
- * so that we have everything decoupled. */
+/* moduleZsetAddFlagsToCoreFlags: 在模块 API 的公共标志和内部私有标志
+ * 之间进行转换，实现解耦。 */
 int moduleZsetAddFlagsToCoreFlags(int flags) {
     int retflags = 0;
     if (flags & REDISMODULE_ZADD_XX) retflags |= ZADD_IN_XX;
@@ -4862,16 +4857,17 @@ int RM_ZsetScore(RedisModuleKey *key, RedisModuleString *ele, double *score) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Key API for Sorted Set iterator
+ * ## 有序集合迭代器的键 API
  * -------------------------------------------------------------------------- */
 
+/* zsetKeyReset: 重置有序集合键的迭代器状态。 */
 void zsetKeyReset(RedisModuleKey *key) {
     key->u.zset.type = REDISMODULE_ZSET_RANGE_NONE;
     key->u.zset.current = NULL;
     key->u.zset.er = 1;
 }
 
-/* Stop a sorted set iteration. */
+/* RM_ZsetRangeStop: 停止有序集合的迭代。 */
 void RM_ZsetRangeStop(RedisModuleKey *key) {
     if (!key->value || key->value->type != OBJ_ZSET) return;
     /* Free resources if needed. */
@@ -5169,20 +5165,18 @@ int RM_ZsetRangePrev(RedisModuleKey *key) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Key API for Hash type
+ * ## 哈希类型的键 API
  *
- * See also RM_ValueLength(), which returns the number of fields in a hash.
+ * 另见 RM_ValueLength()，返回哈希中字段的数量。
  * -------------------------------------------------------------------------- */
 
-/* Set the field of the specified hash field to the specified value.
- * If the key is an empty key open for writing, it is created with an empty
- * hash value, in order to set the specified field.
+/* RM_HashSet: 将指定哈希字段设置为指定值。
+ * 如果键是以写模式打开的空键，则创建一个空哈希值以设置指定字段。
  *
- * The function is variadic and the user must specify pairs of field
- * names and values, both as RedisModuleString pointers (unless the
- * CFIELD option is set, see later). At the end of the field/value-ptr pairs,
- * NULL must be specified as last argument to signal the end of the arguments
- * in the variadic function.
+ * 此函数是可变参数函数，用户必须指定字段名和值的对，
+ * 两者都是 RedisModuleString 指针（除非设置了 CFIELD 选项）。
+ * 在字段/值对之后，必须指定 NULL 作为最后一个参数
+ * 以表示可变参数函数的参数结束。
  *
  * Example to set the hash argv[1] to the value argv[2]:
  *
@@ -5424,20 +5418,20 @@ int RM_HashGet(RedisModuleKey *key, int flags, ...) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Key API for Stream type
+ * ## 流类型的键 API
  *
- * For an introduction to streams, see https://redis.io/topics/streams-intro.
+ * 流的介绍参见 https://redis.io/topics/streams-intro。
  *
- * The type RedisModuleStreamID, which is used in stream functions, is a struct
- * with two 64-bit fields and is defined as
+ * 流函数中使用的 RedisModuleStreamID 类型是一个包含两个 64 位字段的
+ * 结构体，定义如下：
  *
  *     typedef struct RedisModuleStreamID {
  *         uint64_t ms;
  *         uint64_t seq;
  *     } RedisModuleStreamID;
  *
- * See also RM_ValueLength(), which returns the length of a stream, and the
- * conversion functions RM_StringToStreamID() and RM_CreateStringFromStreamID().
+ * 另见 RM_ValueLength()（返回流的长度）以及转换函数
+ * RM_StringToStreamID() 和 RM_CreateStringFromStreamID()。
  * -------------------------------------------------------------------------- */
 
 /* Adds an entry to a stream. Like XADD without trimming.
@@ -5891,9 +5885,9 @@ long long RM_StreamTrimByID(RedisModuleKey *key, int flags, RedisModuleStreamID 
 }
 
 /* --------------------------------------------------------------------------
- * ## Calling Redis commands from modules
+ * ## 从模块中调用 Redis 命令
  *
- * RM_Call() sends a command to Redis. The remaining functions handle the reply.
+ * RM_Call() 向 Redis 发送命令。其余函数处理回复。
  * -------------------------------------------------------------------------- */
 
 
@@ -5905,12 +5899,10 @@ void moduleParseCallReply_Array(RedisModuleCallReply *reply);
 
 
 
-/* Free a Call reply and all the nested replies it contains if it's an
- * array. */
+/* RM_FreeCallReply: 释放调用回复及其包含的所有嵌套回复（如果是数组）。 */
 void RM_FreeCallReply(RedisModuleCallReply *reply) {
-    /* This is a wrapper for the recursive free reply function. This is needed
-     * in order to have the first level function to return on nested replies,
-     * but only if called by the module API. */
+    /* 这是递归释放回复函数的包装器。需要这样做是为了让
+     * 第一层函数在嵌套回复时直接返回，但仅在被模块 API 调用时。 */
 
     RedisModuleCtx *ctx = NULL;
     if(callReplyType(reply) == REDISMODULE_REPLY_PROMISE) {
@@ -6025,25 +6017,24 @@ int RM_CallReplyAttributeElement(RedisModuleCallReply *reply, size_t idx, RedisM
     return REDISMODULE_ERR;
 }
 
-/* Set unblock handler (callback and private data) on the given promise RedisModuleCallReply.
- * The given reply must be of promise type (REDISMODULE_REPLY_PROMISE). */
+/* RM_CallReplyPromiseSetUnblockHandler: 在给定的 promise
+ * RedisModuleCallReply 上设置解除阻塞处理器（回调和私有数据）。
+ * 给定的回复必须是 promise 类型（REDISMODULE_REPLY_PROMISE）。 */
 void RM_CallReplyPromiseSetUnblockHandler(RedisModuleCallReply *reply, RedisModuleOnUnblocked on_unblock, void *private_data) {
     RedisModuleAsyncRMCallPromise *promise = callReplyGetPrivateData(reply);
     promise->on_unblocked = on_unblock;
     promise->private_data = private_data;
 }
 
-/* Abort the execution of a given promise RedisModuleCallReply.
- * return REDMODULE_OK in case the abort was done successfully and REDISMODULE_ERR
- * if its not possible to abort the execution (execution already finished).
- * In case the execution was aborted (REDMODULE_OK was returned), the private_data out parameter
- * will be set with the value of the private data that was given on 'RM_CallReplyPromiseSetUnblockHandler'
- * so the caller will be able to release the private data.
+/* RM_CallReplyPromiseAbort: 中止给定 promise RedisModuleCallReply 的执行。
+ * 成功中止返回 REDISMODULE_OK，无法中止（执行已完成）返回 REDISMODULE_ERR。
+ * 如果执行被中止（返回 REDISMODULE_OK），private_data 输出参数将被设置为
+ * 在 'RM_CallReplyPromiseSetUnblockHandler' 中传入的私有数据值，
+ * 以便调用者能够释放私有数据。
  *
- * If the execution was aborted successfully, it is promised that the unblock handler will not be called.
- * That said, it is possible that the abort operation will successes but the operation will still continue.
- * This can happened if, for example, a module implements some blocking command and does not respect the
- * disconnect callback. For pure Redis commands this can not happened.*/
+ * 如果成功中止执行，保证不会调用解除阻塞处理器。
+ * 但中止操作可能成功而操作仍会继续。例如当模块实现了某个阻塞命令
+ * 但未遵守断开连接回调时就会发生这种情况。对于纯 Redis 命令不会发生。 */
 int RM_CallReplyPromiseAbort(RedisModuleCallReply *reply, void **private_data) {
     RedisModuleAsyncRMCallPromise *promise = callReplyGetPrivateData(reply);
     if (!promise->c) return REDISMODULE_ERR; /* Promise can not be aborted, either already aborted or already finished. */
@@ -6307,11 +6298,11 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     int argc = 0, flags = 0;
     va_list ap;
     RedisModuleCallReply *reply = NULL;
-    int replicate = 0; /* Replicate this command? */
-    int error_as_call_replies = 0; /* return errors as RedisModuleCallReply object */
+    int replicate = 0; /* 是否复制此命令？ */
+    int error_as_call_replies = 0; /* 是否以 CallReply 对象形式返回错误 */
     uint64_t cmd_flags;
 
-    /* Handle arguments. */
+    /* 处理参数。 */
     va_start(ap, fmt);
     argv = moduleCreateArgvFromUserFormat(cmdname,fmt,&argc,&flags,ap);
     replicate = flags & REDISMODULE_ARGV_REPLICATE;
@@ -6321,19 +6312,19 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     c = moduleAllocTempClient();
 
     if (!(flags & REDISMODULE_ARGV_ALLOW_BLOCK)) {
-        /* We do not want to allow block, the module do not expect it */
+        /* 不允许阻塞，模块不期望阻塞行为 */
         c->flags |= CLIENT_DENY_BLOCKING;
     }
     c->db = ctx->client->db;
     c->argv = argv;
-    /* We have to assign argv_len, which is equal to argc in that case (RM_Call)
-     * because we may be calling a command that uses rewriteClientCommandArgument */
+    /* 必须设置 argv_len，在 RM_Call 场景下它等于 argc，
+     * 因为我们可能调用会使用 rewriteClientCommandArgument 的命令 */
     c->argc = c->argv_len = argc;
     c->resp = 2;
     if (flags & REDISMODULE_ARGV_RESP_3) {
         c->resp = 3;
     } else if (flags & REDISMODULE_ARGV_RESP_AUTO) {
-        /* Auto mode means to take the same protocol as the ctx client. */
+        /* 自动模式：使用与上下文客户端相同的协议版本。 */
         c->resp = ctx->client->resp;
     }
     if (ctx->module) ctx->module->in_call++;
@@ -6352,23 +6343,19 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         c->user = user;
     }
 
-    /* We handle the above format error only when the client is setup so that
-     * we can free it normally. */
+    /* 仅在客户端设置完成后才处理格式错误，以便正常释放客户端。 */
     if (argv == NULL) {
-        /* We do not return a call reply here this is an error that should only
-         * be catch by the module indicating wrong fmt was given, the module should
-         * handle this error and decide how to continue. It is not an error that
-         * should be propagated to the user. */
+        /* 此处不返回 call reply，这是一个仅应被模块捕获的错误，
+         * 表明传入了错误的 fmt。模块应自行处理此错误并决定如何继续。
+         * 这不是应该传播给用户的错误。 */
         errno = EBADF;
         goto cleanup;
     }
 
-    /* Call command filters */
+    /* 调用命令过滤器 */
     moduleCallCommandFilters(c);
 
-    /* Lookup command now, after filters had a chance to make modifications
-     * if necessary.
-     */
+    /* 在过滤器有机会修改之后查找命令。 */
     c->cmd = c->lastcmd = c->realcmd = lookupCommand(c->argv,c->argc);
     sds err;
     if (!commandCheckExistence(c, error_as_call_replies? &err : NULL)) {
@@ -6485,12 +6472,11 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         }
     }
 
-    /* Check if the user can run this command according to the current
-     * ACLs.
+    /* 根据当前 ACL 规则检查用户是否有权执行此命令。
      *
-     * If RM_SetContextUser has set a user, that user is used, otherwise
-     * use the attached client's user. If there is no attached client user and no manually
-     * set user, an error will be returned */
+     * 如果 RM_SetContextUser 设置了用户，则使用该用户，
+     * 否则使用附加客户端的用户。如果没有附加客户端用户
+     * 且未手动设置用户，将返回错误。 */
     if (flags & REDISMODULE_ARGV_RUN_AS_USER) {
         int acl_errpos;
         int acl_retval;
@@ -6511,9 +6497,8 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         }
     }
 
-    /* If this is a Redis Cluster node, we need to make sure the module is not
-     * trying to access non-local keys, with the exception of commands
-     * received from our master. */
+    /* 如果这是 Redis Cluster 节点，需要确保模块不会尝试
+     * 访问非本地键，但来自主节点的命令除外。 */
     if (server.cluster_enabled && !mustObeyClient(ctx->client)) {
         int error_code;
         /* Duplicate relevant flags in the module client. */
@@ -6551,16 +6536,16 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         goto cleanup;
     }
 
-    /* We need to use a global replication_allowed flag in order to prevent
-     * replication of nested RM_Calls. Example:
-     * 1. module1.foo does RM_Call of module2.bar without replication (i.e. no '!')
-     * 2. module2.bar internally calls RM_Call of INCR with '!'
-     * 3. at the end of module1.foo we call RM_ReplicateVerbatim
-     * We want the replica/AOF to see only module1.foo and not the INCR from module2.bar */
+    /* 使用全局 replication_allowed 标志来防止嵌套 RM_Call 的复制。
+     * 示例：
+     * 1. module1.foo 调用 RM_Call 执行 module2.bar（不带 '!'，不复制）
+     * 2. module2.bar 内部调用 RM_Call 执行 INCR（带 '!'，需要复制）
+     * 3. module1.foo 结束时调用 RM_ReplicateVerbatim
+     * 我们希望副本/AOF 只看到 module1.foo，而不是 module2.bar 中的 INCR */
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = replicate && server.replication_allowed;
 
-    /* Run the command */
+    /* 执行命令 */
     int call_flags = CMD_CALL_FROM_MODULE;
     if (replicate) {
         if (!(flags & REDISMODULE_ARGV_NO_AOF))
@@ -6576,8 +6561,8 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         serverAssert(ctx->module);
         RedisModuleAsyncRMCallPromise *promise = zmalloc(sizeof(RedisModuleAsyncRMCallPromise));
         *promise = (RedisModuleAsyncRMCallPromise) {
-                /* We start with ref_count value of 2 because this object is held
-                 * by the promise CallReply and the fake client that was used to execute the command. */
+                /* 初始引用计数为 2，因为此对象被 promise CallReply
+                 * 和执行命令的伪客户端同时持有。 */
                 .ref_count = 2,
                 .module = ctx->module,
                 .on_unblocked = NULL,
@@ -6588,14 +6573,14 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
         reply = callReplyCreatePromise(promise);
         c->bstate.async_rm_call_handle = promise;
         if (!(call_flags & CMD_CALL_PROPAGATE_AOF)) {
-            /* No need for AOF propagation, set the relevant flags of the client */
+            /* 无需 AOF 传播，设置客户端的相关标志 */
             c->flags |= CLIENT_MODULE_PREVENT_AOF_PROP;
         }
         if (!(call_flags & CMD_CALL_PROPAGATE_REPL)) {
-            /* No need for replication propagation, set the relevant flags of the client */
+            /* 无需副本传播，设置客户端的相关标志 */
             c->flags |= CLIENT_MODULE_PREVENT_REPL_PROP;
         }
-        c = NULL; /* Make sure not to free the client */
+        c = NULL; /* 确保不会释放客户端（已移交给 promise） */
     } else {
         reply = moduleParseReply(c, (ctx->flags & REDISMODULE_CTX_AUTO_MEMORY) ? ctx : NULL);
     }
@@ -6614,13 +6599,12 @@ const char *RM_CallReplyProto(RedisModuleCallReply *reply, size_t *len) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Modules data types
+ * ## 模块数据类型
  *
- * When String DMA or using existing data structures is not enough, it is
- * possible to create new data types from scratch and export them to
- * Redis. The module must provide a set of callbacks for handling the
- * new values exported (for example in order to provide RDB saving/loading,
- * AOF rewrite, and so forth). In this section we define this API.
+ * 当字符串 DMA 或现有数据结构不足以满足需求时，可以从头创建
+ * 新的数据类型并导出给 Redis。模块必须提供一组回调来处理
+ * 导出的新值（例如用于 RDB 保存/加载、AOF 重写等）。
+ * 本节定义了这些 API。
  * -------------------------------------------------------------------------- */
 
 /* Turn a 9 chars name in the specified charset and a 10 bit encver into
@@ -7610,15 +7594,10 @@ int RM_GetDbIdFromIO(RedisModuleIO *io) {
 }
 
 /* --------------------------------------------------------------------------
- * ## Logging
+ * ## 日志
  * -------------------------------------------------------------------------- */
 
-/* This is the low level function implementing both:
- *
- *      RM_Log()
- *      RM_LogIOError()
- *
- */
+/* moduleLogRaw: 底层日志函数，实现了 RM_Log() 和 RM_LogIOError()。 */
 void moduleLogRaw(RedisModule *module, const char *levelstr, const char *fmt, va_list ap) {
     char msg[LOG_MAX_LEN];
     size_t name_len;
@@ -7637,24 +7616,21 @@ void moduleLogRaw(RedisModule *module, const char *levelstr, const char *fmt, va
     serverLogRaw(level,msg);
 }
 
-/* Produces a log message to the standard Redis log, the format accepts
- * printf-alike specifiers, while level is a string describing the log
- * level to use when emitting the log, and must be one of the following:
+/* RM_Log: 向标准 Redis 日志输出一条日志消息。
+ * 格式接受 printf 风格的格式说明符，level 是描述日志级别的字符串，
+ * 必须是以下之一：
  *
  * * "debug" (`REDISMODULE_LOGLEVEL_DEBUG`)
  * * "verbose" (`REDISMODULE_LOGLEVEL_VERBOSE`)
  * * "notice" (`REDISMODULE_LOGLEVEL_NOTICE`)
  * * "warning" (`REDISMODULE_LOGLEVEL_WARNING`)
  *
- * If the specified log level is invalid, verbose is used by default.
- * There is a fixed limit to the length of the log line this function is able
- * to emit, this limit is not specified but is guaranteed to be more than
- * a few lines of text.
+ * 如果指定的日志级别无效，默认使用 verbose。
+ * 此函数能输出的日志行长度有固定限制，具体值未指定，
+ * 但保证至少能输出几行文本。
  *
- * The ctx argument may be NULL if cannot be provided in the context of the
- * caller for instance threads or callbacks, in which case a generic "module"
- * will be used instead of the module name.
- */
+ * ctx 参数可以为 NULL（例如在线程或回调中无法提供时），
+ * 此时将使用通用的 "module" 代替模块名称。 */
 void RM_Log(RedisModuleCtx *ctx, const char *levelstr, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -7662,11 +7638,10 @@ void RM_Log(RedisModuleCtx *ctx, const char *levelstr, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Log errors from RDB / AOF serialization callbacks.
+/* RM_LogIOError: 记录 RDB / AOF 序列化回调中的错误。
  *
- * This function should be used when a callback is returning a critical
- * error to the caller since cannot load or save the data for some
- * critical reason. */
+ * 当回调因某种关键原因无法加载或保存数据，需要向调用者
+ * 返回严重错误时，应使用此函数。 */
 void RM_LogIOError(RedisModuleIO *io, const char *levelstr, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -7674,52 +7649,48 @@ void RM_LogIOError(RedisModuleIO *io, const char *levelstr, const char *fmt, ...
     va_end(ap);
 }
 
-/* Redis-like assert function.
+/* RM__Assert: 类似 Redis 的断言函数。
  *
- * The macro `RedisModule_Assert(expression)` is recommended, rather than
- * calling this function directly.
+ * 推荐使用宏 `RedisModule_Assert(expression)` 而非直接调用此函数。
  *
- * A failed assertion will shut down the server and produce logging information
- * that looks identical to information generated by Redis itself.
- */
+ * 断言失败将关闭服务器并产生与 Redis 自身生成的
+ * 日志信息完全一致的日志。 */
 void RM__Assert(const char *estr, const char *file, int line) {
     _serverAssert(estr, file, line);
 }
 
-/* Allows adding event to the latency monitor to be observed by the LATENCY
- * command. The call is skipped if the latency is smaller than the configured
- * latency-monitor-threshold. */
+/* RM_LatencyAddSample: 向延迟监控器添加事件，供 LATENCY 命令观察。
+ * 如果延迟小于配置的 latency-monitor-threshold，则跳过此调用。 */
 void RM_LatencyAddSample(const char *event, mstime_t latency) {
     if (latency >= server.latency_monitor_threshold)
         latencyAddSample(event, latency);
 }
 
 /* --------------------------------------------------------------------------
- * ## Blocking clients from modules
+ * ## 从模块中阻塞客户端
  *
- * For a guide about blocking commands in modules, see
- * https://redis.io/topics/modules-blocking-ops.
+ * 关于模块中阻塞命令的指南，参见
+ * https://redis.io/topics/modules-blocking-ops。
  * -------------------------------------------------------------------------- */
 
-/* Returns 1 if the client already in the moduleUnblocked list, 0 otherwise. */
+/* isModuleClientUnblocked: 如果客户端已在 moduleUnblocked 列表中
+ * 则返回 1，否则返回 0。 */
 int isModuleClientUnblocked(client *c) {
     RedisModuleBlockedClient *bc = c->bstate.module_blocked_handle;
 
     return bc->unblocked == 1;
 }
 
-/* This is called from blocked.c in order to unblock a client: may be called
- * for multiple reasons while the client is in the middle of being blocked
- * because the client is terminated, but is also called for cleanup when a
- * client is unblocked in a clean way after replaying.
+/* unblockClientFromModule: 从 blocked.c 调用以解除客户端阻塞。
+ * 可能在客户端被阻塞期间因多种原因被调用（如客户端终止），
+ * 也可能在客户端正常解除阻塞后用于清理。
  *
- * What we do here is just to set the client to NULL in the redis module
- * blocked client handle. This way if the client is terminated while there
- * is a pending threaded operation involving the blocked client, we'll know
- * that the client no longer exists and no reply callback should be called.
+ * 此处所做的只是将 Redis 模块阻塞客户端句柄中的客户端设为 NULL。
+ * 这样，如果客户端在有待处理的线程操作时被终止，
+ * 我们就能知道客户端已不存在，不应调用回复回调。
  *
- * The structure RedisModuleBlockedClient will be always deallocated when
- * running the list of clients blocked by a module that need to be unblocked. */
+ * RedisModuleBlockedClient 结构体将在运行需要解除阻塞的
+ * 模块阻塞客户端列表时被释放。 */
 void unblockClientFromModule(client *c) {
     RedisModuleBlockedClient *bc = c->bstate.module_blocked_handle;
 
@@ -7757,25 +7728,22 @@ void unblockClientFromModule(client *c) {
     bc->client = NULL;
 }
 
-/* Block a client in the context of a module: this function implements both
- * RM_BlockClient() and RM_BlockClientOnKeys() depending on the fact the
- * keys are passed or not.
+/* moduleBlockClient: 在模块上下文中阻塞客户端。
+ * 根据是否传入 keys 参数，此函数同时实现了
+ * RM_BlockClient() 和 RM_BlockClientOnKeys()。
  *
- * When not blocking for keys, the keys, numkeys, and privdata parameters are
- * not needed. The privdata in that case must be NULL, since later is
- * RM_UnblockClient() that will provide some private data that the reply
- * callback will receive.
+ * 非按键阻塞时，keys、numkeys 和 privdata 参数不需要。
+ * 此时 privdata 必须为 NULL，因为后续的 RM_UnblockClient()
+ * 才会提供回复回调将接收的私有数据。
  *
- * Instead when blocking for keys, normally RM_UnblockClient() will not be
- * called (because the client will unblock when the key is modified), so
- * 'privdata' should be provided in that case, so that once the client is
- * unlocked and the reply callback is called, it will receive its associated
- * private data.
+ * 按键阻塞时，通常不会调用 RM_UnblockClient()
+ * （因为客户端会在键被修改时自动解除阻塞），
+ * 所以应在阻塞时提供 privdata，这样当客户端解除阻塞
+ * 且回调被调用时，它能接收到关联的私有数据。
  *
- * Even when blocking on keys, RM_UnblockClient() can be called however, but
- * in that case the privdata argument is disregarded, because we pass the
- * reply callback the privdata that is set here while blocking.
- *
+ * 即使是按键阻塞，也可以调用 RM_UnblockClient()，
+ * 但此时 privdata 参数会被忽略，因为我们会将阻塞时
+ * 设置的 privdata 传递给回复回调。
  */
 RedisModuleBlockedClient *moduleBlockClient(RedisModuleCtx *ctx, RedisModuleCmdFunc reply_callback,
                                             RedisModuleAuthCallback auth_reply_callback,
@@ -8786,7 +8754,7 @@ int RM_GetNotifyKeyspaceEvents(void) {
     return server.notify_keyspace_events;
 }
 
-/* Expose notifyKeyspaceEvent to modules */
+/* RM_NotifyKeyspaceEvent: 向模块暴露 notifyKeyspaceEvent 功能。 */
 int RM_NotifyKeyspaceEvent(RedisModuleCtx *ctx, int type, const char *event, RedisModuleString *key) {
     if (!ctx || !ctx->client)
         return REDISMODULE_ERR;
@@ -8794,11 +8762,10 @@ int RM_NotifyKeyspaceEvent(RedisModuleCtx *ctx, int type, const char *event, Red
     return REDISMODULE_OK;
 }
 
-/* Dispatcher for keyspace notifications to module subscriber functions.
- * This gets called  only if at least one module requested to be notified on
- * keyspace notifications */
+/* moduleNotifyKeyspaceEvent: 键空间通知到模块订阅者函数的分发器。
+ * 仅在至少一个模块请求了键空间通知时才会被调用。 */
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid) {
-    /* Don't do anything if there aren't any subscribers */
+    /* 如果没有订阅者则直接返回 */
     if (listLength(moduleKeyspaceSubscribers) == 0) return;
 
     /* Ugly hack to handle modules which use write commands from within
@@ -10586,32 +10553,29 @@ int RM_ExportSharedAPI(RedisModuleCtx *ctx, const char *apiname, void *func) {
     return REDISMODULE_OK;
 }
 
-/* Request an exported API pointer. The return value is just a void pointer
- * that the caller of this function will be required to cast to the right
- * function pointer, so this is a private contract between modules.
+/* RM_GetSharedAPI: 请求一个已导出的 API 指针。返回值是一个 void 指针，
+ * 调用者需要将其转换为正确的函数指针类型，这是模块之间的私有约定。
  *
- * If the requested API is not available then NULL is returned. Because
- * modules can be loaded at different times with different order, this
- * function calls should be put inside some module generic API registering
- * step, that is called every time a module attempts to execute a
- * command that requires external APIs: if some API cannot be resolved, the
- * command should return an error.
+ * 如果请求的 API 不可用则返回 NULL。由于模块可能在不同时间以
+ * 不同顺序加载，此函数调用应放在模块通用的 API 注册步骤中，
+ * 该步骤在模块每次尝试执行需要外部 API 的命令时调用：
+ * 如果某些 API 无法解析，命令应返回错误。
  *
- * Here is an example:
+ * 示例：
  *
  *     int ... myCommandImplementation(void) {
  *        if (getExternalAPIs() == 0) {
- *             reply with an error here if we cannot have the APIs
+ *             // 如果无法获取 API 则在此回复错误
  *        }
- *        // Use the API:
+ *        // 使用 API：
  *        myFunctionPointer(foo);
  *     }
  *
- * And the function registerAPI() is:
+ * registerAPI() 函数如下：
  *
  *     int getExternalAPIs(void) {
  *         static int api_loaded = 0;
- *         if (api_loaded != 0) return 1; // APIs already resolved.
+ *         if (api_loaded != 0) return 1; // API 已解析。
  *
  *         myFunctionPointer = RedisModule_GetSharedAPI("...");
  *         if (myFunctionPointer == NULL) return 0;
@@ -10630,12 +10594,11 @@ void *RM_GetSharedAPI(RedisModuleCtx *ctx, const char *apiname) {
     return sapi->func;
 }
 
-/* Remove all the APIs registered by the specified module. Usually you
- * want this when the module is going to be unloaded. This function
- * assumes that's caller responsibility to make sure the APIs are not
- * used by other modules.
+/* moduleUnregisterSharedAPI: 移除指定模块注册的所有共享 API。
+ * 通常在模块即将卸载时调用。此函数假设调用者有责任确保
+ * 这些 API 不再被其他模块使用。
  *
- * The number of unregistered APIs is returned. */
+ * 返回已注销的 API 数量。 */
 int moduleUnregisterSharedAPI(RedisModule *module) {
     int count = 0;
     dictIterator *di = dictGetSafeIterator(server.sharedapi);
@@ -10653,10 +10616,10 @@ int moduleUnregisterSharedAPI(RedisModule *module) {
     return count;
 }
 
-/* Remove the specified module as an user of APIs of ever other module.
- * This is usually called when a module is unloaded.
+/* moduleUnregisterUsedAPI: 移除指定模块作为其他模块 API 使用者的记录。
+ * 通常在模块卸载时调用。
  *
- * Returns the number of modules this module was using APIs from. */
+ * 返回此模块正在使用其 API 的模块数量。 */
 int moduleUnregisterUsedAPI(RedisModule *module) {
     listIter li;
     listNode *ln;
@@ -12097,15 +12060,14 @@ void moduleRemoveCateogires(RedisModule *module) {
     }
 }
 
-/* Load all the modules in the server.loadmodule_queue list, which is
- * populated by `loadmodule` directives in the configuration file.
- * We can't load modules directly when processing the configuration file
- * because the server must be fully initialized before loading modules.
+/* moduleLoadFromQueue: 加载 server.loadmodule_queue 列表中的所有模块。
+ * 该列表由配置文件中的 `loadmodule` 指令填充。
+ * 不能在处理配置文件时直接加载模块，因为服务器必须完全初始化后
+ * 才能加载模块。
  *
- * The function aborts the server on errors, since to start with missing
- * modules is not considered sane: clients may rely on the existence of
- * given commands, loading AOF also may need some modules to exist, and
- * if this instance is a slave, it must understand commands from master. */
+ * 函数在出错时会中止服务器，因为缺少模块的启动被认为是不合理的：
+ * 客户端可能依赖于某些命令的存在，加载 AOF 也可能需要某些模块，
+ * 如果此实例是从节点，它必须能理解主节点的命令。 */
 void moduleLoadFromQueue(void) {
     listIter li;
     listNode *ln;
@@ -12130,6 +12092,7 @@ void moduleLoadFromQueue(void) {
     }
 }
 
+/* moduleFreeModuleStructure: 释放模块结构体及其所有子资源。 */
 void moduleFreeModuleStructure(struct RedisModule *module) {
     listRelease(module->types);
     listRelease(module->filters);
@@ -12141,6 +12104,7 @@ void moduleFreeModuleStructure(struct RedisModule *module) {
     zfree(module);
 }
 
+/* moduleFreeArgs: 递归释放命令参数数组。 */
 void moduleFreeArgs(struct redisCommandArg *args, int num_args) {
     for (int j = 0; j < num_args; j++) {
         zfree((char *)args[j].name);
@@ -12157,12 +12121,11 @@ void moduleFreeArgs(struct redisCommandArg *args, int num_args) {
     zfree(args);
 }
 
-/* Free the command registered with the specified module.
- * On success C_OK is returned, otherwise C_ERR is returned.
+/* moduleFreeCommand: 释放指定模块注册的命令。
+ * 成功返回 C_OK，否则返回 C_ERR。
  *
- * Note that caller needs to handle the deletion of the command table dict,
- * and after that needs to free the command->fullname and the command itself.
- */
+ * 注意：调用者需要处理命令表字典的删除，
+ * 之后还需要释放 command->fullname 和命令本身。 */
 int moduleFreeCommand(struct RedisModule *module, struct redisCommand *cmd) {
     if (cmd->proc != RedisModuleCommandDispatcher)
         return C_ERR;
@@ -12217,8 +12180,9 @@ int moduleFreeCommand(struct RedisModule *module, struct redisCommand *cmd) {
     return C_OK;
 }
 
+/* moduleUnregisterCommands: 注销此模块注册的所有命令。 */
 void moduleUnregisterCommands(struct RedisModule *module) {
-    /* Unregister all the commands registered by this module. */
+    /* 注销此模块注册的所有命令。 */
     dictIterator *di = dictGetSafeIterator(server.commands);
     dictEntry *de;
     while ((de = dictNext(di)) != NULL) {
@@ -12234,9 +12198,10 @@ void moduleUnregisterCommands(struct RedisModule *module) {
     dictReleaseIterator(di);
 }
 
-/* We parse argv to add sds "NAME VALUE" pairs to the server.module_configs_queue list of configs.
- * We also increment the module_argv pointer to just after ARGS if there are args, otherwise
- * we set it to NULL */
+/* parseLoadexArguments: 解析 argv 以将 "NAME VALUE" 对添加到
+ * server.module_configs_queue 配置列表中。
+ * 如果有 ARGS 参数，则将 module_argv 指针移动到 ARGS 之后，
+ * 否则设为 NULL。 */
 int parseLoadexArguments(RedisModuleString ***module_argv, int *module_argc) {
     int args_specified = 0;
     RedisModuleString **argv = *module_argv;
@@ -12275,7 +12240,8 @@ int parseLoadexArguments(RedisModuleString ***module_argv, int *module_argc) {
     return REDISMODULE_OK;
 }
 
-/* Unregister module-related things, called when moduleLoad fails or moduleUnload. */
+/* moduleUnregisterCleanup: 注销模块相关的所有注册项。
+ * 在 moduleLoad 失败或 moduleUnload 时调用。 */
 void moduleUnregisterCleanup(RedisModule *module) {
     moduleFreeAuthenticatedClients(module);
     moduleUnregisterCommands(module);
@@ -12288,8 +12254,8 @@ void moduleUnregisterCleanup(RedisModule *module) {
     moduleUnregisterAuthCBs(module);
 }
 
-/* Load a module and initialize it. On success C_OK is returned, otherwise
- * C_ERR is returned. */
+/* moduleLoad: 加载并初始化一个模块。
+ * 成功返回 C_OK，否则返回 C_ERR。 */
 int moduleLoad(const char *path, void **module_argv, int module_argc, int is_loadex) {
     int (*onload)(void *, void **, int);
     void *handle;
@@ -12378,12 +12344,10 @@ int moduleLoad(const char *path, void **module_argv, int module_argc, int is_loa
     return C_OK;
 }
 
-/* Unload the module registered with the specified name. On success
- * C_OK is returned, otherwise C_ERR is returned and errmsg is set
- * with an appropriate message.
- * Only forcefully unload this module, passing forced_unload != 0, 
- * if it is certain that it has not yet been in use (e.g., immediate
- * unload on failed load). */
+/* moduleUnload: 卸载指定名称的已注册模块。
+ * 成功返回 C_OK，否则返回 C_ERR 并通过 errmsg 设置错误消息。
+ * 只有在确定模块尚未被使用时（例如加载失败后的立即卸载），
+ * 才应传入 forced_unload != 0 来强制卸载。 */
 int moduleUnload(sds name, const char **errmsg, int forced_unload) {
     struct RedisModule *module = dictFetchValue(modules,name);
 

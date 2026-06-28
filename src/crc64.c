@@ -26,11 +26,20 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE. */
 
+/*
+ * crc64.c - CRC64 校验和算法实现
+ *
+ * 本文件提供 CRC64 校验和的计算，用于 Redis 中
+ * 数据完整性校验。底层使用逐位算法（由 pycrc 生成），
+ * 上层通过 crcspeed 模块提供基于查找表的高速计算。
+ */
 #include "crc64.h"
 #include "crcspeed.h"
 static uint64_t crc64_table[8][256] = {{0}};
+/* CRC64 的 8x256 查找表，用于加速计算（slice-by-8）。 */
 
 #define POLY UINT64_C(0xad93d23594c935a9)
+/* CRC64 多项式：0xad93d23594c935a9 */
 /******************** BEGIN GENERATED PYCRC FUNCTIONS ********************/
 /**
  * Generated on Sun Dec 21 14:14:07 2014,
@@ -60,11 +69,11 @@ static uint64_t crc64_table[8][256] = {{0}};
  *****************************************************************************/
 
 /**
- * Reflect all bits of a \a data word of \a data_len bytes.
+ * 反转数据字的每一位。
  *
- * \param data         The data word to be reflected.
- * \param data_len     The width of \a data expressed in number of bits.
- * \return             The reflected data.
+ * \param data     待反转的数据字。
+ * \param data_len 数据的宽度（以位为单位）。
+ * \return         反转后的数据。
  *****************************************************************************/
 static inline uint_fast64_t crc_reflect(uint_fast64_t data, size_t data_len) {
     uint_fast64_t ret = data & 0x01;
@@ -78,12 +87,12 @@ static inline uint_fast64_t crc_reflect(uint_fast64_t data, size_t data_len) {
 }
 
 /**
- *  Update the crc value with new data.
+ * 使用新数据更新 CRC 值。
  *
- * \param crc      The current crc value.
- * \param data     Pointer to a buffer of \a data_len bytes.
- * \param data_len Number of bytes in the \a data buffer.
- * \return         The updated crc value.
+ * \param crc      当前的 CRC 值。
+ * \param data     指向数据缓冲区的指针。
+ * \param data_len 数据缓冲区的字节数。
+ * \return         更新后的 CRC 值。
  ******************************************************************************/
 uint64_t _crc64(uint_fast64_t crc, const void *in_data, const uint64_t len) {
     const uint8_t *data = in_data;
@@ -112,17 +121,17 @@ uint64_t _crc64(uint_fast64_t crc, const void *in_data, const uint64_t len) {
 
 /******************** END GENERATED PYCRC FUNCTIONS ********************/
 
-/* Initializes the 16KB lookup tables. */
+/* 初始化 16KB 的查找表。 */
 void crc64_init(void) {
     crcspeed64native_init(_crc64, crc64_table);
 }
 
-/* Compute crc64 */
+/* 计算 CRC64 校验值。 */
 uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l) {
     return crcspeed64native(crc64_table, crc, (void *) s, l);
 }
 
-/* Test main */
+/* 测试主函数 */
 #ifdef REDIS_TEST
 #include <stdio.h>
 

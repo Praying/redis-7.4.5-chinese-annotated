@@ -1,23 +1,32 @@
 
+/*
+ * sha1.c - SHA-1 安全哈希算法实现
+ *
+ * 本文件实现了 SHA-1 消息摘要算法，用于 Redis 中
+ * 数据完整性校验。SHA-1 生成 160 位（20 字节）的
+ * 哈希值。
+ * 原始作者：Steve Reid <steve@edmweb.com>
+ * 许可：100% 公共领域
+ */
 /* from valgrind tests */
 
 /* ================ sha1.c ================ */
 /*
-SHA-1 in C
-By Steve Reid <steve@edmweb.com>
-100% Public Domain
+SHA-1 C 语言实现
+作者：Steve Reid <steve@edmweb.com>
+100% 公共领域
 
-Test Vectors (from FIPS PUB 180-1)
+测试向量（来自 FIPS PUB 180-1）
 "abc"
   A9993E36 4706816A BA3E2571 7850C26C 9CD0D89D
 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
   84983E44 1C3BD26E BAAE4AA1 F95129E5 E54670F1
-A million repetitions of "a"
+一百万个 "a" 的重复
   34AA973C D4C4DAA4 F61EEB2B DBAD2731 6534016F
 */
 
-/* #define LITTLE_ENDIAN * This should be #define'd already, if true. */
-/* #define SHA1HANDSOFF * Copies data before messing with it. */
+/* LITTLE_ENDIAN：如果系统是小端序则应已定义 */
+/* SHA1HANDSOFF：在处理前复制数据，避免修改原始数据 */
 
 #define SHA1HANDSOFF
 
@@ -28,10 +37,11 @@ A million repetitions of "a"
 #include "sha1.h"
 #include "config.h"
 
+/* 循环左移：将 value 左移 bits 位，溢出位补到低位 */
 #define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
 
-/* blk0() and blk() perform the initial expand. */
-/* I got the idea of expanding during the round function from SSLeay */
+/* blk0() 和 blk() 执行初始扩展。 */
+/* 轮函数中进行扩展的想法来自 SSLeay */
 #if BYTE_ORDER == LITTLE_ENDIAN
 #define blk0(i) (block->l[i] = (rol(block->l[i],24)&0xFF00FF00) \
     |(rol(block->l[i],8)&0x00FF00FF))
@@ -43,7 +53,7 @@ A million repetitions of "a"
 #define blk(i) (block->l[i&15] = rol(block->l[(i+13)&15]^block->l[(i+8)&15] \
     ^block->l[(i+2)&15]^block->l[i&15],1))
 
-/* (R0+R1), R2, R3, R4 are the different operations used in SHA1 */
+/* R0+R1、R2、R3、R4 是 SHA1 中使用的不同轮操作 */
 #define R0(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30);
 #define R1(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30);
 #define R2(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30);
@@ -51,7 +61,7 @@ A million repetitions of "a"
 #define R4(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30);
 
 
-/* Hash a single 512-bit block. This is the core of the algorithm. */
+/* 对单个 512 位块进行哈希。这是算法的核心。 */
 
 void SHA1Transform(uint32_t state[5], const unsigned char buffer[64])
 {
@@ -71,13 +81,13 @@ void SHA1Transform(uint32_t state[5], const unsigned char buffer[64])
      */
     CHAR64LONG16* block = (const CHAR64LONG16*)buffer;
 #endif
-    /* Copy context->state[] to working vars */
+    /* 将 context->state[] 复制到工作变量 */
     a = state[0];
     b = state[1];
     c = state[2];
     d = state[3];
     e = state[4];
-    /* 4 rounds of 20 operations each. Loop unrolled. */
+    /* 4 轮操作，每轮 20 次。循环已展开。 */
     R0(a,b,c,d,e, 0); R0(e,a,b,c,d, 1); R0(d,e,a,b,c, 2); R0(c,d,e,a,b, 3);
     R0(b,c,d,e,a, 4); R0(a,b,c,d,e, 5); R0(e,a,b,c,d, 6); R0(d,e,a,b,c, 7);
     R0(c,d,e,a,b, 8); R0(b,c,d,e,a, 9); R0(a,b,c,d,e,10); R0(e,a,b,c,d,11);
@@ -98,13 +108,13 @@ void SHA1Transform(uint32_t state[5], const unsigned char buffer[64])
     R4(c,d,e,a,b,68); R4(b,c,d,e,a,69); R4(a,b,c,d,e,70); R4(e,a,b,c,d,71);
     R4(d,e,a,b,c,72); R4(c,d,e,a,b,73); R4(b,c,d,e,a,74); R4(a,b,c,d,e,75);
     R4(e,a,b,c,d,76); R4(d,e,a,b,c,77); R4(c,d,e,a,b,78); R4(b,c,d,e,a,79);
-    /* Add the working vars back into context.state[] */
+    /* 将工作变量加回到 context.state[] */
     state[0] += a;
     state[1] += b;
     state[2] += c;
     state[3] += d;
     state[4] += e;
-    /* Wipe variables */
+    /* 清除变量 */
     a = b = c = d = e = 0;
 #ifdef SHA1HANDSOFF
     memset(block, '\0', sizeof(block));
@@ -112,11 +122,11 @@ void SHA1Transform(uint32_t state[5], const unsigned char buffer[64])
 }
 
 
-/* SHA1Init - Initialize new context */
+/* SHA1Init - 初始化新的上下文 */
 
 void SHA1Init(SHA1_CTX* context)
 {
-    /* SHA1 initialization constants */
+    /* SHA1 初始化常量 */
     context->state[0] = 0x67452301;
     context->state[1] = 0xEFCDAB89;
     context->state[2] = 0x98BADCFE;
@@ -134,7 +144,7 @@ void SHA1Init(SHA1_CTX* context)
 #pragma GCC diagnostic ignored "-Wstringop-overread"
 #endif
 
-/* Run your data through this. */
+/* 将数据传入此函数进行处理。 */
 
 void SHA1Update(SHA1_CTX* context, const unsigned char* data, uint32_t len)
 {
@@ -161,7 +171,7 @@ void SHA1Update(SHA1_CTX* context, const unsigned char* data, uint32_t len)
 #pragma GCC diagnostic pop
 #endif
 
-/* Add padding and return the message digest. */
+/* 添加填充并返回消息摘要。 */
 
 void SHA1Final(unsigned char digest[20], SHA1_CTX* context)
 {
@@ -202,7 +212,7 @@ void SHA1Final(unsigned char digest[20], SHA1_CTX* context)
         digest[i] = (unsigned char)
          ((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
     }
-    /* Wipe variables */
+    /* 清除变量 */
     memset(context, '\0', sizeof(*context));
     memset(&finalcount, '\0', sizeof(finalcount));
 }
@@ -212,6 +222,7 @@ void SHA1Final(unsigned char digest[20], SHA1_CTX* context)
 #define BUFSIZE 4096
 
 #define UNUSED(x) (void)(x)
+/* SHA1 测试函数 */
 int sha1Test(int argc, char **argv, int flags)
 {
     SHA1_CTX ctx;

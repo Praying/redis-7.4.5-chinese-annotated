@@ -27,19 +27,28 @@
   madler@alumni.caltech.edu
  */
 
+/*
+ * crcspeed.c - CRC 加速计算模块
+ *
+ * 本模块实现了基于查找表的 CRC 高速计算算法
+ * （slice-by-8 技术）。支持 64 位和 16 位 CRC，
+ * 并根据系统字节序自动选择小端或大端实现。
+ * 原始作者：Mark Adler，修改者：Matt Stancliff。
+ */
+
 #include "crcspeed.h"
 
-/* Fill in a CRC constants table. */
+/* 填充 CRC 常量查找表（小端序，64 位 CRC）。 */
 void crcspeed64little_init(crcfn64 crcfn, uint64_t table[8][256]) {
     uint64_t crc;
 
-    /* generate CRCs for all single byte sequences */
+    /* 为所有单字节序列生成 CRC 值 */
     for (int n = 0; n < 256; n++) {
         unsigned char v = n;
         table[0][n] = crcfn(0, &v, 1);
     }
 
-    /* generate nested CRC table for future slice-by-8 lookup */
+    /* 生成嵌套 CRC 表，用于后续的 slice-by-8 查找 */
     for (int n = 0; n < 256; n++) {
         crc = table[0][n];
         for (int k = 1; k < 8; k++) {
@@ -49,15 +58,16 @@ void crcspeed64little_init(crcfn64 crcfn, uint64_t table[8][256]) {
     }
 }
 
+/* 填充 CRC 常量查找表（小端序，16 位 CRC）。 */
 void crcspeed16little_init(crcfn16 crcfn, uint16_t table[8][256]) {
     uint16_t crc;
 
-    /* generate CRCs for all single byte sequences */
+    /* 为所有单字节序列生成 CRC 值 */
     for (int n = 0; n < 256; n++) {
         table[0][n] = crcfn(0, &n, 1);
     }
 
-    /* generate nested CRC table for future slice-by-8 lookup */
+    /* 生成嵌套 CRC 表，用于后续的 slice-by-8 查找 */
     for (int n = 0; n < 256; n++) {
         crc = table[0][n];
         for (int k = 1; k < 8; k++) {
@@ -67,7 +77,7 @@ void crcspeed16little_init(crcfn16 crcfn, uint16_t table[8][256]) {
     }
 }
 
-/* Reverse the bytes in a 64-bit word. */
+/* 反转 64 位字中的字节顺序。 */
 static inline uint64_t rev8(uint64_t a) {
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_bswap64(a);
@@ -82,10 +92,10 @@ static inline uint64_t rev8(uint64_t a) {
 #endif
 }
 
-/* This function is called once to initialize the CRC table for use on a
-   big-endian architecture. */
+/* 此函数在大端架构上调用一次，用于初始化
+ * CRC 查找表。 */
 void crcspeed64big_init(crcfn64 fn, uint64_t big_table[8][256]) {
-    /* Create the little endian table then reverse all the entries. */
+    /* 先创建小端序表，然后反转所有条目。 */
     crcspeed64little_init(fn, big_table);
     for (int k = 0; k < 8; k++) {
         for (int n = 0; n < 256; n++) {
@@ -94,8 +104,9 @@ void crcspeed64big_init(crcfn64 fn, uint64_t big_table[8][256]) {
     }
 }
 
+/* 为大端架构初始化 16 位 CRC 查找表。 */
 void crcspeed16big_init(crcfn16 fn, uint16_t big_table[8][256]) {
-    /* Create the little endian table then reverse all the entries. */
+    /* 先创建小端序表，然后反转所有条目。 */
     crcspeed16little_init(fn, big_table);
     for (int k = 0; k < 8; k++) {
         for (int n = 0; n < 256; n++) {
@@ -104,22 +115,20 @@ void crcspeed16big_init(crcfn16 fn, uint16_t big_table[8][256]) {
     }
 }
 
-/* Calculate a non-inverted CRC multiple bytes at a time on a little-endian
- * architecture. If you need inverted CRC, invert *before* calling and invert
- * *after* calling.
- * 64 bit crc = process 8 bytes at once;
- */
+/* 在小端架构上一次处理多个字节来计算非反转的 CRC。
+ * 如需反转 CRC，应在调用前后分别进行反转。
+ * 64 位 CRC = 一次处理 8 个字节。 */
 uint64_t crcspeed64little(uint64_t little_table[8][256], uint64_t crc,
                           void *buf, size_t len) {
     unsigned char *next = buf;
 
-    /* process individual bytes until we reach an 8-byte aligned pointer */
+    /* 逐字节处理，直到指针达到 8 字节对齐 */
     while (len && ((uintptr_t)next & 7) != 0) {
         crc = little_table[0][(crc ^ *next++) & 0xff] ^ (crc >> 8);
         len--;
     }
 
-    /* fast middle processing, 8 bytes (aligned!) per loop */
+    /* 快速中间处理，每次循环处理 8 字节（已对齐！） */
     while (len >= 8) {
         crc ^= *(uint64_t *)next;
         crc = little_table[7][crc & 0xff] ^
@@ -134,7 +143,7 @@ uint64_t crcspeed64little(uint64_t little_table[8][256], uint64_t crc,
         len -= 8;
     }
 
-    /* process remaining bytes (can't be larger than 8) */
+    /* 处理剩余字节（不超过 8 个） */
     while (len) {
         crc = little_table[0][(crc ^ *next++) & 0xff] ^ (crc >> 8);
         len--;
@@ -143,17 +152,18 @@ uint64_t crcspeed64little(uint64_t little_table[8][256], uint64_t crc,
     return crc;
 }
 
+/* 在小端架构上计算 16 位 CRC，每次处理 8 字节。 */
 uint16_t crcspeed16little(uint16_t little_table[8][256], uint16_t crc,
                           void *buf, size_t len) {
     unsigned char *next = buf;
 
-    /* process individual bytes until we reach an 8-byte aligned pointer */
+    /* 逐字节处理，直到指针达到 8 字节对齐 */
     while (len && ((uintptr_t)next & 7) != 0) {
         crc = little_table[0][((crc >> 8) ^ *next++) & 0xff] ^ (crc << 8);
         len--;
     }
 
-    /* fast middle processing, 8 bytes (aligned!) per loop */
+    /* 快速中间处理，每次循环处理 8 字节（已对齐！） */
     while (len >= 8) {
         uint64_t n = *(uint64_t *)next;
         crc = little_table[7][(n & 0xff) ^ ((crc >> 8) & 0xff)] ^
@@ -168,7 +178,7 @@ uint16_t crcspeed16little(uint16_t little_table[8][256], uint16_t crc,
         len -= 8;
     }
 
-    /* process remaining bytes (can't be larger than 8) */
+    /* 处理剩余字节（不超过 8 个） */
     while (len) {
         crc = little_table[0][((crc >> 8) ^ *next++) & 0xff] ^ (crc << 8);
         len--;
@@ -177,8 +187,7 @@ uint16_t crcspeed16little(uint16_t little_table[8][256], uint16_t crc,
     return crc;
 }
 
-/* Calculate a non-inverted CRC eight bytes at a time on a big-endian
- * architecture.
+/* 在大端架构上一次处理 8 字节来计算非反转的 CRC。
  */
 uint64_t crcspeed64big(uint64_t big_table[8][256], uint64_t crc, void *buf,
                        size_t len) {
@@ -212,7 +221,7 @@ uint64_t crcspeed64big(uint64_t big_table[8][256], uint64_t crc, void *buf,
     return rev8(crc);
 }
 
-/* WARNING: Completely untested on big endian architecture.  Possibly broken. */
+/* 警告：在大端架构上完全未经测试，可能存在问题。 */
 uint16_t crcspeed16big(uint16_t big_table[8][256], uint16_t crc_in, void *buf,
                        size_t len) {
     unsigned char *next = buf;
@@ -246,10 +255,9 @@ uint16_t crcspeed16big(uint16_t big_table[8][256], uint16_t crc_in, void *buf,
     return rev8(crc);
 }
 
-/* Return the CRC of buf[0..len-1] with initial crc, processing eight bytes
-   at a time using passed-in lookup table.
-   This selects one of two routines depending on the endianness of
-   the architecture. */
+/* 返回 buf[0..len-1] 的 CRC 值，使用传入的查找表
+ * 每次处理 8 字节。根据系统字节序自动选择
+ * 小端或大端处理例程。 */
 uint64_t crcspeed64native(uint64_t table[8][256], uint64_t crc, void *buf,
                           size_t len) {
     uint64_t n = 1;
@@ -266,7 +274,7 @@ uint16_t crcspeed16native(uint16_t table[8][256], uint16_t crc, void *buf,
                        : crcspeed16big(table, crc, buf, len);
 }
 
-/* Initialize CRC lookup table in architecture-dependent manner. */
+/* 根据系统架构初始化 CRC 查找表。 */
 void crcspeed64native_init(crcfn64 fn, uint64_t table[8][256]) {
     uint64_t n = 1;
 

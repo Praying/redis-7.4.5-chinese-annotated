@@ -8,9 +8,28 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
+/*
+ * debug.c - Redis 调试与崩溃报告模块
+ *
+ * 本文件实现了 Redis 的调试子系统，主要包括以下功能：
+ * 1. DEBUG 命令处理（debugCommand）
+ *    - 提供 segfault、panic、reload、digest 等调试子命令
+ * 2. 数据集摘要计算（digest）
+ *    - 使用 SHA1 + XOR 运算为数据库内容生成唯一摘要
+ * 3. 断言与崩溃处理
+ *    - _serverAssert / _serverPanic 等断言失败处理函数
+ *    - 信号处理器（SIGSEGV、SIGBUS 等）
+ * 4. 崩溃报告生成
+ *    - 记录堆栈跟踪、寄存器状态、服务器信息、客户端信息等
+ * 5. 软件看门狗（watchdog）
+ *    - 通过 SIGALRM 定时输出堆栈跟踪
+ * 6. 内存测试
+ *    - 在崩溃时进行快速内存检测
+ */
+
 #include "server.h"
 #include "util.h"
-#include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
+#include "sha1.h"   /* SHA1 用于 DEBUG DIGEST 摘要计算 */
 #include "crc64.h"
 #include "bio.h"
 #include "quicklist.h"
@@ -27,9 +46,9 @@
 #include <unistd.h>
 
 #ifdef HAVE_BACKTRACE
-#include <execinfo.h>
+#include <execinfo.h>     /* backtrace() 和 backtrace_symbols_fd() */
 #ifndef __OpenBSD__
-#include <ucontext.h>
+#include <ucontext.h>     /* 获取信号处理器中的寄存器上下文 */
 #else
 typedef ucontext_t sigcontext_t;
 #endif
@@ -42,31 +61,33 @@ typedef ucontext_t sigcontext_t;
 #endif
 
 #if defined(__APPLE__) && defined(__arm64__)
-#include <mach/mach.h>
+#include <mach/mach.h>    /* macOS ARM64 上用于获取线程状态 */
 #endif
 
-/* Globals */
-static int bug_report_start = 0; /* True if bug report header was already logged. */
+/* =============================== 全局变量 =============================== */
+static int bug_report_start = 0;
+/* 标志位：bug 报告头是否已输出 */
 static pthread_mutex_t bug_report_start_mutex = PTHREAD_MUTEX_INITIALIZER;
-/* Mutex for a case when two threads crash at the same time. */
+/* 互斥锁：防止两个线程同时崩溃时并发写入报告 */
 static pthread_mutex_t signal_handler_lock;
 static pthread_mutexattr_t signal_handler_lock_attr;
 static volatile int signal_handler_lock_initialized = 0;
-/* Forward declarations */
+/* 前向声明 */
 int bugReportStart(void);
 void printCrashReport(void);
 void bugReportEnd(int killViaSignal, int sig);
 void logStackTrace(void *eip, int uplevel, int current_thread);
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret);
 
-/* ================================= Debugging ============================== */
+/* ================================ 调试功能 ================================ */
 
-/* Compute the sha1 of string at 's' with 'len' bytes long.
- * The SHA1 is then xored against the string pointed by digest.
- * Since xor is commutative, this operation is used in order to
- * "add" digests relative to unordered elements.
+/*
+ * 计算长度为 len 的数据 ptr 的 SHA1 值，
+ * 然后将结果与 digest 进行 XOR 运算。
  *
- * So digest(a,b,c,d) will be the same of digest(b,a,c,d) */
+ * 由于 XOR 满足交换律，此操作可用于聚合无序元素的摘要，
+ * 因此 digest(a,b,c,d) 与 digest(b,a,c,d) 的结果相同。
+ */
 void xorDigest(unsigned char *digest, const void *ptr, size_t len) {
     SHA1_CTX ctx;
     unsigned char hash[20];
@@ -80,25 +101,25 @@ void xorDigest(unsigned char *digest, const void *ptr, size_t len) {
         digest[j] ^= hash[j];
 }
 
+/* xorStringObjectDigest - 对字符串对象计算 XOR 摘要 */
 void xorStringObjectDigest(unsigned char *digest, robj *o) {
     o = getDecodedObject(o);
     xorDigest(digest,o->ptr,sdslen(o->ptr));
     decrRefCount(o);
 }
 
-/* This function instead of just computing the SHA1 and xoring it
- * against digest, also perform the digest of "digest" itself and
- * replace the old value with the new one.
+/*
+ * 与 xorDigest 不同，此函数不仅计算 SHA1 并与 digest 进行 XOR，
+ * 还会对 XOR 后的 digest 本身再次计算 SHA1，并用新值替换旧值。
  *
- * So the final digest will be:
+ * 最终公式为：
+ *   digest = SHA1(digest xor SHA1(data))
  *
- * digest = SHA1(digest xor SHA1(data))
+ * 此函数用于需要保持顺序的场景，
+ * 因此 digest(a,b,c,d) 与 digest(b,c,d,a) 的结果不同。
  *
- * This function is used every time we want to preserve the order so
- * that digest(a,b,c,d) will be different than digest(b,c,d,a)
- *
- * Also note that mixdigest("foo") followed by mixdigest("bar")
- * will lead to a different digest compared to "fo", "obar".
+ * 注意：mixDigest("foo") 后再 mixDigest("bar")
+ * 与 mixDigest("fo") 后再 mixDigest("obar") 的结果不同。
  */
 void mixDigest(unsigned char *digest, const void *ptr, size_t len) {
     SHA1_CTX ctx;
@@ -109,27 +130,28 @@ void mixDigest(unsigned char *digest, const void *ptr, size_t len) {
     SHA1Final(digest,&ctx);
 }
 
+/* mixStringObjectDigest - 对字符串对象计算有序混合摘要 */
 void mixStringObjectDigest(unsigned char *digest, robj *o) {
     o = getDecodedObject(o);
     mixDigest(digest,o->ptr,sdslen(o->ptr));
     decrRefCount(o);
 }
 
-/* This function computes the digest of a data structure stored in the
- * object 'o'. It is the core of the DEBUG DIGEST command: when taking the
- * digest of a whole dataset, we take the digest of the key and the value
- * pair, and xor all those together.
+/*
+ * 计算存储在对象 o 中的数据结构的摘要。
+ * 此函数是 DEBUG DIGEST 命令的核心：计算整个数据集的摘要时，
+ * 对每个键值对计算摘要，然后将所有摘要通过 XOR 合并。
  *
- * Note that this function does not reset the initial 'digest' passed, it
- * will continue mixing this object digest to anything that was already
- * present. */
+ * 注意：此函数不会重置传入的 digest 初始值，
+ * 而是将对象的摘要混合到已有的摘要中。
+ */
 void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) {
     uint32_t aux = htonl(o->type);
     mixDigest(digest,&aux,sizeof(aux));
     long long expiretime = getExpire(db,keyobj);
     char buf[128];
 
-    /* Save the key and associated value */
+    /* 根据对象类型，对键和关联的值计算摘要 */
     if (o->type == OBJ_STRING) {
         mixStringObjectDigest(digest,o);
     } else if (o->type == OBJ_LIST) {
@@ -207,16 +229,16 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             unsigned char eledigest[20];
             sds sdsele;
 
-            /* field */
+            /* 计算字段名的摘要 */
             memset(eledigest,0,20);
             sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_KEY);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
-            /* val */
+            /* 计算字段值的摘要 */
             sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_VALUE);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
-            /* hash-field expiration (HFE) */
+            /* 哈希字段过期时间（HFE） */
             if (hi->expire_time != EB_EXPIRE_TIME_INVALID)
                 xorDigest(eledigest,"!!hexpire!!",11);
             xorDigest(digest,eledigest,20);
@@ -255,23 +277,26 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
     } else {
         serverPanic("Unknown object type");
     }
-    /* If the key has an expire, add it to the mix */
+    /* 如果键设置了过期时间，将其加入摘要混合 */
     if (expiretime != -1) xorDigest(digest,"!!expire!!",10);
 }
 
-/* Compute the dataset digest. Since keys, sets elements, hashes elements
- * are not ordered, we use a trick: every aggregate digest is the xor
- * of the digests of their elements. This way the order will not change
- * the result. For list instead we use a feedback entering the output digest
- * as input in order to ensure that a different ordered list will result in
- * a different digest. */
+/*
+ * 计算整个数据集的摘要。
+ *
+ * 由于键、集合元素、哈希元素是无序的，我们使用一个技巧：
+ * 每个聚合摘要都是其元素摘要的 XOR 结果，
+ * 这样顺序就不会影响结果。
+ * 对于列表（list），我们使用反馈机制，将输出摘要作为输入，
+ * 以确保不同顺序的列表会产生不同的摘要。
+ */
 void computeDatasetDigest(unsigned char *final) {
     unsigned char digest[20];
     dictEntry *de;
     int j;
     uint32_t aux;
 
-    memset(final,0,20); /* Start with a clean result */
+    memset(final,0,20); /* 以全零值作为初始摘要 */
 
     for (j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
@@ -279,16 +304,16 @@ void computeDatasetDigest(unsigned char *final) {
             continue;
         kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys);
 
-        /* hash the DB id, so the same dataset moved in a different DB will lead to a different digest */
+        /* 将 DB ID 加入摘要，使得相同数据集在不同 DB 中产生不同摘要 */
         aux = htonl(j);
         mixDigest(final,&aux,sizeof(aux));
 
-        /* Iterate this DB writing every entry */
+        /* 遍历当前 DB 的所有键值对 */
         while((de = kvstoreIteratorNext(kvs_it)) != NULL) {
             sds key;
             robj *keyobj, *o;
 
-            memset(digest,0,20); /* This key-val digest */
+            memset(digest,0,20); /* 当前键值对的摘要 */
             key = dictGetKey(de);
             keyobj = createStringObject(key,sdslen(key));
 
@@ -297,7 +322,7 @@ void computeDatasetDigest(unsigned char *final) {
             o = dictGetVal(de);
             xorObjectDigest(db,keyobj,digest,o);
 
-            /* We can finally xor the key-val digest to the final digest */
+            /* 将当前键值对的摘要 XOR 到最终摘要中 */
             xorDigest(final,digest,20);
             decrRefCount(keyobj);
         }
@@ -306,9 +331,15 @@ void computeDatasetDigest(unsigned char *final) {
 }
 
 #ifdef USE_JEMALLOC
+/*
+ * mallctl_int - 通过 je_mallctl 获取或设置 jemalloc 整型配置项。
+ *
+ * 首先尝试 int64 大小，如果失败则依次尝试更小的类型
+ * （int32、bool），以兼容不同配置项的数据类型。
+ */
 void mallctl_int(client *c, robj **argv, int argc) {
     int ret;
-    /* start with the biggest size (int64), and if that fails, try smaller sizes (int32, bool) */
+    /* 从最大的 int64 开始尝试，失败则尝试更小的类型 */
     int64_t old = 0, val;
     if (argc > 1) {
         long long ll;
@@ -321,14 +352,14 @@ void mallctl_int(client *c, robj **argv, int argc) {
         size_t zz = sz;
         if ((ret=je_mallctl(argv[0]->ptr, &old, &zz, argc > 1? &val: NULL, argc > 1?sz: 0))) {
             if (ret == EPERM && argc > 1) {
-                /* if this option is write only, try just writing to it. */
+                /* 如果此选项是只写的，尝试仅写入 */
                 if (!(ret=je_mallctl(argv[0]->ptr, NULL, 0, &val, sz))) {
                     addReply(c, shared.ok);
                     return;
                 }
             }
             if (ret==EINVAL) {
-                /* size might be wrong, try a smaller one */
+                /* 大小可能不正确，尝试更小的类型 */
                 sz /= 2;
 #if BYTE_ORDER == BIG_ENDIAN
                 val <<= 8*sz;
@@ -348,13 +379,17 @@ void mallctl_int(client *c, robj **argv, int argc) {
     addReplyErrorFormat(c,"%s", strerror(EINVAL));
 }
 
+/*
+ * mallctl_string - 通过 je_mallctl 获取或设置 jemalloc 字符串配置项。
+ * 对于字符串类型，需要先读取旧值再进行覆盖。
+ */
 void mallctl_string(client *c, robj **argv, int argc) {
     int rret, wret;
     char *old;
     size_t sz = sizeof(old);
-    /* for strings, it seems we need to first get the old value, before overriding it. */
+    /* 对于字符串类型，需要先获取旧值，再进行覆盖写入 */
     if ((rret=je_mallctl(argv[0]->ptr, &old, &sz, NULL, 0))) {
-        /* return error unless this option is write only. */
+        /* 除非此选项是只写的，否则返回错误 */
         if (!(rret == EPERM && argc > 1)) {
             addReplyErrorFormat(c,"%s", strerror(rret));
             return;
@@ -376,6 +411,23 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+/*
+ * debugCommand - 处理 DEBUG 命令的入口函数。
+ *
+ * DEBUG 是一个多功能调试命令，包含众多子命令，主要用于
+ * 开发和测试环境。以下为常用子命令：
+ *
+ * - SEGFAULT / PANIC: 触发崩溃（用于测试崩溃报告）
+ * - RELOAD: 重新加载 RDB 文件
+ * - LOADAOF: 重新加载 AOF 文件
+ * - DIGEST: 计算当前数据集的摘要
+ * - OBJECT: 显示键的底层对象信息
+ * - POPULATE: 批量创建测试数据
+ * - SLEEP: 让服务器休眠指定时间
+ * - PROTOCOL: 测试各种 RESP 协议回复类型
+ * - RESTART / CRASH-AND-RECOVER: 重启服务器
+ * - OOM: 模拟内存耗尽
+ */
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
@@ -490,9 +542,9 @@ NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
-        /* Compiler gives warnings about writing to a random address
-         * e.g "*((char*)-1) = 'x';". As a workaround, we map a read-only area
-         * and try to write there to trigger segmentation fault. */
+        /* 向随机地址写入（如 "*((char*)-1) = 'x'"）会触发编译器警告。
+         * 作为替代方案，我们映射一个只读内存区域，
+         * 然后尝试写入该区域来触发段错误（SIGSEGV）。 */
         char* p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
         *p = 'x';
     } else if (!strcasecmp(c->argv[1]->ptr,"panic")) {
@@ -512,7 +564,7 @@ NULL
         restartServer(flags,delay);
         addReplyError(c,"failed to restart the server. Check server logs.");
     } else if (!strcasecmp(c->argv[1]->ptr,"oom")) {
-        void *ptr = zmalloc(SIZE_MAX/2); /* Should trigger an out of memory. */
+        void *ptr = zmalloc(SIZE_MAX/2); /* 应该会触发内存耗尽 */
         zfree(ptr);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"assert")) {
@@ -527,8 +579,7 @@ NULL
         int flush = 1, save = 1;
         int flags = RDBFLAGS_NONE;
 
-        /* Parse the additional options that modify the RELOAD
-         * behavior. */
+        /* 解析修改 RELOAD 行为的附加选项 */
         for (int j = 2; j < c->argc; j++) {
             char *opt = c->argv[j]->ptr;
             if (!strcasecmp(opt,"MERGE")) {
@@ -544,8 +595,7 @@ NULL
             }
         }
 
-        /* The default behavior is to save the RDB file before loading
-         * it back. */
+        /* 默认行为是先保存 RDB 文件，然后再加载回来 */
         if (save) {
             rdbSaveInfo rsi, *rsiptr;
             rsiptr = rdbPopulateSaveInfo(&rsi);
@@ -555,9 +605,9 @@ NULL
             }
         }
 
-        /* The default behavior is to remove the current dataset from
-         * memory before loading the RDB file, however when MERGE is
-         * used together with NOFLUSH, we are able to merge two datasets. */
+        /* 默认行为是在加载 RDB 文件前清除当前数据集。
+         * 但当 MERGE 和 NOFLUSH 选项同时使用时，
+         * 可以将两个数据集合并。 */
         if (flush) emptyData(-1,EMPTYDB_NO_FLAGS,NULL);
 
         protectClient(c);
@@ -582,7 +632,7 @@ NULL
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
-        server.dirty = 0; /* Prevent AOF / replication */
+        server.dirty = 0; /* 防止触发 AOF 写入或复制 */
         serverLog(LL_NOTICE,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"drop-cluster-packet-filter") && c->argc == 3) {
@@ -608,25 +658,25 @@ NULL
             char *nextra = extra;
             int remaining = sizeof(extra);
             quicklist *ql = val->ptr;
-            /* Add number of quicklist nodes */
+            /* 添加 quicklist 节点数量 */
             int used = snprintf(nextra, remaining, " ql_nodes:%lu", ql->len);
             nextra += used;
             remaining -= used;
-            /* Add average quicklist fill factor */
+            /* 添加 quicklist 平均填充因子 */
             double avg = (double)ql->count/ql->len;
             used = snprintf(nextra, remaining, " ql_avg_node:%.2f", avg);
             nextra += used;
             remaining -= used;
-            /* Add quicklist fill level / max listpack size */
+            /* 添加 quicklist 填充级别 / 最大 listpack 大小 */
             used = snprintf(nextra, remaining, " ql_listpack_max:%d", ql->fill);
             nextra += used;
             remaining -= used;
-            /* Add isCompressed? */
+            /* 是否已压缩 */
             int compressed = ql->compress != 0;
             used = snprintf(nextra, remaining, " ql_compressed:%d", compressed);
             nextra += used;
             remaining -= used;
-            /* Add total uncompressed size */
+            /* 添加未压缩总大小 */
             unsigned long sz = 0;
             for (quicklistNode *node = ql->head; node; node = node->next) {
                 sz += node->sz;
@@ -743,7 +793,7 @@ NULL
         }
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"digest") && c->argc == 2) {
-        /* DEBUG DIGEST (form without keys specified) */
+        /* DEBUG DIGEST（不指定键的形式，计算整个数据集的摘要） */
         unsigned char digest[20];
         sds d = sdsempty();
 
@@ -752,14 +802,14 @@ NULL
         addReplyStatus(c,d);
         sdsfree(d);
     } else if (!strcasecmp(c->argv[1]->ptr,"digest-value") && c->argc >= 2) {
-        /* DEBUG DIGEST-VALUE key key key ... key. */
+        /* DEBUG DIGEST-VALUE key key key ... key（计算指定键的值摘要） */
         addReplyArrayLen(c,c->argc-2);
         for (int j = 2; j < c->argc; j++) {
             unsigned char digest[20];
-            memset(digest,0,20); /* Start with a clean result */
+            memset(digest,0,20); /* 以全零作为初始摘要 */
 
-            /* We don't use lookupKey because a debug command should
-             * work on logically expired keys */
+            /* 不使用 lookupKey，因为调试命令应该能操作
+             * 逻辑上已过期的键 */
             dictEntry *de;
             robj *o = ((de = dbFind(c->db, c->argv[j]->ptr)) == NULL) ? NULL : dictGetVal(de);
             if (o) xorObjectDigest(c->db,c->argv[j],digest,o);
@@ -803,8 +853,8 @@ NULL
                 addReplyBulkCString(c,"key:123");
                 addReplyLongLong(c,90);
             }
-            /* Attributes are not real replies, so a well formed reply should
-             * also have a normal reply type after the attribute. */
+            /* 属性（Attribute）不是真正的回复，因此格式正确的回复
+             * 应在属性之后还有普通的回复类型。 */
             addReplyBulkCString(c,"Some real reply following the attribute");
         } else if (!strcasecmp(name,"push")) {
             if (c->resp < 3) {
@@ -817,9 +867,8 @@ NULL
             addReplyBulkCString(c,"server-cpu-usage");
             addReplyLongLong(c,42);
             if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
-            /* Push replies are not synchronous replies, so we emit also a
-             * normal reply in order for blocking clients just discarding the
-             * push reply, to actually consume the reply and continue. */
+            /* Push 回复不是同步回复，因此还需要发送一个普通回复，
+             * 以便丢弃 push 回复的阻塞客户端能够消费此回复并继续执行。 */
             addReplyBulkCString(c,"Some real reply following the push reply");
         } else if (!strcasecmp(name,"true")) {
             addReplyBool(c,1);
@@ -872,7 +921,7 @@ NULL
         sds errstr = sdsnewlen("-",1);
 
         errstr = sdscatsds(errstr,c->argv[2]->ptr);
-        errstr = sdsmapchars(errstr,"\n\r","  ",2); /* no newlines in errors. */
+        errstr = sdsmapchars(errstr,"\n\r","  ",2); /* 错误消息中不允许换行 */
         errstr = sdscatlen(errstr,"\r\n",2);
         addReplySds(c,errstr);
     } else if (!strcasecmp(c->argv[1]->ptr,"structsize") && c->argc == 2) {
@@ -925,7 +974,7 @@ NULL
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
 
-        /* Get the hash table reference from the object, if possible. */
+        /* 尝试从对象中获取哈希表引用 */
         switch (o->encoding) {
         case OBJ_ENCODING_SKIPLIST:
             {
@@ -1047,8 +1096,20 @@ NULL
     }
 }
 
-/* =========================== Crash handling  ============================== */
+/* ============================= 崩溃处理 ================================ */
 
+/*
+ * _serverAssert - 处理服务器断言失败。
+ *
+ * 当 serverAssert() 宏的条件不满足时调用此函数。
+ * 它会启动 bug 报告、记录断言失败信息、输出堆栈跟踪
+ * 以及完整的崩溃报告，然后终止进程。
+ *
+ * 参数：
+ *   estr: 断言表达式的字符串形式
+ *   file: 触发断言的源文件名
+ *   line: 触发断言的行号
+ */
 __attribute__ ((noinline))
 void _serverAssert(const char *estr, const char *file, int line) {
     int new_report = bugReportStart();
@@ -1059,21 +1120,22 @@ void _serverAssert(const char *estr, const char *file, int line) {
 #ifdef HAVE_BACKTRACE
         logStackTrace(NULL, 1, 0);
 #endif
-        /* If this was a recursive assertion, it what most likely generated
-         * from printCrashReport. */
+        /* 如果是递归断言（即在 printCrashReport 中再次触发），
+         * 则不再重复输出崩溃报告。 */
         if (new_report) printCrashReport();
     }
 
-    // remove the signal handler so on abort() we will output the crash report.
+    // 移除信号处理器，这样在 abort() 时会输出崩溃报告
     removeSigSegvHandlers();
     bugReportEnd(0, 0);
 }
 
-/* Returns the amount of client's command arguments we allow logging */
+/* 返回允许记录的客户端命令参数数量 */
 int clientArgsToLog(const client *c) {
     return server.hide_user_data_from_log ? 1 : c->argc;
 }
 
+/* 输出断言失败时的客户端上下文信息 */
 void _serverAssertPrintClientInfo(const client *c) {
     int j;
     char conninfo[CONN_INFO_LEN];
@@ -1103,18 +1165,26 @@ void _serverAssertPrintClientInfo(const client *c) {
     }
 }
 
+/*
+ * serverLogObjectDebugInfo - 记录 Redis 对象的调试信息。
+ *
+ * 输出对象的类型、编码和引用计数。
+ * 如果启用了 UNSAFE_CRASH_REPORT，还会输出
+ * 对象的具体内容（字符串值、列表长度等）。
+ */
 void serverLogObjectDebugInfo(const robj *o) {
     serverLog(LL_WARNING,"Object type: %u", o->type);
     serverLog(LL_WARNING,"Object encoding: %u", o->encoding);
     serverLog(LL_WARNING,"Object refcount: %d", o->refcount);
 #if UNSAFE_CRASH_REPORT
-    /* This code is now disabled. o->ptr may be unreliable to print. in some
-     * cases a ziplist could have already been freed by realloc, but not yet
-     * updated to o->ptr. in other cases the call to ziplistLen may need to
-     * iterate on all the items in the list (and possibly crash again).
-     * For some cases it may be ok to crash here again, but these could cause
-     * invalid memory access which will bother valgrind and also possibly cause
-     * random memory portion to be "leaked" into the logfile. */
+    /* 此代码目前已被禁用。o->ptr 可能不可靠：
+     * 在某些情况下，ziplist 可能已被 realloc 释放，
+     * 但 o->ptr 尚未更新。
+     * 在另一些情况下，调用 ziplistLen 可能需要遍历
+     * 列表中的所有元素（并可能再次崩溃）。
+     * 虽然再次崩溃在某些场景下可以接受，
+     * 但无效内存访问会干扰 valgrind，
+     * 还可能导致随机内存内容"泄露"到日志文件中。 */
     if (o->type == OBJ_STRING && sdsEncodedObject(o)) {
         serverLog(LL_WARNING,"Object raw string len: %zu", sdslen(o->ptr));
         if (sdslen(o->ptr) < 4096) {
@@ -1150,6 +1220,13 @@ void _serverAssertWithInfo(const client *c, const robj *o, const char *estr, con
     _serverAssert(estr,file,line);
 }
 
+/*
+ * _serverPanic - 处理服务器 panic（严重错误）。
+ *
+ * 当 serverPanic() 宏被调用时触发此函数。
+ * 记录 "Guru Meditation" 错误信息（致敬 Amiga 崩溃提示），
+ * 输出堆栈跟踪和崩溃报告后终止进程。
+ */
 __attribute__ ((noinline))
 void _serverPanic(const char *file, int line, const char *msg, ...) {
     va_list ap;
@@ -1167,17 +1244,22 @@ void _serverPanic(const char *file, int line, const char *msg, ...) {
 #ifdef HAVE_BACKTRACE
         logStackTrace(NULL, 1, 0);
 #endif
-        /* If this was a recursive panic, it what most likely generated
-         * from printCrashReport. */
+        /* 如果是递归 panic（即在 printCrashReport 中再次触发），
+         * 则不再重复输出崩溃报告。 */
         if (new_report) printCrashReport();
     }
 
-    // remove the signal handler so on abort() we will output the crash report.
+    // 移除信号处理器，这样在 abort() 时会输出崩溃报告
     removeSigSegvHandlers();
     bugReportEnd(0, 0);
 }
 
-/* Start a bug report, returning 1 if this is the first time this function was called, 0 otherwise. */
+/*
+ * bugReportStart - 开始输出 bug 报告。
+ *
+ * 首次调用时输出报告头并返回 1，
+ * 后续调用返回 0（避免重复输出头部）。
+ */
 int bugReportStart(void) {
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
@@ -1193,13 +1275,26 @@ int bugReportStart(void) {
 
 #ifdef HAVE_BACKTRACE
 
-/* Returns the current eip and set it to the given new value (if its not NULL) */
+/*
+ * getAndSetMcontextEip - 获取当前 EIP（指令指针），
+ * 并可选地将其设置为新值。
+ *
+ * 此函数根据不同的操作系统和 CPU 架构，
+ * 从 ucontext_t 结构中读取/设置指令指针寄存器。
+ *
+ * 参数：
+ *   uc: 信号处理器的上下文
+ *   eip: 新的指令指针值，为 NULL 则仅读取
+ * 返回：旧的指令指针值
+ */
 static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
+/* 不支持的平台：返回 NULL */
 #define NOT_SUPPORTED() do {\
     UNUSED(uc);\
     UNUSED(eip);\
     return NULL;\
 } while(0)
+/* 获取旧值，如果 new_val 非空则设置新值，返回旧值 */
 #define GET_SET_RETURN(target_var, new_val) do {\
     void *old_val = (void*)target_var; \
     if (new_val) { \
@@ -1209,7 +1304,7 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
     return old_val; \
 } while(0)
 #if defined(__APPLE__) && !defined(MAC_OS_10_6_DETECTED)
-    /* OSX < 10.6 */
+    /* macOS < 10.6 */
     #if defined(__x86_64__)
     GET_SET_RETURN(uc->uc_mcontext->__ss.__rip, eip);
     #elif defined(__i386__)
@@ -1218,7 +1313,7 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
     GET_SET_RETURN(uc->uc_mcontext->__ss.__srr0, eip);
     #endif
 #elif defined(__APPLE__) && defined(MAC_OS_10_6_DETECTED)
-    /* OSX >= 10.6 */
+    /* macOS >= 10.6 */
     #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
     GET_SET_RETURN(uc->uc_mcontext->__ss.__rip, eip);
     #elif defined(__i386__)
@@ -1284,9 +1379,16 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
 #undef NOT_SUPPORTED
 }
 
+/*
+ * logStackContent - 输出栈内存内容。
+ *
+ * 从栈指针 sp 开始，向高地址方向打印 16 个栈帧的内容。
+ * 用于崩溃诊断时查看栈上的数据。
+ */
 REDIS_NO_SANITIZE("address")
 void logStackContent(void **sp) {
     if (server.hide_user_data_from_log) {
+        /* 如果启用了隐藏用户数据，则跳过栈内容输出以避免泄露个人信息 */
         serverLog(LL_NOTICE,"hide-user-data-from-log is on, skip logging stack content to avoid spilling PII.");
         return;
     }
@@ -1302,16 +1404,23 @@ void logStackContent(void **sp) {
     }
 }
 
-/* Log dump of processor registers */
+/*
+ * logRegisters - 输出处理器寄存器状态。
+ *
+ * 根据不同平台（macOS、Linux、FreeBSD、OpenBSD 等）
+ * 和架构（x86、x86_64、ARM、AArch64、RISC-V 等）
+ * 输出寄存器的当前值，用于崩溃诊断。
+ */
 void logRegisters(ucontext_t *uc) {
     serverLog(LL_WARNING|LL_RAW, "\n------ REGISTERS ------\n");
+/* 不支持的平台：输出提示信息 */
 #define NOT_SUPPORTED() do {\
     UNUSED(uc);\
     serverLog(LL_WARNING,\
               "  Dumping of registers not supported for this OS/arch");\
 } while(0)
 
-/* OSX */
+/* macOS */
 #if defined(__APPLE__) && defined(MAC_OS_10_6_DETECTED)
   /* OSX AMD64 */
     #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
@@ -1817,12 +1926,15 @@ void logRegisters(ucontext_t *uc) {
 
 #endif /* HAVE_BACKTRACE */
 
-/* Return a file descriptor to write directly to the Redis log with the
- * write(2) syscall, that can be used in critical sections of the code
- * where the rest of Redis can't be trusted (for example during the memory
- * test) or when an API call requires a raw fd.
+/*
+ * openDirectLogFiledes - 打开一个直接写入 Redis 日志的文件描述符。
  *
- * Close it with closeDirectLogFiledes(). */
+ * 使用 write(2) 系统调用直接写入，适用于代码中的临界区
+ * （例如内存测试期间），此时不能信任 Redis 的其余部分，
+ * 或者当 API 调用需要原始文件描述符时。
+ *
+ * 使用 closeDirectLogFiledes() 关闭。
+ */
 int openDirectLogFiledes(void) {
     int log_to_stdout = server.logfile[0] == '\0';
     int fd = log_to_stdout ?
@@ -1831,13 +1943,15 @@ int openDirectLogFiledes(void) {
     return fd;
 }
 
-/* Used to close what closeDirectLogFiledes() returns. */
+/* 关闭 openDirectLogFiledes() 返回的文件描述符 */
 void closeDirectLogFiledes(int fd) {
     int log_to_stdout = server.logfile[0] == '\0';
     if (!log_to_stdout) close(fd);
 }
 
+/* Linux 平台下的多线程堆栈跟踪支持 */
 #if defined(HAVE_BACKTRACE) && defined(__linux__)
+/* 用于在信号处理器和主线程之间传递堆栈跟踪数据的管道 */
 static int stacktrace_pipe[2] = {0};
 static void setupStacktracePipe(void) {
     if (-1 == anetPipe(stacktrace_pipe, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK)) {
@@ -1862,32 +1976,47 @@ static void setupStacktracePipe(void) {/* we don't need a pipe to write the stac
 #define TIDS_MAX_SIZE 50
 static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_SIZE]);
 
+/* 堆栈跟踪数据结构，用于在信号处理器中收集线程信息 */
 typedef struct {
-    char thread_name[16];
-    int trace_size;
-    pid_t tid;
-    void *trace[BACKTRACE_MAX_SIZE];
+    char thread_name[16];              /* 线程名称 */
+    int trace_size;                    /* 堆栈帧数量 */
+    pid_t tid;                         /* 线程 ID */
+    void *trace[BACKTRACE_MAX_SIZE];   /* 堆栈帧地址数组 */
 } stacktrace_data;
 
+/*
+ * collect_stacktrace_data - 收集当前线程的堆栈跟踪数据。
+ *
+ * 由 ThreadsManager_runOnThreads() 在各线程中调用，
+ * 收集后通过 stacktrace_pipe 发送给主线程。
+ * 此函数标记为 noinline 以确保 backtrace() 能正确跳过它。
+ */
 __attribute__ ((noinline)) static void collect_stacktrace_data(void) {
     stacktrace_data trace_data = {{0}};
 
-    /* Get the stack trace first! */
+    /* 首先获取堆栈跟踪！ */
     trace_data.trace_size = backtrace(trace_data.trace, BACKTRACE_MAX_SIZE);
 
-    /* get the thread name */
+    /* 获取线程名称 */
     prctl(PR_GET_NAME, trace_data.thread_name);
 
-    /* get the thread id */
+    /* 获取线程 ID */
     trace_data.tid = syscall(SYS_gettid);
 
-    /* Send the output to the main process*/
-    if (write(stacktrace_pipe[1], &trace_data, sizeof(trace_data)) == -1) {/* Avoid warning. */};
+    /* 将数据发送给主进程 */
+    if (write(stacktrace_pipe[1], &trace_data, sizeof(trace_data)) == -1) {/* 避免警告 */};
 }
 
+/*
+ * writeStacktraces - 收集并写入所有线程的堆栈跟踪。
+ *
+ * 此函数通过信号机制触发每个线程收集堆栈跟踪数据，
+ * 然后从 stacktrace_pipe 中读取数据并写入日志文件。
+ * 仅在 Linux 平台可用。
+ */
 __attribute__ ((noinline))
 static void writeStacktraces(int fd, int uplevel) {
-    /* get the list of all the process's threads that don't block or ignore the THREADS_SIGNAL */
+    /* 获取所有不阻塞或忽略 THREADS_SIGNAL 的线程列表 */
     pid_t tids[TIDS_MAX_SIZE];
     size_t len_tids = get_ready_to_signal_threads_tids(THREADS_SIGNAL, tids);
     if (!len_tids) {
@@ -1895,48 +2024,50 @@ static void writeStacktraces(int fd, int uplevel) {
     }
 
     char buff[PIPE_BUF];
-    /* Clear the stacktraces pipe */
+    /* 清空堆栈跟踪管道中的旧数据 */
     while (read(stacktrace_pipe[0], &buff, sizeof(buff)) > 0) {}
 
-    /* ThreadsManager_runOnThreads returns 0 if it is already running */
+    /* ThreadsManager_runOnThreads 返回 0 表示已在运行中 */
     if (!ThreadsManager_runOnThreads(tids, len_tids, collect_stacktrace_data)) return;
 
     size_t collected = 0;
 
     pid_t calling_tid = syscall(SYS_gettid);
 
-    /* Read the stacktrace_pipe until it's empty */
+    /* 从 stacktrace_pipe 中读取数据直到为空 */
     stacktrace_data curr_stacktrace_data = {{0}};
     while (read(stacktrace_pipe[0], &curr_stacktrace_data, sizeof(curr_stacktrace_data)) > 0) {
-        /* stacktrace header includes the tid and the thread's name */
+        /* 堆栈跟踪头部：线程 ID 和线程名称 */
         snprintf_async_signal_safe(buff, sizeof(buff), "\n%d %s", curr_stacktrace_data.tid, curr_stacktrace_data.thread_name);
-        if (write(fd,buff,strlen(buff)) == -1) {/* Avoid warning. */};
+        if (write(fd,buff,strlen(buff)) == -1) {/* 避免警告 */};
 
-        /* skip kernel call to the signal handler, the signal handler and the callback addresses */
+        /* 跳过内核信号处理调用、信号处理器和回调函数的地址 */
         int curr_uplevel = 3;
 
         if (curr_stacktrace_data.tid == calling_tid) {
-            /* skip signal syscall and ThreadsManager_runOnThreads */
+            /* 跳过 signal 系统调用和 ThreadsManager_runOnThreads */
             curr_uplevel += uplevel + 2;
-            /* Add an indication to header of the thread that is handling the log file */
-            if (write(fd," *\n",strlen(" *\n")) == -1) {/* Avoid warning. */};
+            /* 在当前处理日志的线程头部添加标记 */
+            if (write(fd," *\n",strlen(" *\n")) == -1) {/* 避免警告 */};
         } else {
-            /* just add a new line */
-            if (write(fd,"\n",strlen("\n")) == -1) {/* Avoid warning. */};
+            /* 仅添加换行 */
+            if (write(fd,"\n",strlen("\n")) == -1) {/* 避免警告 */};
         }
 
-        /* add the stacktrace */
+        /* 输出堆栈跟踪符号 */
         backtrace_symbols_fd(curr_stacktrace_data.trace+curr_uplevel, curr_stacktrace_data.trace_size-curr_uplevel, fd);
 
         ++collected;
     }
 
     snprintf_async_signal_safe(buff, sizeof(buff), "\n%lu/%lu expected stacktraces.\n", (long unsigned)(collected), (long unsigned)len_tids);
-    if (write(fd,buff,strlen(buff)) == -1) {/* Avoid warning. */};
+    if (write(fd,buff,strlen(buff)) == -1) {/* 避免编译器警告 */};
 
 }
 
 #endif /* __linux__ */
+
+/* writeCurrentThreadsStackTrace - 仅写入当前线程的堆栈跟踪 */
 __attribute__ ((noinline))
 static void writeCurrentThreadsStackTrace(int fd, int uplevel) {
     void *trace[BACKTRACE_MAX_SIZE];
@@ -1944,36 +2075,44 @@ static void writeCurrentThreadsStackTrace(int fd, int uplevel) {
     int trace_size = backtrace(trace, BACKTRACE_MAX_SIZE);
 
     char *msg = "\nBacktrace:\n";
-    if (write(fd,msg,strlen(msg)) == -1) {/* Avoid warning. */};
+    if (write(fd,msg,strlen(msg)) == -1) {/* 避免编译器警告 */};
     backtrace_symbols_fd(trace+uplevel, trace_size-uplevel, fd);
 }
 
-/* Logs the stack trace using the backtrace() call. This function is designed
- * to be called from signal handlers safely.
- * The eip argument is optional (can take NULL).
- * The uplevel argument indicates how many of the calling functions to skip.
- * Functions that are taken in consideration in "uplevel" should be declared with
- * __attribute__ ((noinline)) to make sure the compiler won't inline them.
+/*
+ * logStackTrace - 使用 backtrace() 记录堆栈跟踪。
+ *
+ * 此函数设计为可从信号处理器中安全调用。
+ *
+ * 参数：
+ *   eip: 指令指针（可选，可以为 NULL）
+ *   uplevel: 需要跳过的调用函数层数
+ *   current_thread: 非零值表示仅记录当前线程；
+ *                   在 Linux 上，0 表示记录所有线程
+ *
+ * 注意：参与 uplevel 计数的函数应使用
+ * __attribute__ ((noinline)) 声明，
+ * 以确保编译器不会将其内联。
  */
 __attribute__ ((noinline))
 void logStackTrace(void *eip, int uplevel, int current_thread) {
     int fd = openDirectLogFiledes();
     char *msg;
-    uplevel++; /* skip this function */
+    uplevel++; /* 跳过本函数自身 */
 
-    if (fd == -1) return; /* If we can't log there is anything to do. */
+    if (fd == -1) return; /* 无法记录日志则直接返回 */
 
     msg = "\n------ STACK TRACE ------\n";
-    if (write(fd,msg,strlen(msg)) == -1) {/* Avoid warning. */};
+    if (write(fd,msg,strlen(msg)) == -1) {/* 避免编译器警告 */};
 
     if (eip) {
-        /* Write EIP to the log file*/
+        /* 将 EIP（指令指针）写入日志文件 */
         msg = "EIP:\n";
-        if (write(fd,msg,strlen(msg)) == -1) {/* Avoid warning. */};
+        if (write(fd,msg,strlen(msg)) == -1) {/* 避免警告 */};
         backtrace_symbols_fd(&eip, 1, fd);
     }
 
-    /* Write symbols to log file */
+    /* 将堆栈符号写入日志文件 */
     ++uplevel;
 #ifdef __linux__
     if (current_thread) {
@@ -1982,20 +2121,21 @@ void logStackTrace(void *eip, int uplevel, int current_thread) {
         writeStacktraces(fd, uplevel);
     }
 #else
-    /* Outside of linux, we only support writing the current thread. */
+    /* 在非 Linux 平台上，仅支持写入当前线程的堆栈跟踪 */
     UNUSED(current_thread);
     writeCurrentThreadsStackTrace(fd, uplevel);
 #endif
     msg = "\n------ STACK TRACE DONE ------\n";
-    if (write(fd,msg,strlen(msg)) == -1) {/* Avoid warning. */};
+    if (write(fd,msg,strlen(msg)) == -1) {/* 避免编译器警告 */};
 
 
-    /* Cleanup */
+    /* 清理：关闭文件描述符 */
     closeDirectLogFiledes(fd);
 }
 
 #endif /* HAVE_BACKTRACE */
 
+/* genClusterDebugString - 生成集群调试信息字符串，包含集群信息和节点描述 */
 sds genClusterDebugString(sds infostring) {
     sds cluster_info = genClusterInfoString();
     sds cluster_nodes = clusterGenNodesDescription(NULL, 0, 0);
@@ -2011,7 +2151,7 @@ sds genClusterDebugString(sds infostring) {
     return infostring;
 }
 
-/* Log global server info */
+/* logServerInfo - 记录全局服务器信息（INFO 输出和客户端列表） */
 void logServerInfo(void) {
     sds infostring, clients;
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ INFO OUTPUT ------\n");
@@ -2033,7 +2173,7 @@ void logServerInfo(void) {
     decrRefCount(argv[0]);
 }
 
-/* Log certain config values, which can be used for debugging */
+/* logConfigDebugInfo - 记录配置调试信息 */
 void logConfigDebugInfo(void) {
     sds configstring;
     configstring = getConfigDebugInfo();
@@ -2042,7 +2182,7 @@ void logConfigDebugInfo(void) {
     sdsfree(configstring);
 }
 
-/* Log modules info. Something we wanna do last since we fear it may crash. */
+/* logModulesInfo - 记录模块信息。放在最后执行，因为它可能崩溃。 */
 void logModulesInfo(void) {
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ MODULES INFO OUTPUT ------\n");
     sds infostring = modulesCollectInfo(sdsempty(), NULL, 1, 0);
@@ -2050,9 +2190,12 @@ void logModulesInfo(void) {
     sdsfree(infostring);
 }
 
-/* Log information about the "current" client, that is, the client that is
- * currently being served by Redis. May be NULL if Redis is not serving a
- * client right now. */
+/*
+ * logCurrentClient - 记录"当前"客户端的信息。
+ *
+ * "当前"客户端是指 Redis 正在服务的客户端。
+ * 如果 Redis 当前没有在服务客户端，则 cc 为 NULL。
+ */
 void logCurrentClient(client *cc, const char *title) {
     if (cc == NULL) return;
 
@@ -2081,8 +2224,8 @@ void logCurrentClient(client *cc, const char *title) {
         sdsfree(repr);
         decrRefCount(decoded);
     }
-    /* Check if the first argument, usually a key, is found inside the
-     * selected DB, and if so print info about the associated object. */
+    /* 检查第一个参数（通常是键）是否存在于当前数据库中，
+     * 如果存在则输出关联对象的信息。 */
     if (cc->argc > 1) {
         robj *val, *key;
         dictEntry *de;
@@ -2102,7 +2245,14 @@ void logCurrentClient(client *cc, const char *title) {
 
 #define MEMTEST_MAX_REGIONS 128
 
-/* A non destructive memory test executed during segfault. */
+/*
+ * memtest_test_linux_anonymous_maps - 在段错误期间执行的非破坏性内存测试。
+ *
+ * 解析 /proc/self/maps 获取可写的匿名内存映射区域，
+ * 然后对每个区域进行 memtest_preserving_test 测试。
+ * 注意：必须在关闭文件描述符之前完成测试，
+ * 因为关闭操作可能导致某些被测试的内存区域被取消映射。
+ */
 int memtest_test_linux_anonymous_maps(void) {
     FILE *fp;
     char line[1024];
@@ -2147,27 +2297,27 @@ int memtest_test_linux_anonymous_maps(void) {
             "*** Preparing to test memory region %lx (%lu bytes)\n",
                 (unsigned long) start_vect[regions],
                 (unsigned long) size_vect[regions]);
-        if (write(fd,logbuf,strlen(logbuf)) == -1) { /* Nothing to do. */ }
+        if (write(fd,logbuf,strlen(logbuf)) == -1) { /* 无需处理 */ }
         regions++;
     }
 
     int errors = 0;
     for (j = 0; j < regions; j++) {
-        if (write(fd,".",1) == -1) { /* Nothing to do. */ }
+        if (write(fd,".",1) == -1) { /* 无需处理 */ }
         errors += memtest_preserving_test((void*)start_vect[j],size_vect[j],1);
-        if (write(fd, errors ? "E" : "O",1) == -1) { /* Nothing to do. */ }
+        if (write(fd, errors ? "E" : "O",1) == -1) { /* 无需处理 */ }
     }
-    if (write(fd,"\n",1) == -1) { /* Nothing to do. */ }
+    if (write(fd,"\n",1) == -1) { /* 无需处理 */ }
 
-    /* NOTE: It is very important to close the file descriptor only now
-     * because closing it before may result into unmapping of some memory
-     * region that we are testing. */
+    /* 注意：必须在此处才关闭文件描述符，
+     * 因为提前关闭可能导致被测试的内存区域被取消映射。 */
     fclose(fp);
     closeDirectLogFiledes(fd);
     return errors;
 }
 #endif /* HAVE_PROC_MAPS */
 
+/* killMainThread - 终止主线程（如果当前不是主线程） */
 static void killMainThread(void) {
     int err;
     if (pthread_self() != server.main_thread_id && pthread_cancel(server.main_thread_id) == 0) {
@@ -2179,20 +2329,24 @@ static void killMainThread(void) {
     }
 }
 
-/* Kill the running threads (other than current) in an unclean way. This function
- * should be used only when it's critical to stop the threads for some reason.
- * Currently Redis does this only on crash (for instance on SIGSEGV) in order
- * to perform a fast memory check without other threads messing with memory. */
+/*
+ * killThreads - 以非正常方式终止运行中的线程（当前线程除外）。
+ *
+ * 此函数仅在必须停止线程的紧急情况下使用。
+ * 目前 Redis 仅在崩溃时（如 SIGSEGV）调用此函数，
+ * 以便在没有其他线程干扰内存的情况下执行快速内存检查。
+ */
 void killThreads(void) {
     killMainThread();
     bioKillThreads();
     killIOThreads();
 }
 
+/* doFastMemoryTest - 执行快速内存测试 */
 void doFastMemoryTest(void) {
 #if defined(HAVE_PROC_MAPS)
     if (server.memcheck_enabled) {
-        /* Test memory */
+        /* 测试内存 */
         serverLogRaw(LL_WARNING|LL_RAW, "\n------ FAST MEMORY TEST ------\n");
         killThreads();
         if (memtest_test_linux_anonymous_maps()) {
@@ -2206,20 +2360,22 @@ void doFastMemoryTest(void) {
 #endif /* HAVE_PROC_MAPS */
 }
 
-/* Scans the (assumed) x86 code starting at addr, for a max of `len`
- * bytes, searching for E8 (callq) opcodes, and dumping the symbols
- * and the call offset if they appear to be valid. */
+/*
+ * dumpX86Calls - 扫描 x86 机器码中的函数调用。
+ *
+ * 从地址 addr 开始扫描最多 len 字节，
+ * 搜索 E8（callq）操作码，并输出有效的调用目标符号。
+ */
 void dumpX86Calls(void *addr, size_t len) {
     size_t j;
     unsigned char *p = addr;
     Dl_info info;
-    /* Hash table to best-effort avoid printing the same symbol
-     * multiple times. */
+    /* 哈希表用于尽力避免重复输出相同的符号 */
     unsigned long ht[256] = {0};
 
     if (len < 5) return;
     for (j = 0; j < len-4; j++) {
-        if (p[j] != 0xE8) continue; /* Not an E8 CALL opcode. */
+        if (p[j] != 0xE8) continue; /* 不是 E8 CALL 操作码 */
         unsigned long target = (unsigned long)addr+j+5;
         uint32_t tmp;
         memcpy(&tmp, p+j+1, sizeof(tmp));
@@ -2229,11 +2385,12 @@ void dumpX86Calls(void *addr, size_t len) {
                 printf("Function at 0x%lx is %s\n",target,info.dli_sname);
                 ht[target&0xff] = target;
             }
-            j += 4; /* Skip the 32 bit immediate. */
+            j += 4; /* 跳过 32 位立即数 */
         }
     }
 }
 
+/* dumpCodeAroundEIP - 转储 EIP 指令指针周围的机器码 */
 void dumpCodeAroundEIP(void *eip) {
     Dl_info info;
     if (dladdr(eip, &info) != 0) {
@@ -2249,9 +2406,8 @@ void dumpCodeAroundEIP(void *eip) {
         size_t len = (long)eip - (long)info.dli_saddr;
         unsigned long sz = sysconf(_SC_PAGESIZE);
         if (len < 1<<13) { /* we don't have functions over 8k (verified) */
-            /* Find the address of the next page, which is our "safety"
-             * limit when dumping. Then try to dump just 128 bytes more
-             * than EIP if there is room, or stop sooner. */
+            /* 查找下一个页面地址作为转储的"安全"限制。
+             * 然后尝试转储 EIP 之后的 128 字节（如果空间允许），否则提前停止。 */
             void *base = (void *)info.dli_saddr;
             unsigned long next = ((unsigned long)eip + sz) & ~(sz-1);
             unsigned long end = (unsigned long)eip + 128;
@@ -2264,19 +2420,27 @@ void dumpCodeAroundEIP(void *eip) {
     }
 }
 
+/* 用于替换无效函数指针调用的目标函数 */
 void invalidFunctionWasCalled(void) {}
 
 typedef void (*invalidFunctionWasCalledType)(void);
 
+/*
+ * sigsegvHandler - 段错误（SIGSEGV）等信号的处理器。
+ *
+ * 处理 SIGSEGV、SIGBUS、SIGFPE、SIGILL 和 SIGABRT 信号。
+ * 记录崩溃信息、寄存器状态、堆栈跟踪，并生成完整的崩溃报告。
+ * 使用互斥锁防止多线程同时处理崩溃时产生死锁。
+ */
 __attribute__ ((noinline))
 static void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     UNUSED(secret);
     UNUSED(info);
     int print_full_crash_info = 1;
-    /* Check if it is safe to enter the signal handler. second thread crashing at the same time will deadlock. */
+    /* 检查是否可以安全进入信号处理器。两个线程同时崩溃会导致死锁。 */
     if(pthread_mutex_lock(&signal_handler_lock) == EDEADLK) {
-        /* If this thread already owns the lock (meaning we crashed during handling a signal) switch
-         * to printing the minimal information about the crash. */
+        /* 如果当前线程已持有锁（即在处理信号期间再次崩溃），
+         * 则切换为输出精简的崩溃信息。 */
         serverLogRawFromHandler(LL_WARNING,
             "Crashed running signal handler. Providing reduced version of recursive crash report.");
         print_full_crash_info = 0;
@@ -2302,19 +2466,20 @@ static void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     }
 
     if (eip == info->si_addr) {
-        /* When eip matches the bad address, it's an indication that we crashed when calling a non-mapped
-         * function pointer. In that case the call to backtrace will crash trying to access that address and we
-         * won't get a crash report logged. Set it to a valid point to avoid that crash. */
+        /* 当 eip 与错误地址匹配时，说明是在调用未映射的函数指针时崩溃。
+         * 此时 backtrace() 会尝试访问该地址而再次崩溃，
+         * 导致无法记录崩溃报告。
+         * 将 eip 设置为一个有效的地址来避免此问题。 */
 
-        /* This trick allow to avoid compiler warning */
+        /* 此技巧用于避免编译器警告 */
         void *ptr;
         invalidFunctionWasCalledType *ptr_ptr = (invalidFunctionWasCalledType*)&ptr;
         *ptr_ptr = invalidFunctionWasCalled;
         getAndSetMcontextEip(uc, ptr);
     }
 
-    /* When printing the reduced crash info, just print the current thread
-     * to avoid race conditions with the multi-threaded stack collector. */
+    /* 输出精简崩溃信息时，仅打印当前线程的堆栈跟踪，
+     * 以避免与多线程堆栈收集器产生竞态条件。 */
     logStackTrace(eip, 1, !print_full_crash_info);
 
     if (eip == info->si_addr) {
@@ -2335,6 +2500,7 @@ static void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     bugReportEnd(1, sig);
 }
 
+/* setupDebugSigHandlers - 设置调试信号处理器（SIGSEGV 等和 SIGALRM） */
 void setupDebugSigHandlers(void) {
     setupStacktracePipe();
 
@@ -2348,11 +2514,12 @@ void setupDebugSigHandlers(void) {
     sigaction(SIGALRM, &act, NULL);
 }
 
+/* setupSigSegvHandler - 设置段错误信号处理器 */
 void setupSigSegvHandler(void) {
-    /* Initialize the signal handler lock.
-    Attempting to initialize an already initialized mutex or mutexattr results in undefined behavior. */
+    /* 初始化信号处理器锁。
+     * 尝试初始化已初始化的 mutex 或 mutexattr 会导致未定义行为。 */
     if (!signal_handler_lock_initialized) {
-        /* Set signal handler with error checking attribute. re-lock within the same thread will error. */
+        /* 设置信号处理器的错误检查属性。同一线程中重复加锁将报错。 */
         pthread_mutexattr_init(&signal_handler_lock_attr);
         pthread_mutexattr_settype(&signal_handler_lock_attr, PTHREAD_MUTEX_ERRORCHECK);
         pthread_mutex_init(&signal_handler_lock, &signal_handler_lock_attr);
@@ -2362,10 +2529,10 @@ void setupSigSegvHandler(void) {
     struct sigaction act;
 
     sigemptyset(&act.sa_mask);
-    /* SA_NODEFER to disables adding the signal to the signal mask of the
-     * calling process on entry to the signal handler unless it is included in the sa_mask field. */
-    /* SA_SIGINFO flag is set to raise the function defined in sa_sigaction.
-     * Otherwise, sa_handler is used. */
+    /* SA_NODEFER: 禁止在进入信号处理器时将该信号添加到调用进程的信号掩码中，
+     * 除非该信号包含在 sa_mask 字段中。 */
+    /* SA_SIGINFO: 使用 sa_sigaction 中定义的函数作为处理器，
+     * 而不是使用 sa_handler。 */
     act.sa_flags = SA_NODEFER | SA_SIGINFO;
     act.sa_sigaction = sigsegvHandler;
     if(server.crashlog_enabled) {
@@ -2377,6 +2544,7 @@ void setupSigSegvHandler(void) {
     }
 }
 
+/* removeSigSegvHandlers - 移除段错误等信号处理器，恢复为默认行为 */
 void removeSigSegvHandlers(void) {
     struct sigaction act;
     sigemptyset(&act.sa_mask);
@@ -2389,25 +2557,42 @@ void removeSigSegvHandlers(void) {
     sigaction(SIGABRT, &act, NULL);
 }
 
+/*
+ * printCrashReport - 输出完整的崩溃报告。
+ *
+ * 依次记录以下信息：
+ * 1. 服务器 INFO 和客户端列表
+ * 2. 当前正在服务的客户端信息
+ * 3. 模块信息
+ * 4. 配置调试信息
+ * 5. 快速内存测试结果
+ */
 void printCrashReport(void) {
-    /* Log INFO and CLIENT LIST */
+    /* 记录 INFO 和 CLIENT LIST */
     logServerInfo();
 
     /* Log the current client */
     logCurrentClient(server.current_client, "CURRENT");
     logCurrentClient(server.executing_client, "EXECUTING");
 
-    /* Log modules info. Something we wanna do last since we fear it may crash. */
+    /* 记录模块信息。放在最后执行，因为它可能崩溃。 */
     logModulesInfo();
 
-    /* Log debug config information, which are some values
-     * which may be useful for debugging crashes. */
+    /* 记录调试配置信息，这些值对调试崩溃可能有帮助 */
     logConfigDebugInfo();
 
-    /* Run memory test in case the crash was triggered by memory corruption. */
+    /* 运行内存测试，以防崩溃是由内存损坏引起的 */
     doFastMemoryTest();
 }
 
+/*
+ * bugReportEnd - 结束 bug 报告并终止进程。
+ *
+ * 输出报告结束提示和 issue 上报链接。
+ * 根据 killViaSignal 参数决定终止方式：
+ * - 0: 使用 abort() 或 _exit()
+ * - 1: 恢复信号默认处理器后发送信号（允许生成 core dump）
+ */
 void bugReportEnd(int killViaSignal, int sig) {
     struct sigaction act;
 
@@ -2420,21 +2605,20 @@ void bugReportEnd(int killViaSignal, int sig) {
 "  Some other issues could be detected by redis-server --check-system\n"
 );
 
-    /* free(messages); Don't call free() with possibly corrupted memory. */
+    /* 不调用 free(messages)，因为内存可能已损坏 */
     if (server.daemonize && server.supervised == 0 && server.pidfile) unlink(server.pidfile);
 
     if (!killViaSignal) {
-        /* To avoid issues with valgrind, we may wanna exit rather than generate a signal */
+        /* 为避免 valgrind 问题，可能需要直接退出而不是生成信号 */
         if (server.use_exit_on_panic) {
-             /* Using _exit to bypass false leak reports by gcc ASAN */
+             /* 使用 _exit 以绕过 gcc ASAN 的误报泄漏报告 */
              fflush(stdout);
             _exit(1);
         }
         abort();
     }
 
-    /* Make sure we exit with the right signal at the end. So for instance
-     * the core will be dumped if enabled. */
+    /* 确保最终以正确的信号退出，这样如果启用了 core dump，会生成核心转储文件。 */
     sigemptyset (&act.sa_mask);
     act.sa_flags = 0;
     act.sa_handler = SIG_DFL;
@@ -2442,8 +2626,13 @@ void bugReportEnd(int killViaSignal, int sig) {
     kill(getpid(),sig);
 }
 
-/* ==================== Logging functions for debugging ===================== */
+/* ======================== 调试用日志函数 =============================== */
 
+/*
+ * serverLogHexDump - 以十六进制格式输出内存内容。
+ *
+ * 将 value 指向的 len 字节数据以十六进制字符串形式记录到日志中。
+ */
 void serverLogHexDump(int level, char *descr, void *value, size_t len) {
     char buf[65], *b;
     unsigned char *v = value;
@@ -2466,9 +2655,15 @@ void serverLogHexDump(int level, char *descr, void *value, size_t len) {
     serverLogRaw(level|LL_RAW,"\n");
 }
 
-/* =========================== Software Watchdog ============================ */
+/* ========================= 软件看门狗（Watchdog）========================= */
 #include <sys/time.h>
 
+/*
+ * sigalrmSignalHandler - SIGALRM 信号处理器。
+ *
+ * 在软件看门狗超时时被调用，输出当前堆栈跟踪。
+ * 也可通过 kill() 显式发送 SIGALRM 来获取堆栈跟踪。
+ */
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
 #ifdef HAVE_BACKTRACE
     ucontext_t *uc = (ucontext_t*) secret;
@@ -2477,8 +2672,8 @@ void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
 #endif
     UNUSED(sig);
 
-    /* SIGALRM can be sent explicitly to the process calling kill() to get the stacktraces,
-       or every watchdog_period interval. In the last case, si_pid is not set */
+    /* SIGALRM 可以通过 kill() 显式发送给进程以获取堆栈跟踪，
+     * 也可以由看门狗定期发送。后一种情况下 si_pid 未设置。 */
     if(info->si_pid == 0) {
         serverLogRawFromHandler(LL_WARNING,"\n--- WATCHDOG TIMER EXPIRED ---");
     } else {
@@ -2492,39 +2687,51 @@ void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
     serverLogRawFromHandler(LL_WARNING,"--------\n");
 }
 
-/* Schedule a SIGALRM delivery after the specified period in milliseconds.
- * If a timer is already scheduled, this function will re-schedule it to the
- * specified time. If period is 0 the current timer is disabled. */
+/*
+ * watchdogScheduleSignal - 调度 SIGALRM 信号的发送。
+ *
+ * 在指定的毫秒数后发送 SIGALRM 信号。
+ * 如果已有定时器，会重新调度到新的时间。
+ * 如果 period 为 0，则禁用当前定时器。
+ */
 void watchdogScheduleSignal(int period) {
     struct itimerval it;
 
-    /* Will stop the timer if period is 0. */
+    /* 当 period 为 0 时会停止定时器 */
     it.it_value.tv_sec = period/1000;
     it.it_value.tv_usec = (period%1000)*1000;
-    /* Don't automatically restart. */
+    /* 不自动重复触发 */
     it.it_interval.tv_sec = 0;
     it.it_interval.tv_usec = 0;
     setitimer(ITIMER_REAL, &it, NULL);
 }
+/* applyWatchdogPeriod - 应用看门狗周期配置 */
 void applyWatchdogPeriod(void) {
-    /* Disable watchdog when period is 0 */
+    /* 当周期为 0 时禁用看门狗 */
     if (server.watchdog_period == 0) {
         watchdogScheduleSignal(0); /* Stop the current timer. */
     } else {
-        /* If the configured period is smaller than twice the timer period, it is
-         * too short for the software watchdog to work reliably. Fix it now
-         * if needed. */
+        /* 如果配置的周期小于定时器周期的两倍，
+         * 则对于软件看门狗来说太短了，无法可靠工作。
+         * 如有必要，在此处修正。 */
         int min_period = (1000/server.hz)*2;
         if (server.watchdog_period < min_period) server.watchdog_period = min_period;
         watchdogScheduleSignal(server.watchdog_period); /* Adjust the current timer. */
     }
 }
 
-/* Positive input is sleep time in microseconds. Negative input is fractions
- * of microseconds, i.e. -10 means 100 nanoseconds. */
+/*
+ * debugDelay - 调试用延迟函数。
+ *
+ * 正数表示休眠时间（微秒）。
+ * 负数表示微秒的分数，即 -10 表示 100 纳秒。
+ *
+ * 由于即使最短的休眠也会导致上下文切换和系统调用，
+ * 实现短延迟的方式是通过概率性地减少休眠频率。
+ */
 void debugDelay(int usec) {
-    /* Since even the shortest sleep results in context switch and system call,
-     * the way we achieve short sleeps is by statistically sleeping less often. */
+    /* 由于即使最短的休眠也会导致上下文切换和系统调用，
+     * 通过概率性休眠来实现亚微秒级的延迟效果 */
     if (usec < 0) usec = (rand() % -usec) == 0 ? 1: 0;
     if (usec) usleep(usec);
 }
@@ -2532,15 +2739,19 @@ void debugDelay(int usec) {
 #ifdef HAVE_BACKTRACE
 #ifdef __linux__
 
-/* =========================== Stacktrace Utils ============================ */
+/* ========================= 堆栈跟踪工具函数 ============================== */
 
 
 
-/** If it doesn't block and doesn't ignore, return 1 (the thread will handle the signal)
- * If thread tid blocks or ignores sig_num returns 0 (thread is not ready to catch the signal).
- * also returns 0 if something is wrong and prints a warning message to the log file **/
+/*
+ * is_thread_ready_to_signal - 检查线程是否能接收指定信号。
+ *
+ * 如果线程既不阻塞也不忽略该信号，返回 1（线程可以处理信号）。
+ * 如果线程阻塞或忽略了 sig_num，返回 0。
+ * 如果发生错误，也返回 0 并记录警告日志。
+ */
 static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char *tid, int sig_num) {
-    /* Open the threads status file path /proc/<pid>>/task/<tid>/status */
+    /* 打开线程状态文件路径 /proc/<pid>/task/<tid>/status */
     char path_buff[PATH_MAX];
     snprintf_async_signal_safe(path_buff, PATH_MAX, "%s/%s/status", proc_pid_task_path, tid);
 
@@ -2552,11 +2763,11 @@ static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char 
     }
 
     int ret = 1;
-    size_t field_name_len = strlen("SigBlk:\t"); /* SigIgn has the same length */
+    size_t field_name_len = strlen("SigBlk:\t"); /* SigIgn 的长度相同 */
     char *line = NULL;
     size_t fields_count = 2;
     while ((line = fgets_async_signal_safe(buff, PATH_MAX, thread_status_file)) && fields_count) {
-        /* iterate the file until we reach SigBlk or SigIgn field line */
+        /* 遍历文件直到找到 SigBlk 或 SigIgn 字段行 */
         if (!strncmp(buff, "SigBlk:\t", field_name_len) ||  !strncmp(buff, "SigIgn:\t", field_name_len)) {
             line = buff + field_name_len;
             unsigned long sig_mask;
@@ -2566,9 +2777,9 @@ static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char 
                 break;
             }
 
-            /* The bit position in a signal mask aligns with the signal number. Since signal numbers start from 1 
-            we need to adjust the signal number by subtracting 1 to align it correctly with the zero-based indexing used */
-            if (sig_mask & (1L << (sig_num - 1))) { /* if the signal is blocked/ignored return 0 */
+            /* 信号掩码中的位位置与信号编号对齐。由于信号编号从 1 开始，
+             * 需要将信号编号减 1 以与零基索引正确对齐 */
+            if (sig_mask & (1L << (sig_num - 1))) { /* 如果信号被阻塞或忽略则返回 0 */
                 ret = 0;
                 break;
             }
@@ -2578,7 +2789,7 @@ static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char 
 
     close(thread_status_file);
 
-    /* if we reached EOF, it means we haven't found SigBlk or/and SigIgn, something is wrong */
+    /* 如果到达 EOF，说明未找到 SigBlk 或/和 SigIgn 字段，说明出了问题 */
     if (line == NULL)  {
         ret = 0;
         serverLogFromHandler(LL_WARNING, "tid:%s: failed to find SigBlk or/and SigIgn field(s) in %s/%s/status file", tid, proc_pid_task_path, tid);
@@ -2586,26 +2797,32 @@ static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char 
     return ret;
 }
 
-/** We are using syscall(SYS_getdents64) to read directories, which unlike opendir(), is considered 
- * async-signal-safe. This function wrapper getdents64() in glibc is supported as of glibc 2.30.
- * To support earlier versions of glibc, we use syscall(SYS_getdents64), which requires defining
- * linux_dirent64 ourselves. This structure is very old and stable: It will not change unless the kernel
- * chooses to break compatibility with all existing binaries. Highly Unlikely.
-*/
+/*
+ * 使用 syscall(SYS_getdents64) 读取目录，与 opendir() 不同，
+ * 该系统调用被认为是异步信号安全的（async-signal-safe）。
+ *
+ * glibc 2.30 开始支持 getdents64() 包装函数。
+ * 为兼容更早版本的 glibc，直接使用 syscall(SYS_getdents64)，
+ * 因此需要自行定义 linux_dirent64 结构体。
+ * 此结构非常古老且稳定，除非内核选择破坏与所有已有二进制文件的
+ * 兼容性（极不可能），否则不会改变。
+ */
 struct linux_dirent64 {
-   unsigned long long d_ino;
-   long long d_off;
-   unsigned short d_reclen;     /* Length of this linux_dirent */
-   unsigned char  d_type;
-   char           d_name[256];  /* Filename (null-terminated) */
+   unsigned long long d_ino;        /* inode 号 */
+   long long d_off;                 /* 到下一个 dirent 的偏移 */
+   unsigned short d_reclen;         /* 此 linux_dirent 的长度 */
+   unsigned char  d_type;           /* 文件类型 */
+   char           d_name[256];      /* 文件名（以 null 结尾） */
 };
 
-/** Returns the number of the process's threads that can receive signal sig_num.
- * Writes into tids the tids of these threads.
- * If it fails, returns 0.
-*/
+/*
+ * get_ready_to_signal_threads_tids - 获取可以接收指定信号的线程 ID 列表。
+ *
+ * 将这些线程的 tid 写入 tids 数组。
+ * 返回可接收信号的线程数量，失败时返回 0。
+ */
 static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_SIZE]) {
-    /* Open /proc/<pid>/task file. */
+    /* 打开 /proc/<pid>/task 目录 */
     char path_buff[PATH_MAX];
     snprintf_async_signal_safe(path_buff, PATH_MAX, "/proc/%d/task", getpid());
 
@@ -2618,22 +2835,22 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
     long nread;
     char buff[PATH_MAX];
 
-    /* readdir() is not async-signal-safe (AS-safe).
-    Hence, we read the file using SYS_getdents64, which is considered AS-sync*/
+    /* readdir() 不是异步信号安全的（AS-safe）。
+     * 因此使用 SYS_getdents64 读取目录，该系统调用被认为是 AS 安全的 */
     while ((nread = syscall(SYS_getdents64, dir, buff, PATH_MAX))) {
         if (nread == -1) {
             close(dir);
             serverLogRawFromHandler(LL_WARNING, "get_ready_to_signal_threads_tids(): Failed to read the process's task directory");
             return 0;
         }
-        /* Each thread is represented by a directory */
+        /* 每个线程由一个目录表示 */
         for (long pos = 0; pos < nread;) {
             struct linux_dirent64 *entry = (struct linux_dirent64 *)(buff + pos);
             pos += entry->d_reclen;
-            /* Skip irrelevant directories. */
+            /* 跳过无关目录 */
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
-            /* the thread's directory name is equivalent to its tid. */
+            /* 线程的目录名等同于其 tid */
            long tid;
            string2l(entry->d_name, strlen(entry->d_name), &tid);
 
@@ -2643,10 +2860,10 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
                 current_thread_index = tids_count;
             }
 
-            /* save the thread id */
+            /* 保存线程 ID */
             tids[tids_count++] = tid;
             
-            /* Stop if we reached the maximum threads number. */
+            /* 达到最大线程数时停止 */
             if(tids_count == TIDS_MAX_SIZE) {
                 serverLogRawFromHandler(LL_WARNING, "get_ready_to_signal_threads_tids(): Reached the limit of the tids buffer.");
                 break;
@@ -2656,7 +2873,7 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
         if(tids_count == TIDS_MAX_SIZE) break;
     }
 
-    /* Swap the last tid with the the current thread id */
+    /* 将当前线程的 tid 交换到数组末尾（使其最后被处理） */
     if(current_thread_index != -1) {
         pid_t last_tid = tids[tids_count - 1];
 

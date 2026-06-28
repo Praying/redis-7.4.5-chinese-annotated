@@ -6,22 +6,22 @@
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
-/* This file implements the interface of logging clients' requests and
- * responses into a file.
- * This feature needs the LOG_REQ_RES macro to be compiled and is turned
- * on by the req-res-logfile config."
+/*
+ * 本文件实现了将客户端的请求和响应记录到文件的接口。
+ * 此功能需要编译时定义 LOG_REQ_RES 宏，并通过
+ * req-res-logfile 配置项开启。
  *
- * Some examples:
+ * 日志格式示例：
  *
- * PING:
+ * PING 命令：
  *
- * 4
- * ping
- * 12
- * __argv_end__
- * +PONG
+ * 4          <- 参数长度
+ * ping       <- 参数内容
+ * 12         <- 结束标记长度
+ * __argv_end__  <- 请求参数结束标记
+ * +PONG      <- RESP 格式的响应
  *
- * LRANGE:
+ * LRANGE 命令：
  *
  * 6
  * lrange
@@ -37,13 +37,13 @@
  * $3
  * ele
  *
- * The request is everything up until the __argv_end__ marker.
- * The format is:
- * <number of characters>
- * <the argument>
+ * 请求部分是从开头到 __argv_end__ 标记之间的所有内容。
+ * 格式为：
+ * <字符数>
+ * <参数值>
  *
- * After __argv_end__ the response appears, and the format is
- * RESP (2 or 3, depending on what the client has configured)
+ * __argv_end__ 之后是响应部分，格式为 RESP
+ * （2 或 3 版本，取决于客户端的配置）
  */
 
 #include "server.h"
@@ -51,28 +51,43 @@
 
 #ifdef LOG_REQ_RES
 
-/* ----- Helpers ----- */
+/* ----- 辅助函数 ----- */
 
+/*
+ * 判断是否应该记录该客户端的请求和响应。
+ * 返回 1 表示应该记录，返回 0 表示忽略。
+ */
 static int reqresShouldLog(client *c) {
+    /* 未配置日志文件时跳过 */
     if (!server.req_res_logfile)
         return 0;
 
-    /* Ignore client with streaming non-standard response */
+    /* 忽略正在流式发送非标准响应的客户端
+     * （发布/订阅、监控、从服务器） */
     if (c->flags & (CLIENT_PUBSUB|CLIENT_MONITOR|CLIENT_SLAVE))
         return 0;
 
-    /* We only work on masters (didn't implement reqresAppendResponse to work on shared slave buffers) */
+    /* 仅对普通客户端生效，主服务器客户端不记录
+     * （未实现 reqresAppendResponse 对共享从服务器
+     * 缓冲区的支持） */
     if (getClientType(c) == CLIENT_TYPE_MASTER)
         return 0;
 
     return 1;
 }
 
+/*
+ * 将指定数据追加到客户端的 reqres 缓冲区中。
+ * 缓冲区空间不足时会自动扩容。
+ * 返回追加的字节数。
+ */
 static size_t reqresAppendBuffer(client *c, void *buf, size_t len) {
     if (!c->reqres.buf) {
+        /* 缓冲区尚未分配，初始容量取 len 和 1024 的较大值 */
         c->reqres.capacity = max(len, 1024);
         c->reqres.buf = zmalloc(c->reqres.capacity);
     } else if (c->reqres.capacity - c->reqres.used < len) {
+        /* 剩余空间不足，扩展缓冲区容量 */
         c->reqres.capacity += len;
         c->reqres.buf = zrealloc(c->reqres.buf, c->reqres.capacity);
     }
@@ -82,8 +97,12 @@ static size_t reqresAppendBuffer(client *c, void *buf, size_t len) {
     return len;
 }
 
-/* Functions for requests */
+/* ----- 请求相关函数 ----- */
 
+/*
+ * 将单个命令参数追加到 reqres 缓冲区。
+ * 格式为：<参数长度>\r\n<参数内容>\r\n
+ */
 static size_t reqresAppendArg(client *c, char *arg, size_t arg_len) {
     char argv_len_buf[LONG_STR_SIZE];
     size_t argv_len_buf_len = ll2string(argv_len_buf,sizeof(argv_len_buf),(long)arg_len);
@@ -94,66 +113,85 @@ static size_t reqresAppendArg(client *c, char *arg, size_t arg_len) {
     return ret;
 }
 
-/* ----- API ----- */
+/* ----- 对外 API ----- */
 
 
-/* Zero out the clientReqResInfo struct inside the client,
- * and free the buffer if needed */
+/*
+ * 重置客户端内部的 clientReqResInfo 结构体，
+ * 根据需要释放缓冲区。
+ */
 void reqresReset(client *c, int free_buf) {
     if (free_buf && c->reqres.buf)
         zfree(c->reqres.buf);
     memset(&c->reqres, 0, sizeof(c->reqres));
 }
 
-/* Save the offset of the reply buffer (or the reply list).
- * Should be called when adding a reply (but it will only save the offset
- * on the very first time it's called, because of c->reqres.offset.saved)
- * The idea is:
- * 1. When a client is executing a command, we save the reply offset.
- * 2. During the execution, the reply offset may grow, as addReply* functions are called.
- * 3. When client is done with the command (commandProcessed), reqresAppendResponse
- *    is called.
- * 4. reqresAppendResponse will append the diff between the current offset and the one from step (1)
- * 5. When client is reset before the next command, we clear c->reqres.offset.saved and start again
+/*
+ * 保存回复缓冲区（或回复链表）的偏移量。
+ * 应在添加回复时调用（但由于 c->reqres.offset.saved
+ * 标志，仅在首次调用时保存偏移量）。
  *
- * We cannot reply on c->sentlen to keep track because it depends on the network
- * (reqresAppendResponse will always write the whole buffer, unlike writeToClient)
+ * 核心流程：
+ * 1. 客户端开始执行命令时，保存当前回复偏移量。
+ * 2. 执行过程中，随着 addReply* 函数被调用，
+ *    回复偏移量会增长。
+ * 3. 命令执行完毕（commandProcessed）后，
+ *    调用 reqresAppendResponse。
+ * 4. reqresAppendResponse 追加当前偏移量与步骤 1 中
+ *    保存的偏移量之间的差值（即本次命令的响应内容）。
+ * 5. 在下一条命令之前重置客户端时，
+ *    清除 c->reqres.offset.saved 标志，重新开始。
  *
- * Ideally, we would just have this code inside reqresAppendRequest, which is called
- * from processCommand, but we cannot save the reply offset inside processCommand
- * because of the following pipe-lining scenario:
+ * 不能依赖 c->sentlen 来追踪，因为它受网络状态影响
+ * （reqresAppendResponse 总是写入整个缓冲区，
+ *  与 writeToClient 不同）。
+ *
+ * 理想情况下，这些代码可以放在 reqresAppendRequest
+ * 内（由 processCommand 调用），但不能在 processCommand
+ * 中保存回复偏移量，因为存在以下管道（pipeline）场景：
+ *
  * set rd [redis_deferring_client]
  * set buf ""
- * append buf "SET key vale\r\n"
+ * append buf "SET key value\r\n"
  * append buf "BLPOP mylist 0\r\n"
  * $rd write $buf
  * $rd flush
  *
- * Let's assume we save the reply offset in processCommand
- * When BLPOP is processed the offset is 5 (+OK\r\n from the SET)
- * Then beforeSleep is called, the +OK is written to network, and bufpos is 0
- * When the client is finally unblocked, the cached offset is 5, but bufpos is already
- * 0, so we would miss the first 5 bytes of the reply.
+ * 假设我们在 processCommand 中保存回复偏移量：
+ * 处理 BLPOP 时偏移量为 5（SET 返回的 +OK\r\n）
+ * 随后 beforeSleep 被调用，+OK 写入网络，bufpos 变为 0
+ * 当客户端最终解除阻塞时，缓存的偏移量是 5，但 bufpos
+ * 已为 0，这样就会丢失响应的前 5 个字节。
  **/
 void reqresSaveClientReplyOffset(client *c) {
     if (!reqresShouldLog(c))
         return;
 
+    /* 仅在首次调用时保存偏移量 */
     if (c->reqres.offset.saved)
         return;
 
     c->reqres.offset.saved = 1;
 
+    /* 记录静态回复缓冲区的当前写入位置 */
     c->reqres.offset.bufpos = c->bufpos;
     if (listLength(c->reply) && listNodeValue(listLast(c->reply))) {
+        /* 记录回复链表中最后一个节点的索引和已用字节数 */
         c->reqres.offset.last_node.index = listLength(c->reply) - 1;
         c->reqres.offset.last_node.used = ((clientReplyBlock *)listNodeValue(listLast(c->reply)))->used;
     } else {
+        /* 回复链表为空，偏移量归零 */
         c->reqres.offset.last_node.index = 0;
         c->reqres.offset.last_node.used = 0;
     }
 }
 
+/*
+ * 将客户端当前命令的请求参数追加到 reqres 缓冲区。
+ * 跳过部分会产生流式非标准响应的命令（如 DEBUG、
+ * SUBSCRIBE 等）。
+ * 返回追加的字节数。
+ */
 size_t reqresAppendRequest(client *c) {
     robj **argv = c->argv;
     int argc = c->argc;
@@ -163,9 +201,9 @@ size_t reqresAppendRequest(client *c) {
     if (!reqresShouldLog(c))
         return 0;
 
-    /* Ignore commands that have streaming non-standard response */
+    /* 忽略会产生流式非标准响应的命令 */
     sds cmd = argv[0]->ptr;
-    if (!strcasecmp(cmd,"debug") || /* because of DEBUG SEGFAULT */
+    if (!strcasecmp(cmd,"debug") || /* DEBUG 会导致段错误 */
         !strcasecmp(cmd,"sync") ||
         !strcasecmp(cmd,"psync") ||
         !strcasecmp(cmd,"monitor") ||
@@ -179,9 +217,10 @@ size_t reqresAppendRequest(client *c) {
         return 0;
     }
 
-    c->reqres.argv_logged = 1;
+    c->reqres.argv_logged = 1; /* 标记请求参数已记录 */
 
     size_t ret = 0;
+    /* 遍历所有参数，逐个追加到缓冲区 */
     for (int i = 0; i < argc; i++) {
         if (sdsEncodedObject(argv[i])) {
             ret += reqresAppendArg(c, argv[i]->ptr, sdslen(argv[i]->ptr));
@@ -193,27 +232,34 @@ size_t reqresAppendRequest(client *c) {
             serverPanic("Wrong encoding in reqresAppendRequest()");
         }
     }
+    /* 追加请求参数结束标记 */
     return ret + reqresAppendArg(c, "__argv_end__", 12);
 }
 
+/*
+ * 将客户端当前命令的响应内容追加到 reqres 缓冲区，
+ * 然后将完整的请求和响应写入日志文件。
+ * 返回追加的字节数。
+ */
 size_t reqresAppendResponse(client *c) {
     size_t ret = 0;
 
     if (!reqresShouldLog(c))
         return 0;
 
-    if (!c->reqres.argv_logged) /* Example: UNSUBSCRIBE */
+    if (!c->reqres.argv_logged) /* 例如：UNSUBSCRIBE */
         return 0;
 
-    if (!c->reqres.offset.saved) /* Example: module client blocked on keys + CLIENT KILL */
+    if (!c->reqres.offset.saved) /* 例如：模块客户端被阻塞 + CLIENT KILL */
         return 0;
 
-    /* First append the static reply buffer */
+    /* 首先追加静态回复缓冲区中新增的数据 */
     if (c->bufpos > c->reqres.offset.bufpos) {
         size_t written = reqresAppendBuffer(c, c->buf + c->reqres.offset.bufpos, c->bufpos - c->reqres.offset.bufpos);
         ret += written;
     }
 
+    /* 获取回复链表的当前状态 */
     int curr_index = 0;
     size_t curr_used = 0;
     if (listLength(c->reply)) {
@@ -221,7 +267,7 @@ size_t reqresAppendResponse(client *c) {
         curr_used = ((clientReplyBlock *)listNodeValue(listLast(c->reply)))->used;
     }
 
-    /* Now, append reply bytes from the reply list */
+    /* 然后追加回复链表中新增的数据 */
     if (curr_index > c->reqres.offset.last_node.index ||
         curr_used > c->reqres.offset.last_node.used)
     {
@@ -233,7 +279,7 @@ size_t reqresAppendResponse(client *c) {
         while ((curr = listNext(&iter)) != NULL) {
             size_t written;
 
-            /* Skip nodes we had already processed */
+            /* 跳过已经处理过的节点 */
             if (i < c->reqres.offset.last_node.index) {
                 i++;
                 continue;
@@ -244,13 +290,14 @@ size_t reqresAppendResponse(client *c) {
                 continue;
             }
             if (i == c->reqres.offset.last_node.index) {
-                /* Write the potentially incomplete node, which had data from
-                 * before the current command started */
+                /* 处理可能不完整的节点——该节点中保存了
+                 * 当前命令开始之前就已存在的数据，
+                 * 只追加新增部分 */
                 written = reqresAppendBuffer(c,
                                              o->buf + c->reqres.offset.last_node.used,
                                              o->used - c->reqres.offset.last_node.used);
             } else {
-                /* New node */
+                /* 全新的节点，追加其全部数据 */
                 written = reqresAppendBuffer(c, o->buf, o->used);
             }
             ret += written;
@@ -259,7 +306,7 @@ size_t reqresAppendResponse(client *c) {
     }
     serverAssert(ret);
 
-    /* Flush both request and response to file */
+    /* 将请求和响应内容刷写到日志文件 */
     FILE *fp = fopen(server.req_res_logfile, "a");
     serverAssert(fp);
     fwrite(c->reqres.buf, c->reqres.used, 1, fp);
@@ -270,7 +317,7 @@ size_t reqresAppendResponse(client *c) {
 
 #else /* #ifdef LOG_REQ_RES */
 
-/* Just mimic the API without doing anything */
+/* 未定义 LOG_REQ_RES 时，提供空实现以满足链接需求 */
 
 void reqresReset(client *c, int free_buf) {
     UNUSED(c);

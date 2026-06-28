@@ -29,21 +29,23 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* CRC16 implementation according to CCITT standards.
+/* CRC16 实现，符合 CCITT 标准。
  *
- * Note by @antirez: this is actually the XMODEM CRC 16 algorithm, using the
- * following parameters:
+ * 注：@antirez 指出，这实际上是 XMODEM CRC-16 算法，
+ * 使用以下参数：
  *
- * Name                       : "XMODEM", also known as "ZMODEM", "CRC-16/ACORN"
- * Width                      : 16 bit
- * Poly                       : 1021 (That is actually x^16 + x^12 + x^5 + 1)
- * Initialization             : 0000
- * Reflect Input byte         : False
- * Reflect Output CRC         : False
- * Xor constant to output CRC : 0000
- * Output for "123456789"     : 31C3
+ * 名称                       : "XMODEM"，亦称 "ZMODEM"、"CRC-16/ACORN"
+ * 宽度                       : 16 位
+ * 多项式                     : 1021（即 x^16 + x^12 + x^5 + 1）
+ * 初始值                     : 0000
+ * 输入字节反转               : 否
+ * 输出 CRC 反转              : 否
+ * 输出 CRC 异或常量          : 0000
+ * "123456789" 的输出结果      : 31C3
  */
 
+/* CRC16 预计算查找表，共 256 个条目，
+ * 对应每个可能的单字节输入值。 */
 static const uint16_t crc16tab[256]= {
     0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,
     0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef,
@@ -79,6 +81,11 @@ static const uint16_t crc16tab[256]= {
     0x6e17,0x7e36,0x4e55,0x5e74,0x2e93,0x3eb2,0x0ed1,0x1ef0
 };
 
+/* 计算输入缓冲区的 CRC16 校验值。
+ * 使用查表法逐字节计算。
+ * 参数 buf: 输入数据缓冲区
+ * 参数 len: 数据长度（字节）
+ * 返回值 : 16 位 CRC 校验值 */
 uint16_t crc16(const char *buf, int len) {
     int counter;
     uint16_t crc = 0;
