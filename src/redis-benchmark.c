@@ -1,4 +1,7 @@
-/* Redis benchmark utility.
+/* Redis 基准测试工具 (redis-benchmark utility)。
+ *
+ * 该工具用于对 Redis 服务器进行压力测试，评估其在不同命令、
+ * 不同并发数以及不同 pipeline 配置下的性能表现。
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -39,17 +42,29 @@
 #include "cli_common.h"
 #include "mt19937-64.h"
 
+/* 抑制未使用参数/变量的编译器警告 */
 #define UNUSED(V) ((void) V)
+/* randptr 数组的初始大小，用于存放输出缓冲区中需随机化字段的指针 */
 #define RANDPTR_INITIAL_SIZE 8
+/* 延迟报告中显示的默认小数位数 */
 #define DEFAULT_LATENCY_PRECISION 3
+/* 延迟报告中允许的最大小数位数 */
 #define MAX_LATENCY_PRECISION 4
+/* 允许的最大线程数 */
 #define MAX_THREADS 500
+/* Redis Cluster 的 slot 总数 (0-16383) */
 #define CLUSTER_SLOTS 16384
+/* 延迟直方图最小值：>= 10 微秒 */
 #define CONFIG_LATENCY_HISTOGRAM_MIN_VALUE 10L          /* >= 10 usecs */
+/* 延迟直方图最大值：<= 3 秒 (微秒精度) */
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L          /* <= 3 secs(us precision) */
+/* 即时延迟直方图最大值：<= 3 秒 (微秒精度) */
 #define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L   /* <= 3 secs(us precision) */
+/* 吞吐量显示的时间间隔 (毫秒) */
 #define SHOW_THROUGHPUT_INTERVAL 250  /* 250ms */
 
+/* 根据客户端所在线程获取对应的事件循环。
+ * 多线程模式下使用所属线程的事件循环，单线程模式使用全局事件循环。*/
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
 
@@ -128,35 +143,33 @@ typedef struct _client {
     int slots_last_update;
 } *client;
 
-/* Threads. */
-
+/* 线程结构体。每个 benchmark 线程拥有独立的事件循环 (el)，用于驱动客户端读写。*/
 typedef struct benchmarkThread {
     int index;
     pthread_t thread;
     aeEventLoop *el;
 } benchmarkThread;
 
-/* Cluster. */
+/* 集群节点结构体。表示 Redis Cluster 中的一个 master 节点及其 slot 分布。*/
 typedef struct clusterNode {
     char *ip;
     int port;
     sds name;
     int flags;
-    sds replicate;  /* Master ID if node is a slave */
+    sds replicate;  /* 若该节点是从节点，则指向其 master 的 ID */
     int *slots;
     int slots_count;
-    int *updated_slots;         /* Used by updateClusterSlotsConfiguration */
-    int updated_slots_count;    /* Used by updateClusterSlotsConfiguration */
+    int *updated_slots;         /* updateClusterSlotsConfiguration 使用的临时缓冲 */
+    int updated_slots_count;    /* updateClusterSlotsConfiguration 使用的临时计数 */
     int replicas_count;
-    sds *migrating; /* An array of sds where even strings are slots and odd
-                     * strings are the destination node IDs. */
-    sds *importing; /* An array of sds where even strings are slots and odd
-                     * strings are the source node IDs. */
-    int migrating_count; /* Length of the migrating array (migrating slots*2) */
-    int importing_count; /* Length of the importing array (importing slots*2) */
+    sds *migrating; /* sds 数组，偶数下标为 slot 字符串，奇数下标为目标节点 ID */
+    sds *importing; /* sds 数组，偶数下标为 slot 字符串，奇数下标为源节点 ID */
+    int migrating_count; /* migrating 数组长度 (slot 数 * 2) */
+    int importing_count; /* importing 数组长度 (slot 数 * 2) */
     struct redisConfig *redis_config;
 } clusterNode;
 
+/* 目标 Redis 服务端的配置信息，benchmark 会获取并展示。*/
 typedef struct redisConfig {
     sds save;
     sds appendonly;
@@ -180,11 +193,13 @@ static void updateClusterSlotsConfiguration(void);
 int showThroughput(struct aeEventLoop *eventLoop, long long id,
                    void *clientData);
 
-/* Dict callbacks */
+/* Dict 字典的回调函数原型。*/
 static uint64_t dictSdsHash(const void *key);
 static int dictSdsKeyCompare(dict *d, const void *key1, const void *key2);
 
 /* Implementation */
+
+/* 获取当前时间，精度为微秒。*/
 static long long ustime(void) {
     struct timeval tv;
     long long ust;
@@ -195,6 +210,7 @@ static long long ustime(void) {
     return ust;
 }
 
+/* 获取当前时间，精度为毫秒 (基于 ustime 实现)。*/
 static long long mstime(void) {
     return ustime()/1000;
 }
@@ -214,6 +230,9 @@ static int dictSdsKeyCompare(dict *d, const void *key1, const void *key2)
     return memcmp(key1, key2, l1) == 0;
 }
 
+/* 建立一个同步的 Redis 连接 (阻塞式)，
+ * 如果需要认证则执行 AUTH 命令。
+ * 成功返回 redisContext，失败返回 NULL。*/
 static redisContext *getRedisContext(const char *ip, int port,
                                      const char *hostsocket)
 {
@@ -271,6 +290,8 @@ cleanup:
 
 
 
+/* 从目标 Redis 实例中读取 save 与 appendonly 配置项，
+ * 用于在 benchmark 报告中展示目标服务器持久化设置。*/
 static redisConfig *getRedisConfig(const char *ip, int port,
                                    const char *hostsocket)
 {
@@ -323,12 +344,15 @@ fail:
     if (abort_test) exit(1);
     return NULL;
 }
+/* 释放 redisConfig 结构体及其内部 sds 字段。*/
 static void freeRedisConfig(redisConfig *cfg) {
     if (cfg->save) sdsfree(cfg->save);
     if (cfg->appendonly) sdsfree(cfg->appendonly);
     zfree(cfg);
 }
 
+/* 释放一个 benchmark client 资源，包括事件循环中注册的读写事件、
+ * redis 连接、输出缓冲区以及随机化字段指针等。*/
 static void freeClient(client c) {
     aeEventLoop *el = CLIENT_GET_EVENTLOOP(c);
     listNode *ln;
@@ -354,6 +378,7 @@ static void freeClient(client c) {
     if (config.num_threads) pthread_mutex_unlock(&(config.liveclients_mutex));
 }
 
+/* 释放 config.clients 列表中的所有 client。*/
 static void freeAllClients(void) {
     listNode *ln = config.clients->head, *next;
 
@@ -364,6 +389,8 @@ static void freeAllClients(void) {
     }
 }
 
+/* 重置 client 状态：重新注册可写事件以便发起下一轮请求，
+ * 复位已写入字节数和待应答计数 (用于 keepalive 模式)。*/
 static void resetClient(client c) {
     aeEventLoop *el = CLIENT_GET_EVENTLOOP(c);
     aeDeleteFileEvent(el,c->context->fd,AE_WRITABLE);
@@ -373,6 +400,8 @@ static void resetClient(client c) {
     c->pending = config.pipeline;
 }
 
+/* 在 client 输出缓冲区中，将所有 "__rand_int__" 占位符替换为
+ * 0 ~ keyspacelen-1 之间的随机数 (12 位数字)。*/
 static void randomizeClientKey(client c) {
     size_t i;
 
@@ -391,6 +420,9 @@ static void randomizeClientKey(client c) {
     }
 }
 
+/* 设置集群模式下的 key hash tag：将 client 输出缓冲区中所有
+ * "{tag}" 占位符替换为目标 master 节点对应 slot 的 hash tag，
+ * 以确保命令被路由到正确的集群节点。*/
 static void setClusterKeyHashTag(client c) {
     assert(c->thread_id >= 0);
     clusterNode *node = c->cluster_node;
@@ -416,6 +448,9 @@ static void setClusterKeyHashTag(client c) {
     }
 }
 
+/* 单个 client 完成全部请求后的处理。
+ * - 已达到请求总数：释放 client 并停止事件循环；
+ * - 否则根据 keepalive 决定重置还是重建连接。*/
 static void clientDone(client c) {
     int requests_finished = 0;
     atomicGet(config.requests_finished, requests_finished);
@@ -437,6 +472,9 @@ static void clientDone(client c) {
     }
 }
 
+/* ae 事件循环的读事件回调：从 socket 读取响应，解析每条 reply。
+ * 计算请求延迟，更新延迟直方图；处理集群错误 (MOVED/ASK/CLUSTERDOWN)
+ * 触发 slot 重新拉取；处理前缀命令 (AUTH/SELECT/TRACKING/HELLO) 等。*/
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     void *reply = NULL;
@@ -550,6 +588,9 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+/* ae 事件循环的写事件回调：将 client 输出缓冲区的命令写入 socket。
+ * 首次写入时进行 key 随机化、设置起始时间、初始化延迟统计；
+ * 全部写入成功后切换为读事件等待响应。*/
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     UNUSED(el);
@@ -599,27 +640,25 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
-/* Create a benchmark client, configured to send the command passed as 'cmd' of
- * 'len' bytes.
+/* 创建一个 benchmark client，配置为发送 'len' 字节的 'cmd' 命令。
  *
- * The command is copied N times in the client output buffer (that is reused
- * again and again to send the request to the server) accordingly to the configured
- * pipeline size.
+ * 该命令会按 pipeline 大小被复制 N 次放入 client 的输出缓冲区中，
+ * 以便反复向服务器发送请求。
  *
- * Also an initial SELECT command is prepended in order to make sure the right
- * database is selected, if needed. The initial SELECT will be discarded as soon
- * as the first reply is received.
+ * 此外，若配置了相应选项，缓冲区开头会加上 AUTH / SELECT /
+ * CLIENT TRACKING / HELLO 等前缀命令。这些前缀命令在收到
+ * 第一个响应后会被丢弃，因此 client 复用时不会重复发送。
  *
- * To create a client from scratch, the 'from' pointer is set to NULL. If instead
- * we want to create a client using another client as reference, the 'from' pointer
- * points to the client to use as reference. In such a case the following
- * information is take from the 'from' client:
+ * 若要从头创建 client，则 'from' 指针为 NULL；若要以另一个
+ * client 为模板创建，则 'from' 指向该模板 client。此时会复用模板
+ * client 的以下信息：
  *
- * 1) The command line to use.
- * 2) The offsets of the __rand_int__ elements inside the command line, used
- *    for arguments randomization.
+ * 1) 命令模板本身。
+ * 2) 命令中 __rand_int__ 元素的位置 (用于参数随机化)。
  *
- * Even when cloning another client, prefix commands are applied if needed.*/
+ * 即使是克隆自另一个 client，前缀命令也会按需应用。
+ */
+/* 创建一个连接到 Redis 的 benchmark client。详见上方块注释。*/
 static client createClient(char *cmd, size_t len, client from, int thread_id) {
     int j;
     int is_cluster_client = (config.cluster_mode && thread_id >= 0);
@@ -809,6 +848,8 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     return c;
 }
 
+/* 持续创建新 client 直到 liveclients 达到 numclients。
+ * 每次最多连续创建 64 个 client，避免瞬间打满监听 backlog。*/
 static void createMissingClients(client c) {
     int n = 0;
     while(config.liveclients < config.numclients) {
@@ -825,6 +866,12 @@ static void createMissingClients(client c) {
     }
 }
 
+/* 输出 benchmark 结束后的延迟报告。
+ * 根据 config.quiet / config.csv 选择不同输出格式：
+ *  - 默认：完整的百分比分布、累计分布、吞吐量与平均/最小/p50/p95/p99/最大 摘要；
+ *  - CSV 模式：单行 CSV 数据；
+ *  - quiet 模式：仅显示每秒请求数与 p50 延迟。
+ */
 static void showLatencyReport(void) {
 
     const float reqpersec = (float)config.requests_finished/((float)config.totlatency/1000.0f);
@@ -918,6 +965,8 @@ static void showLatencyReport(void) {
     }
 }
 
+/* 初始化所有 benchmark 线程 (num_threads 个)，每个线程拥有独立的事件循环，
+ * 并注册周期性 showThroughput 定时器用于打印实时吞吐。*/
 static void initBenchmarkThreads(void) {
     int i;
     if (config.threads) freeBenchmarkThreads();
@@ -928,6 +977,7 @@ static void initBenchmarkThreads(void) {
     }
 }
 
+/* 启动所有 benchmark 线程并等待它们执行结束。*/
 static void startBenchmarkThreads(void) {
     int i;
     for (i = 0; i < config.num_threads; i++) {
@@ -941,6 +991,9 @@ static void startBenchmarkThreads(void) {
         pthread_join(config.threads[i]->thread, NULL);
 }
 
+/* 对给定的命令执行一轮 benchmark：
+ * 初始化延迟直方图，创建首个 client 并补足并发数，
+ * 记录总耗时，最后输出延迟报告并清理资源。*/
 static void benchmark(const char *title, char *cmd, int len) {
     client c;
 
@@ -979,8 +1032,10 @@ static void benchmark(const char *title, char *cmd, int len) {
 
 }
 
-/* Thread functions. */
+/* 线程相关函数。*/
 
+/* 创建一个指定下标的 benchmark 线程，
+ * 包括独立的事件循环与定期输出吞吐的定时器。*/
 static benchmarkThread *createBenchmarkThread(int index) {
     benchmarkThread *thread = zmalloc(sizeof(*thread));
     if (thread == NULL) return NULL;
@@ -990,11 +1045,13 @@ static benchmarkThread *createBenchmarkThread(int index) {
     return thread;
 }
 
+/* 释放单个 benchmark 线程及其事件循环。*/
 static void freeBenchmarkThread(benchmarkThread *thread) {
     if (thread->el) aeDeleteEventLoop(thread->el);
     zfree(thread);
 }
 
+/* 释放所有 benchmark 线程及线程数组。*/
 static void freeBenchmarkThreads(void) {
     int i = 0;
     for (; i < config.num_threads; i++) {
@@ -1005,14 +1062,17 @@ static void freeBenchmarkThreads(void) {
     config.threads = NULL;
 }
 
+/* benchmark 线程入口函数：进入对应线程的事件循环，
+ * 一直运行到事件循环被停止 (如请求全部完成时)。*/
 static void *execBenchmarkThread(void *ptr) {
     benchmarkThread *thread = (benchmarkThread *) ptr;
     aeMain(thread->el);
     return NULL;
 }
 
-/* Cluster helper functions. */
+/* 集群模式辅助函数。*/
 
+/* 创建一个 clusterNode 结构，分配 slot 数组并初始化字段。*/
 static clusterNode *createClusterNode(char *ip, int port) {
     clusterNode *node = zmalloc(sizeof(*node));
     if (!node) return NULL;
@@ -1034,6 +1094,8 @@ static clusterNode *createClusterNode(char *ip, int port) {
     return node;
 }
 
+/* 释放 clusterNode 及其内部动态分配的资源。
+ * 注意：若 ip 不等于默认 hostip，则该 ip 由 fetchClusterConfiguration 分配，需要释放。*/
 static void freeClusterNode(clusterNode *node) {
     int i;
     if (node->name) sdsfree(node->name);
@@ -1055,6 +1117,7 @@ static void freeClusterNode(clusterNode *node) {
     zfree(node);
 }
 
+/* 释放所有 clusterNode 及节点数组。*/
 static void freeClusterNodes(void) {
     int i = 0;
     for (; i < config.cluster_node_count; i++) {
@@ -1065,6 +1128,7 @@ static void freeClusterNodes(void) {
     config.cluster_nodes = NULL;
 }
 
+/* 将 clusterNode 添加到 config.cluster_nodes 数组中，必要时扩展数组。*/
 static clusterNode **addClusterNode(clusterNode *node) {
     int count = config.cluster_node_count + 1;
     config.cluster_nodes = zrealloc(config.cluster_nodes,
@@ -1074,9 +1138,9 @@ static clusterNode **addClusterNode(clusterNode *node) {
     return config.cluster_nodes;
 }
 
-/* TODO: This should be refactored to use CLUSTER SLOTS, the migrating/importing
- * information is anyway not used.
- */
+/* 通过 CLUSTER NODES 命令获取集群 master 节点及其 slot 分布。
+ * TODO: 此函数应改用 CLUSTER SLOTS 命令，migrating/importing
+ * 字段实际上未被使用。*/
 static int fetchClusterConfiguration(void) {
     int success = 1;
     redisContext *ctx = NULL;
@@ -1243,8 +1307,8 @@ cleanup:
     return success;
 }
 
-/* Request the current cluster slots configuration by calling CLUSTER SLOTS
- * and atomically update the slots after a successful reply. */
+/* 通过调用 CLUSTER SLOTS 命令获取集群最新的 slot 配置，
+ * 并在收到成功回复后以原子方式更新 slot 分配。*/
 static int fetchClusterSlotsConfiguration(client c) {
     UNUSED(c);
     int success = 1, is_fetching_slots = 0, last_update = 0;
@@ -1335,7 +1399,8 @@ cleanup:
     return success;
 }
 
-/* Atomically update the new slots configuration. */
+/* 原子地应用新的 slot 配置：将每个 master 的 updated_slots 替换为 slots，
+ * 并递增 slots_last_update 通知其他线程配置已更新。*/
 static void updateClusterSlotsConfiguration(void) {
     pthread_mutex_lock(&config.is_updating_slots_mutex);
     atomicSet(config.is_updating_slots, 1);
@@ -1356,7 +1421,8 @@ static void updateClusterSlotsConfiguration(void) {
     pthread_mutex_unlock(&config.is_updating_slots_mutex);
 }
 
-/* Generate random data for redis benchmark. See #7196. */
+/* 生成 redis benchmark 使用的随机数据 (参见 issue #7196)。
+ * 使用简单线性同余生成器填充指定长度的 buffer，字符为 '0'..'0'+63。*/
 static void genBenchmarkRandomData(char *data, int count) {
     static uint32_t state = 1234;
     int i = 0;
@@ -1367,7 +1433,8 @@ static void genBenchmarkRandomData(char *data, int count) {
     }
 }
 
-/* Returns number of consumed options. */
+/* 解析 redis-benchmark 命令行选项。
+ * 返回已消费的选项个数；调用方据此将剩余参数作为命令模板。*/
 int parseOptions(int argc, char **argv) {
     int i;
     int lastarg;
@@ -1633,6 +1700,10 @@ tls_usage,
     exit(exit_status);
 }
 
+/* 周期性定时器回调，每 SHOW_THROUGHPUT_INTERVAL 毫秒打印一次实时吞吐：
+ * 包括瞬时 rps、平均 rps、瞬时平均延迟与全局平均延迟。
+ * idle 模式下显示当前 client 数；多线程模式下仅由 index==0 的线程输出。
+ * 请求全部完成后停止事件循环。*/
 int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
@@ -1677,8 +1748,8 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
     return SHOW_THROUGHPUT_INTERVAL;
 }
 
-/* Return true if the named test was selected using the -t command line
- * switch, or if all the tests are selected (no -t passed by user). */
+/* 检查名为 'name' 的测试是否被 -t 选项选中。
+ * 如果未提供 -t (config.tests == NULL)，则所有测试均被选中。*/
 int test_is_selected(const char *name) {
     char buf[256];
     int l = strlen(name);
@@ -1691,6 +1762,12 @@ int test_is_selected(const char *name) {
     return strstr(config.tests,buf) != NULL;
 }
 
+/* redis-benchmark 入口函数：
+ * 1) 初始化默认配置与全局事件循环；
+ * 2) 解析命令行参数；
+ * 3) 集群模式下获取集群拓扑 (并按节点数自动调整线程数)；
+ * 4) 若指定了具体命令则仅 benchmark 该命令，否则运行默认测试套件；
+ * 5) 输出结果并清理资源。*/
 int main(int argc, char **argv) {
     int i;
     char *data, *cmd, *tag;
@@ -1752,10 +1829,10 @@ int main(int argc, char **argv) {
 #endif
 
     if (config.cluster_mode) {
-        // We only include the slot placeholder {tag} if cluster mode is enabled
+        // 仅在集群模式下附加 slot 占位符 {tag}
         tag = ":{tag}";
 
-        /* Fetch cluster configuration. */
+        /* 获取集群配置。*/
         if (!fetchClusterConfiguration() || !config.cluster_nodes) {
             if (!config.hostsocket) {
                 fprintf(stderr, "Failed to fetch cluster configuration from "
@@ -1771,6 +1848,7 @@ int main(int argc, char **argv) {
                     config.cluster_node_count);
             exit(1);
         }
+        /* 打印集群 master 节点列表，并获取各节点的配置。*/
         printf("Cluster has %d master nodes:\n\n", config.cluster_node_count);
         int i = 0;
         for (; i < config.cluster_node_count; i++) {
@@ -1789,8 +1867,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("\n");
-        /* Automatically set thread number to node count if not specified
-         * by the user. */
+        /* 若用户未显式指定线程数，则自动按 master 节点数设置。*/
         if (config.num_threads == 0)
             config.num_threads = config.cluster_node_count;
     } else {
@@ -1816,6 +1893,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "WARNING: Option -t is ignored.\n");
     }
 
+    /* idle 模式：仅创建若干空闲连接并保持，不发送任何命令。*/
     if (config.idlemode) {
         printf("Creating %d idle connections and waiting forever (Ctrl+C when done)\n", config.numclients);
         int thread_id = -1, use_threads = (config.num_threads > 0);
@@ -1832,7 +1910,7 @@ int main(int argc, char **argv) {
     if(config.csv){
         printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n");
     }
-    /* Run benchmark with command in the remainder of the arguments. */
+    /* 使用剩余的命令行参数作为命令模板运行 benchmark。*/
     if (argc) {
         sds title = sdsnew(argv[0]);
         for (i = 1; i < argc; i++) {
@@ -1868,7 +1946,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* Run default benchmark suite. */
+    /* 运行默认 benchmark 测试套件。*/
     data = zmalloc(config.datasize+1);
     do {
         genBenchmarkRandomData(data, config.datasize);
@@ -2009,6 +2087,8 @@ int main(int argc, char **argv) {
             sdsfree(key_placeholder);
         }
 
+        /* 用户自定义命令中 __rand_int__ 占位符在每次执行时
+         * 会被替换为 -r 指定范围内的 12 位随机整数。*/
         if (test_is_selected("xadd")) {
             len = redisFormatCommand(&cmd,"XADD mystream%s * myfield %s", tag, data);
             benchmark("XADD",cmd,len);

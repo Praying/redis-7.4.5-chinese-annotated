@@ -9,9 +9,8 @@
  */
 
 /*
- * cluster.c contains the common parts of a clustering
- * implementation, the parts that are shared between
- * any implementation of Redis clustering.
+ * cluster.c 包含了集群实现的公共部分,
+ * 即在任何 Redis 集群实现之间共享的代码。
  */
 
 #include "server.h"
@@ -20,12 +19,11 @@
 #include <ctype.h>
 
 /* -----------------------------------------------------------------------------
- * Key space handling
+ * Key space handling（键空间处理）
  * -------------------------------------------------------------------------- */
 
-/* If it can be inferred that the given glob-style pattern, as implemented in
- * stringmatchlen() in util.c, only can match keys belonging to a single slot,
- * that slot is returned. Otherwise -1 is returned. */
+/* 如果能推断出给定的 glob 风格 pattern（如 util.c 中 stringmatchlen() 所实现的）
+ * 只能匹配属于单个 slot 的键，则返回该 slot；否则返回 -1。*/
 int patternHashSlot(char *pattern, int length) {
     int s = -1; /* index of the first '{' */
 
@@ -62,26 +60,26 @@ ConnectionType *connTypeOfCluster(void) {
 }
 
 /* -----------------------------------------------------------------------------
- * DUMP, RESTORE and MIGRATE commands
+ * DUMP, RESTORE and MIGRATE commands（DUMP、RESTORE 与 MIGRATE 命令）
  * -------------------------------------------------------------------------- */
 
-/* Generates a DUMP-format representation of the object 'o', adding it to the
- * io stream pointed by 'rio'. This function can't fail. */
+/* 生成对象 'o' 的 DUMP 格式表示，并将其追加到 'rio' 指向的 io 流中。
+ * 该函数不会失败。*/
 void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
     unsigned char buf[2];
     uint64_t crc;
 
-    /* Serialize the object in an RDB-like format. It consist of an object type
-     * byte followed by the serialized object. This is understood by RESTORE. */
+    /* 以类似 RDB 的格式序列化对象。它由一个对象类型字节及随后序列化的对象组成。
+     * RESTORE 命令能够识别这种格式。*/
     rioInitWithBuffer(payload,sdsempty());
     serverAssert(rdbSaveObjectType(payload,o));
     serverAssert(rdbSaveObject(payload,o,key,dbid));
 
-    /* Write the footer, this is how it looks like:
+    /* 写入尾部，其结构如下：
      * ----------------+---------------------+---------------+
      * ... RDB payload | 2 bytes RDB version | 8 bytes CRC64 |
      * ----------------+---------------------+---------------+
-     * RDB version and CRC are both in little endian.
+     * RDB version 和 CRC 都是小端字节序。
      */
 
     /* RDB version */
@@ -96,21 +94,19 @@ void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
     payload->io.buffer.ptr = sdscatlen(payload->io.buffer.ptr,&crc,8);
 }
 
-/* Verify that the RDB version of the dump payload matches the one of this Redis
- * instance and that the checksum is ok.
- * If the DUMP payload looks valid C_OK is returned, otherwise C_ERR
- * is returned. If rdbver_ptr is not NULL, its populated with the value read
- * from the input buffer. */
+/* 校验 dump payload 的 RDB 版本是否与本 Redis 实例匹配，且校验和是否正确。
+ * 如果 DUMP payload 看起来有效则返回 C_OK，否则返回 C_ERR。
+ * 如果 rdbver_ptr 不为 NULL，则使用从输入缓冲区中读取到的值填充它。*/
 int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr) {
     unsigned char *footer;
     uint16_t rdbver;
     uint64_t crc;
 
-    /* At least 2 bytes of RDB version and 8 of CRC64 should be present. */
+    /* 至少应该包含 2 字节的 RDB 版本号和 8 字节的 CRC64。*/
     if (len < 10) return C_ERR;
     footer = p+(len-10);
 
-    /* Set and verify RDB version. */
+    /* 设置并校验 RDB 版本号。*/
     rdbver = (footer[1] << 8) | footer[0];
     if (rdbver_ptr) {
         *rdbver_ptr = rdbver;
@@ -120,41 +116,42 @@ int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr) {
     if (server.skip_checksum_validation)
         return C_OK;
 
-    /* Verify CRC64 */
+    /* 校验 CRC64 */
     crc = crc64(0,p,len-8);
     memrev64ifbe(&crc);
     return (memcmp(&crc,footer+2,8) == 0) ? C_OK : C_ERR;
 }
 
 /* DUMP keyname
- * DUMP is actually not used by Redis Cluster but it is the obvious
- * complement of RESTORE and can be useful for different applications. */
+ * DUMP 实际上并没有被 Redis Cluster 使用，但它显然是 RESTORE 的对偶命令，
+ * 对于不同的应用场景可能非常有用。*/
 void dumpCommand(client *c) {
     robj *o;
     rio payload;
 
-    /* Check if the key is here. */
+    /* 检查键是否在这里。*/
     if ((o = lookupKeyRead(c->db,c->argv[1])) == NULL) {
         addReplyNull(c);
         return;
     }
 
-    /* Create the DUMP encoded representation. */
+    /* 创建 DUMP 编码表示。*/
     createDumpPayload(&payload,o,c->argv[1],c->db->id);
 
-    /* Transfer to the client */
+    /* 发送给客户端 */
     addReplyBulkSds(c,payload.io.buffer.ptr);
     return;
 }
 
-/* RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency] */
+/* RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]
+ * 恢复 key 的序列化的值，可指定 TTL 及各种可选参数。*/
 void restoreCommand(client *c) {
     long long ttl, lfu_freq = -1, lru_idle = -1, lru_clock = -1;
     rio payload;
     int j, type, replace = 0, absttl = 0;
     robj *obj;
 
-    /* Parse additional options */
+    /* 解析额外的选项 */
     for (j = 4; j < c->argc; j++) {
         int additional = c->argc-j-1;
         if (!strcasecmp(c->argv[j]->ptr,"replace")) {
@@ -171,7 +168,7 @@ void restoreCommand(client *c) {
                 return;
             }
             lru_clock = LRU_CLOCK();
-            j++; /* Consume additional arg. */
+            j++; /* 消费额外的参数。*/
         } else if (!strcasecmp(c->argv[j]->ptr,"freq") && additional >= 1 &&
                    lru_idle == -1)
         {
@@ -181,21 +178,21 @@ void restoreCommand(client *c) {
                 addReplyError(c,"Invalid FREQ value, must be >= 0 and <= 255");
                 return;
             }
-            j++; /* Consume additional arg. */
+            j++; /* 消费额外的参数。*/
         } else {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
     }
 
-    /* Make sure this key does not already exist here... */
+    /* 确保该 key 在这里不存在…… */
     robj *key = c->argv[1];
     if (!replace && lookupKeyWrite(c->db,key) != NULL) {
         addReplyErrorObject(c,shared.busykeyerr);
         return;
     }
 
-    /* Check if the TTL value makes sense */
+    /* 检查 TTL 值是否合理 */
     if (getLongLongFromObjectOrReply(c,c->argv[2],&ttl,NULL) != C_OK) {
         return;
     } else if (ttl < 0) {
@@ -203,7 +200,7 @@ void restoreCommand(client *c) {
         return;
     }
 
-    /* Verify RDB version and data checksum. */
+    /* 校验 RDB 版本与数据校验和。*/
     if (verifyDumpPayload(c->argv[3]->ptr,sdslen(c->argv[3]->ptr),NULL) == C_ERR)
     {
         addReplyError(c,"DUMP payload version or checksum are wrong");
@@ -218,7 +215,7 @@ void restoreCommand(client *c) {
         return;
     }
 
-    /* Remove the old key if needed. */
+    /* 如果需要，移除旧的 key。*/
     int deleted = 0;
     if (replace)
         deleted = dbDelete(c->db,key);
@@ -237,11 +234,11 @@ void restoreCommand(client *c) {
         return;
     }
 
-    /* Create the key and set the TTL if any */
+    /* 创建 key 并设置 TTL（如果有）*/
     dictEntry *de = dbAdd(c->db,key,obj);
 
-    /* If minExpiredField was set, then the object is hash with expiration
-     * on fields and need to register it in global HFE DS */
+    /* 如果 minExpiredField 已被设置，则该对象是一个字段带过期时间的哈希，
+     * 需要将其注册到全局的 HFE 数据结构中 */
     if (obj->type == OBJ_HASH) {
         uint64_t minExpiredField = hashTypeGetMinExpire(obj, 1);
         if (minExpiredField != EB_EXPIRE_TIME_INVALID)
@@ -251,7 +248,7 @@ void restoreCommand(client *c) {
     if (ttl) {
         setExpire(c,c->db,key,ttl);
         if (!absttl) {
-            /* Propagate TTL as absolute timestamp */
+            /* 将 TTL 作为绝对时间戳进行传播 */
             robj *ttl_obj = createStringObjectFromLongLong(ttl);
             rewriteClientCommandArgument(c,2,ttl_obj);
             decrRefCount(ttl_obj);
@@ -264,14 +261,13 @@ void restoreCommand(client *c) {
     addReply(c,shared.ok);
     server.dirty++;
 }
-/* MIGRATE socket cache implementation.
+/* MIGRATE socket cache implementation（MIGRATE 套接字缓存实现）。
  *
- * We take a map between host:ip and a TCP socket that we used to connect
- * to this instance in recent time.
- * This sockets are closed when the max number we cache is reached, and also
- * in serverCron() when they are around for more than a few seconds. */
-#define MIGRATE_SOCKET_CACHE_ITEMS 64 /* max num of items in the cache. */
-#define MIGRATE_SOCKET_CACHE_TTL 10 /* close cached sockets after 10 sec. */
+ * 我们维护一个 host:ip 到最近用于连接该实例的 TCP 套接字的映射。
+ * 当缓存的套接字数量达到上限时会关闭部分套接字；
+ * 同时 serverCron() 也会清理那些闲置超过数秒的缓存套接字。*/
+#define MIGRATE_SOCKET_CACHE_ITEMS 64 /* max num of items in the cache.（缓存中的最大条目数）*/
+#define MIGRATE_SOCKET_CACHE_TTL 10 /* close cached sockets after 10 sec.（缓存套接字在 10 秒后关闭）*/
 
 typedef struct migrateCachedSocket {
     connection *conn;
@@ -279,23 +275,20 @@ typedef struct migrateCachedSocket {
     time_t last_use_time;
 } migrateCachedSocket;
 
-/* Return a migrateCachedSocket containing a TCP socket connected with the
- * target instance, possibly returning a cached one.
+/* 返回一个包含连接到目标实例的 TCP 套接字的 migrateCachedSocket，
+ * 可能直接返回一个缓存的套接字。
  *
- * This function is responsible of sending errors to the client if a
- * connection can't be established. In this case -1 is returned.
- * Otherwise on success the socket is returned, and the caller should not
- * attempt to free it after usage.
+ * 如果无法建立连接，本函数负责向客户端发送错误信息，这种情况下返回 -1。
+ * 否则在成功时返回该套接字，调用者使用后不应尝试释放它。
  *
- * If the caller detects an error while using the socket, migrateCloseSocket()
- * should be called so that the connection will be created from scratch
- * the next time. */
+ * 如果调用者在使用套接字时检测到错误，应调用 migrateCloseSocket()，
+ * 这样下次就会重新创建连接。*/
 migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long timeout) {
     connection *conn;
     sds name = sdsempty();
     migrateCachedSocket *cs;
 
-    /* Check if we have an already cached socket for this ip:port pair. */
+    /* 检查该 ip:port 对是否已有缓存的套接字。*/
     name = sdscatlen(name,host->ptr,sdslen(host->ptr));
     name = sdscatlen(name,":",1);
     name = sdscatlen(name,port->ptr,sdslen(port->ptr));
@@ -306,9 +299,9 @@ migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long ti
         return cs;
     }
 
-    /* No cached socket, create one. */
+    /* 没有缓存的套接字，创建一个新的。*/
     if (dictSize(server.migrate_cached_sockets) == MIGRATE_SOCKET_CACHE_ITEMS) {
-        /* Too many items, drop one at random. */
+        /* 条目过多，随机丢弃一个。*/
         dictEntry *de = dictGetRandomKey(server.migrate_cached_sockets);
         cs = dictGetVal(de);
         connClose(cs->conn);
@@ -316,7 +309,7 @@ migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long ti
         dictDelete(server.migrate_cached_sockets,dictGetKey(de));
     }
 
-    /* Create the connection */
+    /* 创建连接 */
     conn = connCreate(connTypeOfCluster());
     if (connBlockingConnect(conn, host->ptr, atoi(port->ptr), timeout)
         != C_OK) {
@@ -327,7 +320,7 @@ migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long ti
     }
     connEnableTcpNoDelay(conn);
 
-    /* Add to the cache and return it to the caller. */
+    /* 添加到缓存中并返回给调用者。*/
     cs = zmalloc(sizeof(*cs));
     cs->conn = conn;
 
@@ -337,7 +330,7 @@ migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long ti
     return cs;
 }
 
-/* Free a migrate cached connection. */
+/* 释放一个 MIGRATE 缓存的连接。*/
 void migrateCloseSocket(robj *host, robj *port) {
     sds name = sdsempty();
     migrateCachedSocket *cs;
@@ -375,8 +368,9 @@ void migrateCloseTimedoutSockets(void) {
 
 /* MIGRATE host port key dbid timeout [COPY | REPLACE | AUTH password |
  *         AUTH2 username password]
+ * 将 key 迁移到指定的 host:port 上。
  *
- * On in the multiple keys form:
+ * 多 key 形式的语法：
  *
  * MIGRATE host port "" dbid timeout [COPY | REPLACE | AUTH password |
  *         AUTH2 username password] KEYS key1 key2 ... keyN */
@@ -395,11 +389,11 @@ void migrateCommand(client *c) {
     int write_error = 0;
     int argv_rewritten = 0;
 
-    /* To support the KEYS option we need the following additional state. */
+    /* 为了支持 KEYS 选项，需要使用以下额外的状态变量。*/
     int first_key = 3; /* Argument index of the first key. */
     int num_keys = 1;  /* By default only migrate the 'key' argument. */
 
-    /* Parse additional options */
+    /* 解析额外的选项 */
     for (j = 6; j < c->argc; j++) {
         int moreargs = (c->argc-1) - j;
         if (!strcasecmp(c->argv[j]->ptr,"copy")) {
@@ -439,7 +433,7 @@ void migrateCommand(client *c) {
         }
     }
 
-    /* Sanity check */
+    /* 基本健全性检查 */
     if (getLongFromObjectOrReply(c,c->argv[5],&timeout,NULL) != C_OK ||
         getLongFromObjectOrReply(c,c->argv[4],&dbid,NULL) != C_OK)
     {
@@ -447,11 +441,10 @@ void migrateCommand(client *c) {
     }
     if (timeout <= 0) timeout = 1000;
 
-    /* Check if the keys are here. If at least one key is to migrate, do it
-     * otherwise if all the keys are missing reply with "NOKEY" to signal
-     * the caller there was nothing to migrate. We don't return an error in
-     * this case, since often this is due to a normal condition like the key
-     * expiring in the meantime. */
+    /* 检查 key 是否存在。如果至少存在一个待迁移的 key 就执行迁移；
+     * 如果所有 key 都缺失，则回复 "NOKEY" 以告知调用者没有可迁移的数据。
+     * 这种情况我们不会返回错误，因为它通常属于正常情形，
+     * 比如 key 刚刚过期。*/
     ov = zrealloc(ov,sizeof(robj*)*num_keys);
     kv = zrealloc(kv,sizeof(robj*)*num_keys);
     int oi = 0;
@@ -472,16 +465,17 @@ void migrateCommand(client *c) {
     try_again:
     write_error = 0;
 
-    /* Connect */
+    /* Connect（建立连接）*/
     cs = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
     if (cs == NULL) {
         zfree(ov); zfree(kv);
-        return; /* error sent to the client by migrateGetSocket() */
+        return; /* error sent to the client by migrateGetSocket()
+                   （错误已由 migrateGetSocket() 发送给客户端）*/
     }
 
     rioInitWithBuffer(&cmd,sdsempty());
 
-    /* Authentication */
+    /* Authentication（认证）*/
     if (password) {
         int arity = username ? 3 : 2;
         serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',arity));
@@ -494,7 +488,7 @@ void migrateCommand(client *c) {
                                                        sdslen(password)));
     }
 
-    /* Send the SELECT command if the current DB is not already selected. */
+    /* 如果目标数据库不是当前已选中的数据库，则发送 SELECT 命令。*/
     int select = cs->last_dbid != dbid; /* Should we emit SELECT? */
     if (select) {
         serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',2));
@@ -507,7 +501,7 @@ void migrateCommand(client *c) {
                             so certain keys that were found non expired by the
                             lookupKey() function, may be expired later. */
 
-    /* Create RESTORE payload and generate the protocol to call the command. */
+    /* 创建 RESTORE payload 并生成调用命令所需的协议。*/
     for (j = 0; j < num_keys; j++) {
         long long ttl = 0;
         long long expireat = getExpire(c->db,kv[j]);
@@ -520,9 +514,8 @@ void migrateCommand(client *c) {
             if (ttl < 1) ttl = 1;
         }
 
-        /* Relocate valid (non expired) keys and values into the array in successive
-         * positions to remove holes created by the keys that were present
-         * in the first lookup but are now expired after the second lookup. */
+        /* 将合法（未过期）的键和值重新放置到数组中相邻的位置，
+         * 以便清除那些在第一次查找中存在但第二次查找时已过期的键所留下的空洞。*/
         ov[non_expired] = ov[j];
         kv[non_expired++] = kv[j];
 
@@ -539,24 +532,22 @@ void migrateCommand(client *c) {
                                                        sdslen(kv[j]->ptr)));
         serverAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,ttl));
 
-        /* Emit the payload argument, that is the serialized object using
-         * the DUMP format. */
+        /* 输出 payload 参数，即使用 DUMP 格式序列化的对象。*/
         createDumpPayload(&payload,ov[j],kv[j],dbid);
         serverAssertWithInfo(c,NULL,
                              rioWriteBulkString(&cmd,payload.io.buffer.ptr,
                                                 sdslen(payload.io.buffer.ptr)));
         sdsfree(payload.io.buffer.ptr);
 
-        /* Add the REPLACE option to the RESTORE command if it was specified
-         * as a MIGRATE option. */
+        /* 如果 REPLACE 被指定为 MIGRATE 的选项，则将其添加到 RESTORE 命令中。*/
         if (replace)
             serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"REPLACE",7));
     }
 
-    /* Fix the actual number of keys we are migrating. */
+    /* 修正实际迁移的 key 数量。*/
     num_keys = non_expired;
 
-    /* Transfer the query to the other node in 64K chunks. */
+    /* 以 64K 大小的块将查询转发到另一个节点。*/
     errno = 0;
     {
         sds buf = cmd.io.buffer.ptr;
@@ -574,27 +565,26 @@ void migrateCommand(client *c) {
         }
     }
 
-    char buf0[1024]; /* Auth reply. */
-    char buf1[1024]; /* Select reply. */
-    char buf2[1024]; /* Restore reply. */
+    char buf0[1024]; /* Auth reply.（认证回复）*/
+    char buf1[1024]; /* Select reply.（选择数据库回复）*/
+    char buf2[1024]; /* Restore reply.（RESTORE 回复）*/
 
-    /* Read the AUTH reply if needed. */
+    /* Read the AUTH reply if needed.（如有必要，读取 AUTH 命令的回复）*/
     if (password && connSyncReadLine(cs->conn, buf0, sizeof(buf0), timeout) <= 0)
         goto socket_err;
 
-    /* Read the SELECT reply if needed. */
+    /* Read the SELECT reply if needed.（如有必要，读取 SELECT 命令的回复）*/
     if (select && connSyncReadLine(cs->conn, buf1, sizeof(buf1), timeout) <= 0)
         goto socket_err;
 
-    /* Read the RESTORE replies. */
+    /* Read the RESTORE replies.（读取 RESTORE 命令的回复）*/
     int error_from_target = 0;
     int socket_error = 0;
     int del_idx = 1; /* Index of the key argument for the replicated DEL op. */
 
-    /* Allocate the new argument vector that will replace the current command,
-     * to propagate the MIGRATE as a DEL command (if no COPY option was given).
-     * We allocate num_keys+1 because the additional argument is for "DEL"
-     * command name itself. */
+    /* 分配新的参数向量，用于替换当前的命令，
+     * 以便在没有给定 COPY 选项的情况下将 MIGRATE 作为 DEL 命令进行传播。
+     * 我们分配 num_keys+1 个空间，因为额外的那个参数是 "DEL" 命令名本身。*/
     if (!copy) newargv = zmalloc(sizeof(robj*)*(num_keys+1));
 
     for (j = 0; j < num_keys; j++) {
@@ -606,7 +596,7 @@ void migrateCommand(client *c) {
             (select && buf1[0] == '-') ||
             buf2[0] == '-')
         {
-            /* On error assume that last_dbid is no longer valid. */
+            /* 出错时假定 last_dbid 已不再有效。*/
             if (!error_from_target) {
                 cs->last_dbid = -1;
                 char *errbuf;
@@ -620,44 +610,47 @@ void migrateCommand(client *c) {
             }
         } else {
             if (!copy) {
-                /* No COPY option: remove the local key, signal the change. */
+                /* 没有指定 COPY 选项：删除本地 key，并通知变化。*/
                 dbDelete(c->db,kv[j]);
                 signalModifiedKey(c,c->db,kv[j]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"del",kv[j],c->db->id);
                 server.dirty++;
 
-                /* Populate the argument vector to replace the old one. */
+                /* Populate the argument vector to replace the old one.
+                 * （填充参数向量以替换旧的参数向量）*/
                 newargv[del_idx++] = kv[j];
                 incrRefCount(kv[j]);
             }
         }
     }
 
-    /* On socket error, if we want to retry, do it now before rewriting the
-     * command vector. We only retry if we are sure nothing was processed
-     * and we failed to read the first reply (j == 0 test). */
+    /* 出现套接字错误时，如果希望重试，则在重写命令向量之前立即重试。
+     * 我们仅在确认没有任何数据被处理过，且读取第一个回复就失败
+     * （j == 0 测试）时才进行重试。*/
     if (!error_from_target && socket_error && j == 0 && may_retry &&
         errno != ETIMEDOUT)
     {
         goto socket_err; /* A retry is guaranteed because of tested conditions.*/
     }
 
-    /* On socket errors, close the migration socket now that we still have
-     * the original host/port in the ARGV. Later the original command may be
-     * rewritten to DEL and will be too later. */
+    /* 在出现套接字错误时，关闭迁移套接字，因为我们仍然保留着
+     * ARGV 中原始的 host/port。之后原始命令可能会被改写为 DEL，
+     * 那时再来关闭就会太晚。*/
     if (socket_error) migrateCloseSocket(c->argv[1],c->argv[2]);
 
     if (!copy) {
-        /* Translate MIGRATE as DEL for replication/AOF. Note that we do
-         * this only for the keys for which we received an acknowledgement
-         * from the receiving Redis server, by using the del_idx index. */
+        /* 将 MIGRATE 翻译为 DEL 用于复制/AOF。注意，我们仅针对那些
+         * 已从接收端 Redis 服务器收到确认的 key 执行此操作，
+         * 索引使用 del_idx。*/
         if (del_idx > 1) {
             newargv[0] = createStringObject("DEL",3);
-            /* Note that the following call takes ownership of newargv. */
+            /* Note that the following call takes ownership of newargv.
+             * （注意，下面的调用会接管 newargv 的所有权）*/
             replaceClientCommandVector(c,del_idx,newargv);
             argv_rewritten = 1;
         } else {
-            /* No key transfer acknowledged, no need to rewrite as DEL. */
+            /* No key transfer acknowledged, no need to rewrite as DEL.
+             * （没有已确认传输的 key，无需改写为 DEL）*/
             zfree(newargv);
         }
         newargv = NULL; /* Make it safe to call zfree() on it in the future. */
@@ -691,28 +684,40 @@ void migrateCommand(client *c) {
 
 /* On socket errors we try to close the cached socket and try again.
  * It is very common for the cached socket to get closed, if just reopening
- * it works it's a shame to notify the error to the caller. */
+ * it works it's a shame to notify the error to the caller.
+ * （出现套接字错误时，我们尝试关闭缓存的套接字并重新尝试。
+ *  缓存套接字被关闭是常见情况，如果只是重新打开就能恢复，
+ *  那么向调用者通知错误就显得没有必要。）*/
     socket_err:
     /* Cleanup we want to perform in both the retry and no retry case.
-     * Note: Closing the migrate socket will also force SELECT next time. */
+     * Note: Closing the migrate socket will also force SELECT next time.
+     * （在重试和不重试两种情况下都需要执行的清理工作。
+     *  注意：关闭迁移套接字也会强制在下一次重新 SELECT。）*/
     sdsfree(cmd.io.buffer.ptr);
 
     /* If the command was rewritten as DEL and there was a socket error,
      * we already closed the socket earlier. While migrateCloseSocket()
      * is idempotent, the host/port arguments are now gone, so don't do it
-     * again. */
+     * again.
+     * （如果命令已经被改写为 DEL 并且发生了套接字错误，
+     *  我们之前已经关闭过套接字。虽然 migrateCloseSocket() 是幂等的，
+     *  但 host/port 参数现在已经消失了，所以不要再次关闭。）*/
     if (!argv_rewritten) migrateCloseSocket(c->argv[1],c->argv[2]);
     zfree(newargv);
-    newargv = NULL; /* This will get reallocated on retry. */
+    newargv = NULL; /* This will get reallocated on retry.
+                      （该参数向量会在重试时重新分配）*/
 
     /* Retry only if it's not a timeout and we never attempted a retry
-     * (or the code jumping here did not set may_retry to zero). */
+     * (or the code jumping here did not set may_retry to zero).
+     * （仅在不是超时错误且之前未尝试过重试时才进行重试，
+     *  或者跳转到这里时未将 may_retry 设为 0。）*/
     if (errno != ETIMEDOUT && may_retry) {
         may_retry = 0;
         goto try_again;
     }
 
-    /* Cleanup we want to do if no retry is attempted. */
+    /* Cleanup we want to do if no retry is attempted.
+     * （如果不打算重试，则执行此处的清理工作）*/
     zfree(ov); zfree(kv);
     addReplyErrorSds(c, sdscatprintf(sdsempty(),
                                      "-IOERR error or timeout %s to target instance",
@@ -721,7 +726,8 @@ void migrateCommand(client *c) {
 }
 
 /* Cluster node sanity check. Returns C_OK if the node id
- * is valid an C_ERR otherwise. */
+ * is valid an C_ERR otherwise.
+ * （集群节点 ID 的健全性检查。如果 node id 合法则返回 C_OK，否则返回 C_ERR。）*/
 int verifyClusterNodeId(const char *name, int length) {
     if (length != CLUSTER_NAMELEN) return C_ERR;
     for (int i = 0; i < length; i++) {
@@ -770,7 +776,12 @@ void clusterCommandMyShardId(client *c) {
  * a Lua script or RM_call, there is no connection in the fake client, so we use
  * server.current_client here to get the real client if available. And if it is not
  * available (modules may call commands without a real client), we return the default
- * info, which is determined by server.tls_cluster. */
+ * info, which is determined by server.tls_cluster.
+ * （当一个集群命令被调用时，我们需要根据客户端的连接类型决定是返回 TLS 信息还是
+ *  非 TLS 信息。但是，如果该命令是通过 Lua 脚本或 RM_call 调用的，
+ *  fake client 中并没有连接，因此这里使用 server.current_client 字段来获取真实
+ *  的客户端（如果可用的话）。如果仍然不可用（比如模块可能在没有真实客户端的
+ *  情况下调用命令），则返回由 server.tls_cluster 决定的默认信息。）*/
 static int shouldReturnTlsInfo(void) {
     if (server.current_client && server.current_client->conn) {
         return connIsTLS(server.current_client->conn);
@@ -823,7 +834,8 @@ void clusterCommand(client *c) {
         clusterCommandHelp(c);
     } else  if (!strcasecmp(c->argv[1]->ptr,"nodes") && c->argc == 2) {
         /* CLUSTER NODES */
-        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client. */
+        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client.
+         * （向 TLS 客户端返回 TLS 端口，向非 TLS 客户端返回非 TLS 端口。）*/
         sds nodes = clusterGenNodesDescription(c, 0, shouldReturnTlsInfo());
         addReplyVerbatim(c,nodes,sdslen(nodes),"txt");
         sdsfree(nodes);
@@ -844,7 +856,7 @@ void clusterCommand(client *c) {
 
         sds info = genClusterInfoString();
 
-        /* Produce the reply protocol. */
+        /* Produce the reply protocol.（生成回复协议）*/
         addReplyVerbatim(c,info,sdslen(info),"txt");
         sdsfree(info);
     } else if (!strcasecmp(c->argv[1]->ptr,"keyslot") && c->argc == 3) {
@@ -908,7 +920,8 @@ void clusterCommand(client *c) {
             return;
         }
 
-        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client. */
+        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client.
+         * （向 TLS 客户端返回 TLS 端口，向非 TLS 客户端返回非 TLS 端口）*/
         addReplyArrayLen(c, clusterNodeNumSlaves(n));
         for (j = 0; j < clusterNodeNumSlaves(n); j++) {
             sds ni = clusterGenNodeDescription(c, clusterNodeGetSlave(n, j), shouldReturnTlsInfo());
@@ -952,7 +965,31 @@ void clusterCommand(client *c) {
  * so we also handle it here.
  *
  * CLUSTER_REDIR_DOWN_STATE and CLUSTER_REDIR_DOWN_RO_STATE if the cluster is
- * down but the user attempts to execute a command that addresses one or more keys. */
+ * down but the user attempts to execute a command that addresses one or more keys.
+ *
+ * 返回能够处理该命令的集群节点指针。要使该函数成功，命令必须只针对以下两种情况之一：
+ *
+ *  1) 单一 key（即使是多次出现，例如 RPOPLPUSH mylist mylist）。
+ *  2) 处于同一 hash slot 中的多个 key，且该 slot 处于稳定状态（没有正在进行的
+ *     重新分片）。
+ *
+ *  成功时，该函数返回能够处理请求的节点。如果该节点不是 'myself'，则必须执行重定向。
+ *  重定向的类型由通过引用传入的整型参数 'error_code' 指定，可被设置为
+ *  CLUSTER_REDIR_ASK 或 CLUSTER_REDIR_MOVED。
+ *
+ *  当节点为 'myself' 时，'error_code' 被设置为 CLUSTER_REDIR_NONE。
+ *
+ *  如果命令执行失败，则返回 NULL，并通过 'error_code' 给出失败原因，可能的取值包括：
+ *
+ *  CLUSTER_REDIR_CROSS_SLOT —— 请求包含多个不属于同一 hash slot 的 key。
+ *  CLUSTER_REDIR_UNSTABLE —— 请求包含属于同一 slot 的多个 key，
+ *                              但该 slot 不稳定（处于迁移或导入状态，
+ *                              通常是因为正在进行重新分片）。
+ *  CLUSTER_REDIR_DOWN_UNBOUND —— 请求访问的 slot 没有绑定到任何节点。
+ *                              这种情况下集群的全局状态应该是 "down"，
+ *                              但依赖全局状态的更新并不稳妥，所以这里也直接处理。
+ *  CLUSTER_REDIR_DOWN_STATE 和 CLUSTER_REDIR_DOWN_RO_STATE —— 集群处于 down 状态，
+ *                              但用户尝试执行一个访问一个或多个 key 的命令。*/
 clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, int argc, int *hashslot, uint64_t cmd_flags, int *error_code) {
     clusterNode *myself = getMyClusterNode();
     clusterNode *n = NULL;
@@ -964,28 +1001,36 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
             existing_keys = 0;
     int pubsubshard_included = 0; /* Flag to indicate if a pubsub shard cmd is included. */
 
-    /* Allow any key to be set if a module disabled cluster redirections. */
+    /* Allow any key to be set if a module disabled cluster redirections.
+     * （如果模块禁用了集群重定向，则允许设置任何 key。）*/
     if (server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)
         return myself;
 
-    /* Set error code optimistically for the base case. */
+    /* Set error code optimistically for the base case.
+     * （为基本用例乐观地设置 error_code）*/
     if (error_code) *error_code = CLUSTER_REDIR_NONE;
 
     /* Modules can turn off Redis Cluster redirection: this is useful
      * when writing a module that implements a completely different
-     * distributed system. */
+     * distributed system.
+     * （模块可以关闭 Redis Cluster 重定向：当编写实现完全不同的分布式系统的模块时，
+     *  这个功能很有用。）*/
 
     /* We handle all the cases as if they were EXEC commands, so we have
-     * a common code path for everything */
+     * a common code path for everything
+     * （我们将所有情况都视为 EXEC 命令，这样我们可以为所有情况提供统一的代码路径）*/
     if (cmd->proc == execCommand) {
         /* If CLIENT_MULTI flag is not set EXEC is just going to return an
-         * error. */
+         * error.
+         * （如果未设置 CLIENT_MULTI 标志，EXEC 只会返回一个错误。）*/
         if (!(c->flags & CLIENT_MULTI)) return myself;
         ms = &c->mstate;
     } else {
         /* In order to have a single codepath create a fake Multi State
          * structure if the client is not in MULTI/EXEC state, this way
-         * we have a single codepath below. */
+         * we have a single codepath below.
+         * （为了保持单一代码路径，如果客户端不在 MULTI/EXEC 状态，
+         *  我们创建一个伪的 Multi State 结构，从而保证下方代码路径一致。）*/
         ms = &_ms;
         _ms.commands = &mc;
         _ms.count = 1;
@@ -995,7 +1040,8 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     }
 
     /* Check that all the keys are in the same hash slot, and obtain this
-     * slot and the node associated. */
+     * slot and the node associated.
+     * （检查所有 key 是否位于同一 hash slot，并获取该 slot 以及对应的节点。）*/
     for (i = 0; i < ms->count; i++) {
         struct redisCommand *mcmd;
         robj **margv;
@@ -1024,7 +1070,8 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
 
             if (firstkey == NULL) {
                 /* This is the first key we see. Check what is the slot
-                 * and node. */
+                 * and node.
+                 * （这是我们看到的第一个 key。检查它属于哪个 slot 和哪个节点。）*/
                 firstkey = thiskey;
                 slot = thisslot;
                 n = getNodeBySlot(slot);
@@ -1032,7 +1079,10 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
                 /* Error: If a slot is not served, we are in "cluster down"
                  * state. However the state is yet to be updated, so this was
                  * not trapped earlier in processCommand(). Report the same
-                 * error to the client. */
+                 * error to the client.
+                 * （错误：如果一个 slot 没有被服务，则我们处于 "cluster down"
+                 *  状态。但是该状态尚未被更新，因此之前在 processCommand()
+                 *  中并未捕获。向客户端报告同样的错误。）*/
                 if (n == NULL) {
                     getKeysFreeResult(&result);
                     if (error_code)
@@ -1044,7 +1094,11 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
                  * if we have all the keys in the request (the only way we
                  * can safely serve the request, otherwise we return a TRYAGAIN
                  * error). To do so we set the importing/migrating state and
-                 * increment a counter for every missing key. */
+                 * increment a counter for every missing key.
+                 * （如果当前正在迁移或导入这个 slot，则需要检查请求中涉及的所有
+                 *  key 是否都已存在（这是安全处理请求的唯一方式，否则我们将返回
+                 *  TRYAGAIN 错误）。为此我们设置导入/迁移状态，并对每个缺失的
+                 *  key 进行计数。）*/
                 if (n == myself &&
                     getMigratingSlotDest(slot) != NULL)
                 {
@@ -1054,9 +1108,11 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
                 }
             } else {
                 /* If it is not the first key/channel, make sure it is exactly
-                 * the same key/channel as the first we saw. */
+                 * the same key/channel as the first we saw.
+                 * （如果不是第一个 key/channel，确保它与第一次看到的 key/channel 完全相同。）*/
                 if (slot != thisslot) {
-                    /* Error: multiple keys from different slots. */
+                    /* Error: multiple keys from different slots.
+                     * （错误：来自不同 slot 的多个 key。）*/
                     getKeysFreeResult(&result);
                     if (error_code)
                         *error_code = CLUSTER_REDIR_CROSS_SLOT;
@@ -1064,7 +1120,8 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
                 }
                 if (importing_slot && !multiple_keys && !equalStringObjects(firstkey,thiskey)) {
                     /* Flag this request as one with multiple different
-                     * keys/channels when the slot is in importing state. */
+                     * keys/channels when the slot is in importing state.
+                     * （当 slot 处于导入状态时，将该请求标记为包含多个不同 key/channel 的请求。）*/
                     multiple_keys = 1;
                 }
             }
@@ -1074,7 +1131,11 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
              * the channel being present or not in the node during the
              * slot migration, the channel will be served from the source
              * node until the migration completes with CLUSTER SETSLOT <slot>
-             * NODE <node-id>. */
+             * NODE <node-id>.
+             * （正在迁移/导入的 slot？统计本地缺失的 key。
+             *  如果是 pubsub shard 命令，则在 slot 迁移期间不必检查节点中是否存在该
+             *  channel；在通过 CLUSTER SETSLOT <slot> NODE <node-id> 完成迁移之前，
+             *  该 channel 仍由源节点提供服务。）*/
             int flags = LOOKUP_NOTOUCH | LOOKUP_NOSTATS | LOOKUP_NONOTIFY | LOOKUP_NOEXPIRE;
             if ((migrating_slot || importing_slot) && !pubsubshard_included)
             {
@@ -1086,11 +1147,15 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     }
 
     /* No key at all in command? then we can serve the request
-     * without redirections or errors in all the cases. */
+     * without redirections or errors in all the cases.
+     * （命令中完全没有 key？那么在所有情况下我们都可以处理该请求，
+     *  无需重定向或报错。）*/
     if (n == NULL) return myself;
 
     /* Cluster is globally down but we got keys? We only serve the request
-     * if it is a read command and when allow_reads_when_down is enabled. */
+     * if it is a read command and when allow_reads_when_down is enabled.
+     * （集群整体处于 down 状态但我们仍然收到了带 key 的请求？只有在它是读命令，
+     *  并且开启了 allow_reads_when_down 时我们才会处理它。）*/
     if (!isClusterHealthy()) {
         if (pubsubshard_included) {
             if (!server.cluster_allow_pubsubshard_when_down) {
@@ -1123,9 +1188,11 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
         return myself;
 
     /* If we don't have all the keys and we are migrating the slot, send
-     * an ASK redirection or TRYAGAIN. */
+     * an ASK redirection or TRYAGAIN.
+     * （如果本地不拥有所有 key，且正在迁移 slot，则发送 ASK 重定向或 TRYAGAIN。）*/
     if (migrating_slot && missing_keys) {
-        /* If we have keys but we don't have all keys, we return TRYAGAIN */
+        /* If we have keys but we don't have all keys, we return TRYAGAIN
+         * （如果只拥有部分 key，则返回 TRYAGAIN）*/
         if (existing_keys) {
             if (error_code) *error_code = CLUSTER_REDIR_UNSTABLE;
             return NULL;
@@ -1138,7 +1205,10 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     /* If we are receiving the slot, and the client correctly flagged the
      * request as "ASKING", we can serve the request. However if the request
      * involves multiple keys and we don't have them all, the only option is
-     * to send a TRYAGAIN error. */
+     * to send a TRYAGAIN error.
+     * （如果我们正在接收 slot，并且客户端正确地将该请求标记为 "ASKING"，
+     *  则可以处理该请求。但是如果请求涉及多个 key 而我们并未全部拥有，
+     *  唯一的选择就是返回 TRYAGAIN 错误。）*/
     if (importing_slot &&
         (c->flags & CLIENT_ASKING || cmd_flags & CMD_ASKING))
     {
@@ -1152,7 +1222,10 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
 
     /* Handle the read-only client case reading from a slave: if this
      * node is a slave and the request is about a hash slot our master
-     * is serving, we can reply without redirection. */
+     * is serving, we can reply without redirection.
+     * （处理从节点读取的只读客户端场景：如果本节点是从节点，
+     *  且请求访问的是其主节点正在服务的 hash slot，
+     *  则可以直接响应而无需重定向。）*/
     int is_write_command = (cmd_flags & CMD_WRITE) ||
                            (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
     if (((c->flags & CLIENT_READONLY) || pubsubshard_included) &&
@@ -1164,7 +1237,9 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     }
 
     /* Base case: just return the right node. However, if this node is not
-     * myself, set error_code to MOVED since we need to issue a redirection. */
+     * myself, set error_code to MOVED since we need to issue a redirection.
+     * （基本用例：仅返回正确的节点。但如果该节点不是 myself，
+     *  则将 error_code 设为 MOVED，因为我们需要发出重定向。）*/
     if (n != myself && error_code) *error_code = CLUSTER_REDIR_MOVED;
     return n;
 }
@@ -1175,14 +1250,23 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
  * If CLUSTER_REDIR_ASK or CLUSTER_REDIR_MOVED error codes
  * are used, then the node 'n' should not be NULL, but should be the
  * node we want to mention in the redirection. Moreover hashslot should
- * be set to the hash slot that caused the redirection. */
+ * be set to the hash slot that caused the redirection.
+ *
+ * 根据 error_code 向客户端发送相应的重定向码，
+ * error_code 应被设置为 CLUSTER_REDIR_* 宏之一。
+ *
+ * 如果使用 CLUSTER_REDIR_ASK 或 CLUSTER_REDIR_MOVED 错误码，
+ * 则节点 'n' 不应为空，必须是我们希望在重定向中提到的节点。
+ * 同时 hashslot 应被设置为引起该重定向的 hash slot。*/
 void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_code) {
     if (error_code == CLUSTER_REDIR_CROSS_SLOT) {
         addReplyError(c,"-CROSSSLOT Keys in request don't hash to the same slot");
     } else if (error_code == CLUSTER_REDIR_UNSTABLE) {
         /* The request spawns multiple keys in the same slot,
          * but the slot is not "stable" currently as there is
-         * a migration or import in progress. */
+         * a migration or import in progress.
+         * （请求涉及同一 slot 中的多个 key，
+         *  但该 slot 当前并不 "稳定"，因为正在进行迁移或导入。）*/
         addReplyError(c,"-TRYAGAIN Multiple keys request during rehashing of slot");
     } else if (error_code == CLUSTER_REDIR_DOWN_STATE) {
         addReplyError(c,"-CLUSTERDOWN The cluster is down");
@@ -1193,7 +1277,8 @@ void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_co
     } else if (error_code == CLUSTER_REDIR_MOVED ||
                error_code == CLUSTER_REDIR_ASK)
     {
-        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client. */
+        /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client.
+         * （向 TLS 客户端返回 TLS 端口，向非 TLS 客户端返回非 TLS 端口）*/
         int port = clusterNodeClientPort(n, shouldReturnTlsInfo());
         addReplyErrorSds(c,sdscatprintf(sdsempty(),
                                         "-%s %d %s:%d",
@@ -1214,7 +1299,17 @@ void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_co
  *
  * If the client is found to be blocked into a hash slot this node no
  * longer handles, the client is sent a redirection error, and the function
- * returns 1. Otherwise 0 is returned and no operation is performed. */
+ * returns 1. Otherwise 0 is returned and no operation is performed.
+ *
+ * 该函数由处理客户端的增量函数调用以检测超时，用于处理以下情况：
+ *
+ *  1) 客户端通过 BLPOP 或类似的阻塞操作进入阻塞状态。
+ *  2) 主节点将该 hash slot 迁移到其他地方或变为从节点。
+ *  3) 客户端可能因此永远（或直到最大超时时间）阻塞，
+ *     等待一个永远不会发生的 key 变更。
+ *
+ *  如果发现客户端阻塞在某个 hash slot 上，而本节点已不再处理该 slot，
+ *  则向客户端发送重定向错误并返回 1；否则返回 0，不进行任何操作。*/
 int clusterRedirectBlockedClientIfNeeded(client *c) {
     clusterNode *myself = getMyClusterNode();
     if (c->flags & CLIENT_BLOCKED &&
@@ -1229,18 +1324,24 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
         /* If the cluster is down, unblock the client with the right error.
          * If the cluster is configured to allow reads on cluster down, we
          * still want to emit this error since a write will be required
-         * to unblock them which may never come.  */
+         * to unblock them which may never come.
+         * （如果集群处于 down 状态，则以相应的错误解除客户端的阻塞。
+         *  即使集群配置为在 down 状态下允许读操作，我们仍然要发出该错误，
+         *  因为解除阻塞需要写入操作，而该写入可能永远不会发生。）*/
         if (!isClusterHealthy()) {
             clusterRedirectClient(c,NULL,0,CLUSTER_REDIR_DOWN_STATE);
             return 1;
         }
 
         /* If the client is blocked on module, but not on a specific key,
-         * don't unblock it (except for the CLUSTER_FAIL case above). */
+         * don't unblock it (except for the CLUSTER_FAIL case above).
+         * （如果客户端因模块而阻塞，但未阻塞在特定 key 上，
+         *  则不要解除它的阻塞（除上述 CLUSTER_FAIL 情况外）。）*/
         if (c->bstate.btype == BLOCKED_MODULE && !moduleClientIsBlockedOnKeys(c))
             return 0;
 
-        /* All keys must belong to the same slot, so check first key only. */
+        /* All keys must belong to the same slot, so check first key only.
+         * （所有 key 必须属于同一 slot，因此只检查第一个 key。）*/
         di = dictGetIterator(c->bstate.keys);
         if ((de = dictNext(di)) != NULL) {
             robj *key = dictGetKey(de);
@@ -1248,7 +1349,8 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
             clusterNode *node = getNodeBySlot(slot);
 
             /* if the client is read-only and attempting to access key that our
-             * replica can handle, allow it. */
+             * replica can handle, allow it.
+             * （如果客户端是只读的，并且尝试访问我们的副本可以处理的 key，则允许。）*/
             if ((c->flags & CLIENT_READONLY) &&
                 !(c->lastcmd->flags & CMD_WRITE) &&
                 clusterNodeIsSlave(myself) && clusterNodeGetSlaveof(myself) == node)
@@ -1258,7 +1360,10 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
 
             /* We send an error and unblock the client if:
              * 1) The slot is unassigned, emitting a cluster down error.
-             * 2) The slot is not handled by this node, nor being imported. */
+             * 2) The slot is not handled by this node, nor being imported.
+             * （在以下情况下我们发送错误并解除客户端阻塞：
+             *  1) slot 未被分配，发出 cluster down 错误；
+             *  2) slot 不由本节点处理，也不在导入中。）*/
             if (node != myself && getImportingSlotSource(slot) == NULL)
             {
                 if (node == NULL) {
@@ -1281,7 +1386,11 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
  * and should be listed in CLUSTER SLOTS response.
  * Returns 1 for available nodes, 0 for nodes that have
  * not finished their initial sync, in failed state, or are
- * otherwise considered not available to serve read commands. */
+ * otherwise considered not available to serve read commands.
+ *
+ * 返回一个副本节点是否完全可用、并应被列入 CLUSTER SLOTS 响应中的指示。
+ * 对于可用节点返回 1，对于尚未完成初次同步、处于失败状态，
+ * 或因其他原因被视为无法处理读命令的节点返回 0。*/
 static int isReplicaAvailable(clusterNode *node) {
     if (clusterNodeIsFailing(node)) {
         return 0;
@@ -1289,7 +1398,8 @@ static int isReplicaAvailable(clusterNode *node) {
     long long repl_offset = clusterNodeReplOffset(node);
     if (clusterNodeIsMyself(node)) {
         /* Nodes do not update their own information
-         * in the cluster node list. */
+         * in the cluster node list.
+         * （节点不会在集群节点列表中更新自身的信息。）*/
         repl_offset = replicationGetSlaveOffset();
     }
     return (repl_offset != 0);
@@ -1312,14 +1422,18 @@ void addNodeToNodeReply(client *c, clusterNode *node) {
         serverPanic("Unrecognized preferred endpoint type");
     }
 
-    /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client. */
+    /* Report TLS ports to TLS client, and report non-TLS port to non-TLS client.
+     * （向 TLS 客户端返回 TLS 端口，向非 TLS 客户端返回非 TLS 端口）*/
     addReplyLongLong(c, clusterNodeClientPort(node, shouldReturnTlsInfo()));
     addReplyBulkCBuffer(c, clusterNodeGetName(node), CLUSTER_NAMELEN);
 
     /* Add the additional endpoint information, this is all the known networking information
      * that is not the preferred endpoint. Note the logic is evaluated twice so we can
      * correctly report the number of additional network arguments without using a deferred
-     * map, an assertion is made at the end to check we set the right length. */
+     * map, an assertion is made at the end to check we set the right length.
+     * （添加额外的端点信息，即所有非首选端点的已知网络信息。
+     *  注意，这段逻辑会被执行两次，以便能够正确报告额外的网络参数数量，
+     *  而无需使用延迟映射；最后会有一个断言来检查是否设置了正确的长度。）*/
     int length = 0;
     if (server.cluster_preferred_endpoint_type != CLUSTER_ENDPOINT_TYPE_IP) {
         length++;
@@ -1357,15 +1471,19 @@ void addNodeReplyForClusterSlot(client *c, clusterNode *node, int start_slot, in
     addReplyLongLong(c, end_slot);
     addNodeToNodeReply(c, node);
 
-    /* Remaining nodes in reply are replicas for slot range */
+    /* Remaining nodes in reply are replicas for slot range
+     * （回复中剩余的节点是该 slot 范围的副本）*/
     for (i = 0; i < clusterNodeNumSlaves(node); i++) {
         /* This loop is copy/pasted from clusterGenNodeDescription()
-         * with modifications for per-slot node aggregation. */
+         * with modifications for per-slot node aggregation.
+         * （此循环是从 clusterGenNodeDescription() 复制/粘贴而来，
+         *  并针对按 slot 聚合节点进行了修改。）*/
         if (!isReplicaAvailable(clusterNodeGetSlave(node, i))) continue;
         addNodeToNodeReply(c, clusterNodeGetSlave(node, i));
         nested_elements--;
     }
-    serverAssert(nested_elements == 3); /* Original 3 elements */
+    serverAssert(nested_elements == 3); /* Original 3 elements
+                                         * （最初的 3 个元素）*/
 }
 
 void clusterCommandSlots(client * c) {
@@ -1384,7 +1502,8 @@ void clusterCommandSlots(client * c) {
     void *slot_replylen = addReplyDeferredLen(c);
 
     for (int i = 0; i <= CLUSTER_SLOTS; i++) {
-        /* Find start node and slot id. */
+        /* Find start node and slot id.
+         * （查找起始节点和 slot id）*/
         if (n == NULL) {
             if (i == CLUSTER_SLOTS) break;
             n = getNodeBySlot(i);
@@ -1393,7 +1512,9 @@ void clusterCommandSlots(client * c) {
         }
 
         /* Add cluster slots info when occur different node with start
-         * or end of slot. */
+         * or end of slot.
+         * （当遇到与起始节点不同的节点，或到达 slot 末尾时，
+         *  添加集群 slot 信息。）*/
         if (i == CLUSTER_SLOTS || n != getNodeBySlot(i)) {
             addNodeReplyForClusterSlot(c, n, start, i-1);
             num_masters++;
@@ -1407,12 +1528,16 @@ void clusterCommandSlots(client * c) {
 
 /* -----------------------------------------------------------------------------
  * Cluster functions related to serving / redirecting clients
+ * （与为客户端服务/重定向相关的集群函数）
  * -------------------------------------------------------------------------- */
 
 /* The ASKING command is required after a -ASK redirection.
  * The client should issue ASKING before to actually send the command to
  * the target instance. See the Redis Cluster specification for more
- * information. */
+ * information.
+ * （ASKING 命令在收到 -ASK 重定向之后必须由客户端发送。
+ *  客户端应在实际向目标实例发送命令之前发送 ASKING。
+ *  更多信息请参阅 Redis Cluster 规范。）*/
 void askingCommand(client *c) {
     if (server.cluster_enabled == 0) {
         addReplyError(c,"This instance has cluster support disabled");
@@ -1424,7 +1549,10 @@ void askingCommand(client *c) {
 
 /* The READONLY command is used by clients to enter the read-only mode.
  * In this mode slaves will not redirect clients as long as clients access
- * with read-only commands to keys that are served by the slave's master. */
+ * with read-only commands to keys that are served by the slave's master.
+ * （READONLY 命令用于让客户端进入只读模式。
+ *  在此模式下，只要客户端使用只读命令访问由从节点主节点提供服务的 key，
+ *  从节点就不会对客户端进行重定向。）*/
 void readonlyCommand(client *c) {
     if (server.cluster_enabled == 0) {
         addReplyError(c,"This instance has cluster support disabled");
@@ -1434,7 +1562,8 @@ void readonlyCommand(client *c) {
     addReply(c,shared.ok);
 }
 
-/* The READWRITE command just clears the READONLY command state. */
+/* The READWRITE command just clears the READONLY command state.
+ * （READWRITE 命令仅用于清除 READONLY 命令所设置的只读状态。）*/
 void readwriteCommand(client *c) {
     if (server.cluster_enabled == 0) {
         addReplyError(c,"This instance has cluster support disabled");

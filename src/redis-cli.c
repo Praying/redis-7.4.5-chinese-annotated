@@ -1,10 +1,13 @@
-/* Redis CLI (command line interface)
+/* Redis CLI (command line interface) — Redis 命令行接口
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ *
+ * 本文件实现 redis-cli 客户端命令行工具，提供了与 Redis 服务器交互、
+ * 执行命令、管理集群、监控数据、查看延迟等功能。
  */
 
 #include "fmacros.h"
@@ -26,63 +29,83 @@
 #include <math.h>
 #include <termios.h>
 
-#include <hiredis.h>
-#ifdef USE_OPENSSL
+#include <hiredis.h>             /* Redis 客户端 C 库 hiredis */
+#ifdef USE_OPENSSL              /* 如果启用了 OpenSSL 则包含 TLS 相关头文件 */
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <hiredis_ssl.h>
 #endif
-#include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
-#include <sds.h> /* use sds.h from hiredis, so that only one set of sds functions will be present in the binary */
-#include "dict.h"
-#include "adlist.h"
-#include "zmalloc.h"
-#include "linenoise.h"
-#include "anet.h"
-#include "ae.h"
-#include "connection.h"
-#include "cli_common.h"
-#include "mt19937-64.h"
-#include "cli_commands.h"
-#include "hdr_histogram.h"
+#include <sdscompat.h> /* 引入 hiredis 的 sds 兼容头，将 sds 调用映射到 hi_ 系列 */
+/* 使用 hiredis 提供的 sds.h，确保二进制中只有一套 sds 函数 */
+#include <sds.h>
+#include "dict.h"                /* 哈希表数据结构 */
+#include "adlist.h"              /* 双向链表 */
+#include "zmalloc.h"             /* 内存分配封装 */
+#include "linenoise.h"           /* 简易命令行编辑库 */
+#include "anet.h"                /* 网络编程封装 */
+#include "ae.h"                  /* 事件循环库 */
+#include "connection.h"          /* 连接抽象层 */
+#include "cli_common.h"          /* CLI 公共函数 */
+#include "mt19937-64.h"          /* 64 位梅森旋转随机数发生器 */
+#include "cli_commands.h"        /* CLI 内置命令表 */
+#include "hdr_histogram.h"       /* 高动态范围直方图，用于延迟统计 */
 
+/* 抑制未使用参数的编译器警告 */
 #define UNUSED(V) ((void) V)
 
-#define OUTPUT_STANDARD 0
-#define OUTPUT_RAW 1
-#define OUTPUT_CSV 2
-#define OUTPUT_JSON 3
-#define OUTPUT_QUOTED_JSON 4
-#define REDIS_CLI_KEEPALIVE_INTERVAL 15 /* seconds */
-#define REDIS_CLI_DEFAULT_PIPE_TIMEOUT 30 /* seconds */
+/* 输出模式常量 */
+#define OUTPUT_STANDARD 0        /* 标准人类可读输出 */
+#define OUTPUT_RAW 1             /* 原始字节输出 */
+#define OUTPUT_CSV 2             /* CSV 格式输出 */
+#define OUTPUT_JSON 3            /* JSON 格式输出 */
+#define OUTPUT_QUOTED_JSON 4     /* 带引号的 JSON 格式输出 */
+
+/* Redis CLI 心跳间隔，单位为秒 */
+#define REDIS_CLI_KEEPALIVE_INTERVAL 15
+/* 管道模式默认超时时间，单位为秒 */
+#define REDIS_CLI_DEFAULT_PIPE_TIMEOUT 30
+/* 历史文件路径环境变量 */
 #define REDIS_CLI_HISTFILE_ENV "REDISCLI_HISTFILE"
+/* 历史文件默认路径（家目录下） */
 #define REDIS_CLI_HISTFILE_DEFAULT ".rediscli_history"
+/* 配置文件路径环境变量 */
 #define REDIS_CLI_RCFILE_ENV "REDISCLI_RCFILE"
+/* 配置文件默认路径 */
 #define REDIS_CLI_RCFILE_DEFAULT ".redisclirc"
+/* 认证密码环境变量 */
 #define REDIS_CLI_AUTH_ENV "REDISCLI_AUTH"
+/* 跳过集群交互确认的环境变量 */
 #define REDIS_CLI_CLUSTER_YES_ENV "REDISCLI_CLUSTER_YES"
 
+/* 集群管理器相关常量 */
 #define CLUSTER_MANAGER_SLOTS               16384
-#define CLUSTER_MANAGER_PORT_INCR           10000 /* same as CLUSTER_PORT_INCR */
-#define CLUSTER_MANAGER_MIGRATE_TIMEOUT     60000
-#define CLUSTER_MANAGER_MIGRATE_PIPELINE    10
-#define CLUSTER_MANAGER_REBALANCE_THRESHOLD 2
+#define CLUSTER_MANAGER_PORT_INCR           10000 /* 与 CLUSTER_PORT_INCR 相同 */
+#define CLUSTER_MANAGER_MIGRATE_TIMEOUT     60000 /* 迁移超时（毫秒） */
+#define CLUSTER_MANAGER_MIGRATE_PIPELINE    10    /* 迁移流水线大小 */
+#define CLUSTER_MANAGER_REBALANCE_THRESHOLD 2     /* 再平衡阈值 */
 
+/* 无效主机参数错误消息 */
 #define CLUSTER_MANAGER_INVALID_HOST_ARG \
     "[ERR] Invalid arguments: you need to pass either a valid " \
     "address (ie. 120.0.0.1:7000) or space separated IP " \
     "and port (ie. 120.0.0.1 7000)\n"
+/* 判断当前是否处于集群管理模式 */
 #define CLUSTER_MANAGER_MODE() (config.cluster_manager_command.name != NULL)
+/* 根据节点总数和副本数计算主节点数 */
 #define CLUSTER_MANAGER_MASTERS_COUNT(nodes, replicas) ((nodes)/((replicas) + 1))
+/* 在指定节点上执行 Redis 命令的快捷宏 */
 #define CLUSTER_MANAGER_COMMAND(n,...) \
         (redisCommand((n)->context, __VA_ARGS__))
 
+/* 释放集群节点数组分配内存 */
 #define CLUSTER_MANAGER_NODE_ARRAY_FREE(array) zfree((array)->alloc)
 
+/* 打印节点返回的错误信息 */
 #define CLUSTER_MANAGER_PRINT_REPLY_ERROR(n, err) \
     clusterManagerLogErr("Node %s:%d replied with error:\n%s\n", \
                          (n)->ip, (n)->port, (err));
 
+/* 不同日志级别的日志宏封装 */
 #define clusterManagerLogInfo(...) \
     clusterManagerLog(CLUSTER_MANAGER_LOG_LVL_INFO,__VA_ARGS__)
 
@@ -95,201 +118,219 @@
 #define clusterManagerLogOk(...) \
     clusterManagerLog(CLUSTER_MANAGER_LOG_LVL_SUCCESS,__VA_ARGS__)
 
-#define CLUSTER_MANAGER_FLAG_MYSELF     1 << 0
-#define CLUSTER_MANAGER_FLAG_SLAVE      1 << 1
-#define CLUSTER_MANAGER_FLAG_FRIEND     1 << 2
-#define CLUSTER_MANAGER_FLAG_NOADDR     1 << 3
-#define CLUSTER_MANAGER_FLAG_DISCONNECT 1 << 4
-#define CLUSTER_MANAGER_FLAG_FAIL       1 << 5
+/* 集群节点状态标志位 */
+#define CLUSTER_MANAGER_FLAG_MYSELF     1 << 0  /* 自身节点 */
+#define CLUSTER_MANAGER_FLAG_SLAVE      1 << 1  /* 从节点 */
+#define CLUSTER_MANAGER_FLAG_FRIEND     1 << 2  /* 已知节点 */
+#define CLUSTER_MANAGER_FLAG_NOADDR     1 << 3  /* 缺少地址信息 */
+#define CLUSTER_MANAGER_FLAG_DISCONNECT 1 << 4  /* 已断开连接 */
+#define CLUSTER_MANAGER_FLAG_FAIL       1 << 5  /* 故障节点 */
 
-#define CLUSTER_MANAGER_CMD_FLAG_FIX            1 << 0
-#define CLUSTER_MANAGER_CMD_FLAG_SLAVE          1 << 1
-#define CLUSTER_MANAGER_CMD_FLAG_YES            1 << 2
-#define CLUSTER_MANAGER_CMD_FLAG_AUTOWEIGHTS    1 << 3
-#define CLUSTER_MANAGER_CMD_FLAG_EMPTYMASTER    1 << 4
-#define CLUSTER_MANAGER_CMD_FLAG_SIMULATE       1 << 5
-#define CLUSTER_MANAGER_CMD_FLAG_REPLACE        1 << 6
-#define CLUSTER_MANAGER_CMD_FLAG_COPY           1 << 7
-#define CLUSTER_MANAGER_CMD_FLAG_COLOR          1 << 8
-#define CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS   1 << 9
+/* 集群管理命令选项标志 */
+#define CLUSTER_MANAGER_CMD_FLAG_FIX            1 << 0   /* 修复集群 */
+#define CLUSTER_MANAGER_CMD_FLAG_SLAVE          1 << 1   /* 包含从节点 */
+#define CLUSTER_MANAGER_CMD_FLAG_YES            1 << 2   /* 自动确认 */
+#define CLUSTER_MANAGER_CMD_FLAG_AUTOWEIGHTS    1 << 3   /* 自动权重 */
+#define CLUSTER_MANAGER_CMD_FLAG_EMPTYMASTER    1 << 4   /* 允许空主节点 */
+#define CLUSTER_MANAGER_CMD_FLAG_SIMULATE       1 << 5   /* 模拟执行 */
+#define CLUSTER_MANAGER_CMD_FLAG_REPLACE        1 << 6   /* 替换节点 */
+#define CLUSTER_MANAGER_CMD_FLAG_COPY           1 << 7   /* 复制模式 */
+#define CLUSTER_MANAGER_CMD_FLAG_COLOR          1 << 8   /* 彩色输出 */
+#define CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS   1 << 9   /* 检查所有权 */
 #define CLUSTER_MANAGER_CMD_FLAG_FIX_WITH_UNREACHABLE_MASTERS 1 << 10
-#define CLUSTER_MANAGER_CMD_FLAG_MASTERS_ONLY   1 << 11
-#define CLUSTER_MANAGER_CMD_FLAG_SLAVES_ONLY    1 << 12
+#define CLUSTER_MANAGER_CMD_FLAG_MASTERS_ONLY   1 << 11  /* 仅主节点 */
+#define CLUSTER_MANAGER_CMD_FLAG_SLAVES_ONLY    1 << 12  /* 仅从节点 */
 
-#define CLUSTER_MANAGER_OPT_GETFRIENDS  1 << 0
-#define CLUSTER_MANAGER_OPT_COLD        1 << 1
-#define CLUSTER_MANAGER_OPT_UPDATE      1 << 2
-#define CLUSTER_MANAGER_OPT_QUIET       1 << 6
-#define CLUSTER_MANAGER_OPT_VERBOSE     1 << 7
+/* 集群管理操作选项 */
+#define CLUSTER_MANAGER_OPT_GETFRIENDS  1 << 0  /* 获取友好节点 */
+#define CLUSTER_MANAGER_OPT_COLD        1 << 1  /* 冷数据迁移 */
+#define CLUSTER_MANAGER_OPT_UPDATE      1 << 2  /* 更新配置 */
+#define CLUSTER_MANAGER_OPT_QUIET       1 << 6  /* 静默模式 */
+#define CLUSTER_MANAGER_OPT_VERBOSE     1 << 7  /* 详细模式 */
 
-#define CLUSTER_MANAGER_LOG_LVL_INFO    1
-#define CLUSTER_MANAGER_LOG_LVL_WARN    2
-#define CLUSTER_MANAGER_LOG_LVL_ERR     3
-#define CLUSTER_MANAGER_LOG_LVL_SUCCESS 4
+/* 集群管理器日志级别 */
+#define CLUSTER_MANAGER_LOG_LVL_INFO    1   /* 信息 */
+#define CLUSTER_MANAGER_LOG_LVL_WARN    2   /* 警告 */
+#define CLUSTER_MANAGER_LOG_LVL_ERR     3   /* 错误 */
+#define CLUSTER_MANAGER_LOG_LVL_SUCCESS 4   /* 成功 */
 
+/* 加入集群后等待检查的秒数 */
 #define CLUSTER_JOIN_CHECK_AFTER        20
 
+/* ANSI 终端颜色转义序列 */
 #define LOG_COLOR_BOLD      "29;1m"
 #define LOG_COLOR_RED       "31;1m"
 #define LOG_COLOR_GREEN     "32;1m"
 #define LOG_COLOR_YELLOW    "33;1m"
 #define LOG_COLOR_RESET     "0m"
 
-/* cliConnect() flags. */
-#define CC_FORCE (1<<0)         /* Re-connect if already connected. */
-#define CC_QUIET (1<<1)         /* Don't log connecting errors. */
+/* cliConnect() 的标志位 */
+#define CC_FORCE (1<<0)         /* 已连接时强制重连 */
+#define CC_QUIET (1<<1)         /* 不打印连接错误 */
 
-/* DNS lookup */
-#define NET_IP_STR_LEN 46       /* INET6_ADDRSTRLEN is 46 */
+/* DNS 解析 */
+#define NET_IP_STR_LEN 46       /* INET6_ADDRSTRLEN 为 46 字节 */
 
-#define REFRESH_INTERVAL 300 /* milliseconds */
+/* 刷新间隔，单位毫秒 */
+#define REFRESH_INTERVAL 300
 
+/* 判断当前是否在 TTY 或伪 TTY 环境中（含 FAKETTY 环境变量） */
 #define IS_TTY_OR_FAKETTY() (isatty(STDOUT_FILENO) || getenv("FAKETTY"))
 
-/* --latency-dist palettes. */
+/* --latency-dist 选项使用的调色板（颜色版） */
 int spectrum_palette_color_size = 19;
 int spectrum_palette_color[] = {0,233,234,235,237,239,241,243,245,247,144,143,142,184,226,214,208,202,196};
 
+/* 灰度版调色板 */
 int spectrum_palette_mono_size = 13;
 int spectrum_palette_mono[] = {0,233,234,235,237,239,241,243,245,247,249,251,253};
 
-/* The actual palette in use. */
+/* 当前正在使用的调色板 */
 int *spectrum_palette;
 int spectrum_palette_size;
 
+/* 终端原始模式保存状态 */
 static int orig_termios_saved = 0;
-static struct termios orig_termios; /* To restore terminal at exit.*/
+static struct termios orig_termios; /* 用于退出时恢复终端状态 */
 
-/* Dict Helpers */
+/* 字典辅助函数 */
 static uint64_t dictSdsHash(const void *key);
 static int dictSdsKeyCompare(dict *d, const void *key1,
     const void *key2);
 static void dictSdsDestructor(dict *d, void *val);
 static void dictListDestructor(dict *d, void *val);
 
-/* Cluster Manager Command Info */
+/* 集群管理器命令信息结构 */
 typedef struct clusterManagerCommand {
-    char *name;
-    int argc;
-    char **argv;
-    sds stdin_arg; /* arg from stdin. (-X option) */
-    int flags;
-    int replicas;
-    char *from;
-    char *to;
-    char **weight;
-    int weight_argc;
-    char *master_id;
-    int slots;
-    int timeout;
-    int pipeline;
-    float threshold;
-    char *backup_dir;
-    char *from_user;
-    char *from_pass;
-    int from_askpass;
+    char *name;          /* 命令名 */
+    int argc;            /* 参数数量 */
+    char **argv;         /* 参数数组 */
+    sds stdin_arg;       /* 来自标准输入的参数（-X 选项） */
+    int flags;           /* 命令标志位 */
+    int replicas;        /* 副本数 */
+    char *from;          /* 源地址 */
+    char *to;            /* 目标地址 */
+    char **weight;       /* 权重数组 */
+    int weight_argc;     /* 权重参数数量 */
+    char *master_id;     /* 主节点 ID */
+    int slots;           /* 槽位数 */
+    int timeout;         /* 超时时间 */
+    int pipeline;        /* 流水线大小 */
+    float threshold;     /* 阈值 */
+    char *backup_dir;    /* 备份目录 */
+    char *from_user;     /* 源用户名 */
+    char *from_pass;     /* 源密码 */
+    int from_askpass;    /* 是否需要交互输入源密码 */
 } clusterManagerCommand;
 
 static int createClusterManagerCommand(char *cmdname, int argc, char **argv);
 
 
+/* 当前 Redis 连接上下文 */
 static redisContext *context;
+
+/* redis-cli 的全局配置结构体，保存命令行参数和运行时状态 */
 static struct config {
-    cliConnInfo conn_info;
-    struct timeval connect_timeout;
-    char *hostsocket;
-    int tls;
-    cliSSLconfig sslconfig;
-    long repeat;
-    long interval;
-    int dbnum; /* db num currently selected */
-    int interactive;
-    int shutdown;
-    int monitor_mode;
-    int pubsub_mode;
-    int blocking_state_aborted; /* used to abort monitor_mode and pubsub_mode. */
-    int latency_mode;
-    int latency_dist_mode;
-    int latency_history;
-    int lru_test_mode;
-    long long lru_test_sample_size;
-    int cluster_mode;
-    int cluster_reissue_command;
-    int cluster_send_asking;
-    int slave_mode;
-    int pipe_mode;
-    int pipe_timeout;
-    int getrdb_mode;
-    int get_functions_rdb_mode;
-    int stat_mode;
-    int scan_mode;
-    int count;
-    int intrinsic_latency_mode;
-    int intrinsic_latency_duration;
-    sds pattern;
-    char *rdb_filename;
-    int bigkeys;
-    int memkeys;
-    long long memkeys_samples;
-    int hotkeys;
-    int keystats;
-    unsigned long long cursor;
-    unsigned long top_sizes_limit;
-    int stdin_lastarg; /* get last arg from stdin. (-x option) */
-    int stdin_tag_arg; /* get <tag> arg from stdin. (-X option) */
-    char *stdin_tag_name; /* Placeholder(tag name) for user input. */
-    int askpass;
-    int quoted_input;   /* Force input args to be treated as quoted strings */
-    int output; /* output mode, see OUTPUT_* defines */
-    int push_output; /* Should we display spontaneous PUSH replies */
-    sds mb_delim;
-    sds cmd_delim;
-    char prompt[128];
-    char *eval;
-    int eval_ldb;
-    int eval_ldb_sync;  /* Ask for synchronous mode of the Lua debugger. */
-    int eval_ldb_end;   /* Lua debugging session ended. */
-    int enable_ldb_on_eval; /* Handle manual SCRIPT DEBUG + EVAL commands. */
-    int last_cmd_type;
-    redisReply *last_reply;
-    int verbose;
-    int set_errcode;
-    clusterManagerCommand cluster_manager_command;
-    int no_auth_warning;
-    int resp2; /* value of 1: specified explicitly with option -2 */
-    int resp3; /* value of 1: specified explicitly, value of 2: implicit like --json option */
-    int current_resp3; /* 1 if we have RESP3 right now in the current connection. */
-    int in_multi;
-    int pre_multi_dbnum;
-    char *server_version;
-    char *test_hint;
-    char *test_hint_file;
-    int prefer_ipv4; /* Prefer IPv4 over IPv6 on DNS lookup. */
-    int prefer_ipv6; /* Prefer IPv6 over IPv4 on DNS lookup. */
+    cliConnInfo conn_info;                  /* 连接信息（主机/端口等） */
+    struct timeval connect_timeout;          /* 连接超时时间 */
+    char *hostsocket;                        /* Unix 套接字路径 */
+    int tls;                                 /* 是否启用 TLS */
+    cliSSLconfig sslconfig;                  /* SSL/TLS 配置 */
+    long repeat;                             /* 重复执行次数 */
+    long interval;                           /* 重复执行间隔 */
+    int dbnum; /* 当前选中的数据库编号 */
+    int interactive;                         /* 是否为交互模式 */
+    int shutdown;                            /* 是否关闭服务器 */
+    int monitor_mode;                        /* 是否处于 MONITOR 模式 */
+    int pubsub_mode;                         /* 是否处于发布订阅模式 */
+    int blocking_state_aborted; /* 用于中止 monitor_mode 和 pubsub_mode */
+    int latency_mode;                        /* 延迟测试模式 */
+    int latency_dist_mode;                   /* 延迟分布模式 */
+    int latency_history;                     /* 延迟历史模式 */
+    int lru_test_mode;                       /* LRU 测试模式 */
+    long long lru_test_sample_size;          /* LRU 测试采样大小 */
+    int cluster_mode;                        /* 集群模式 */
+    int cluster_reissue_command;             /* 集群模式下重新发送命令 */
+    int cluster_send_asking;                 /* 集群模式下发送 ASKING */
+    int slave_mode;                          /* 复制模式 */
+    int pipe_mode;                           /* 管道模式 */
+    int pipe_timeout;                        /* 管道超时 */
+    int getrdb_mode;                         /* 获取 RDB 模式 */
+    int get_functions_rdb_mode;              /* 获取函数库 RDB 模式 */
+    int stat_mode;                           /* 统计模式 */
+    int scan_mode;                           /* SCAN 模式 */
+    int count;                               /* COUNT 参数 */
+    int intrinsic_latency_mode;              /* 系统固有延迟测量模式 */
+    int intrinsic_latency_duration;          /* 固有延迟测量时长 */
+    sds pattern;                             /* 模式匹配字符串 */
+    char *rdb_filename;                      /* RDB 文件名 */
+    int bigkeys;                             /* --bigkeys 模式 */
+    int memkeys;                             /* --memkeys 模式 */
+    long long memkeys_samples;               /* --memkeys 采样数 */
+    int hotkeys;                             /* --hotkeys 模式 */
+    int keystats;                            /* --keystats 模式 */
+    unsigned long long cursor;               /* SCAN 游标 */
+    unsigned long top_sizes_limit;           /* top 列表大小限制 */
+    int stdin_lastarg; /* 从标准输入读取最后一个参数（-x 选项） */
+    int stdin_tag_arg; /* 从标准输入读取 <tag> 参数（-X 选项） */
+    char *stdin_tag_name; /* 用户输入的占位符标签名 */
+    int askpass;                             /* 交互式输入密码 */
+    int quoted_input;   /* 强制输入参数视为带引号字符串 */
+    int output; /* 输出模式，参见 OUTPUT_* 宏定义 */
+    int push_output; /* 是否显示自发的 PUSH 响应 */
+    sds mb_delim;                            /* 多块分隔符 */
+    sds cmd_delim;                           /* 命令分隔符 */
+    char prompt[128];                        /* 交互模式提示符 */
+    char *eval;                              /* EVAL 命令字符串 */
+    int eval_ldb;                            /* 启用 Lua 调试器 */
+    int eval_ldb_sync;  /* 请求 Lua 调试器进入同步模式 */
+    int eval_ldb_end;   /* Lua 调试会话已结束 */
+    int enable_ldb_on_eval; /* 处理手动 SCRIPT DEBUG + EVAL 命令 */
+    int last_cmd_type;                       /* 上一个命令的类型 */
+    redisReply *last_reply;                  /* 上一次回复对象 */
+    int verbose;                             /* 详细输出模式 */
+    int set_errcode;                         /* 是否设置错误返回码 */
+    clusterManagerCommand cluster_manager_command; /* 集群管理命令 */
+    int no_auth_warning;                     /* 不打印 AUTH 警告 */
+    int resp2; /* 1：显式通过 -2 选项指定 */
+    int resp3; /* 1：显式指定；2：隐式（如 --json 选项） */
+    int current_resp3; /* 当前连接是否启用了 RESP3 协议 */
+    int in_multi;                            /* 是否处于 MULTI/EXEC 事务中 */
+    int pre_multi_dbnum;                     /* 进入 MULTI 前的数据库编号 */
+    char *server_version;                    /* 服务器版本 */
+    char *test_hint;                         /* 测试提示 */
+    char *test_hint_file;                    /* 测试提示文件 */
+    int prefer_ipv4; /* DNS 解析时优先使用 IPv4 */
+    int prefer_ipv6; /* DNS 解析时优先使用 IPv6 */
 } config;
 
-/* User preferences. */
+/* 用户偏好设置 */
 static struct pref {
-    int hints;
+    int hints;                              /* 是否启用命令提示 */
 } pref;
 
+/* 用于在信号处理函数中通知主循环强制取消 */
 static volatile sig_atomic_t force_cancel_loop = 0;
-static void usage(int err);
-static void slaveMode(int send_sync);
-static int cliConnect(int flags);
 
+/* 函数前置声明 */
+static void usage(int err);                 /* 打印帮助信息 */
+static void slaveMode(int send_sync);       /* 进入 SLAVEOF 模式 */
+static int cliConnect(int flags);           /* 建立到 Redis 的连接 */
+
+/* 从 INFO 输出中获取字段值的辅助函数 */
 static char *getInfoField(char *info, char *field);
 static long getLongInfoField(char *info, char *field);
 
 /*------------------------------------------------------------------------------
- * Utility functions
+ * Utility functions — 通用工具函数
  *--------------------------------------------------------------------------- */
-size_t redis_strlcpy(char *dst, const char *src, size_t dsize);
+size_t redis_strlcpy(char *dst, const char *src, size_t dsize); /* 字符串安全拷贝 */
 
-static void cliPushHandler(void *, void *);
+static void cliPushHandler(void *, void *); /* 处理服务器主动推送的消息 */
 
-uint16_t crc16(const char *buf, int len);
+uint16_t crc16(const char *buf, int len);   /* CRC-16 校验 */
 
+/* 获取当前时间，单位为微秒 */
 static long long ustime(void) {
     struct timeval tv;
     long long ust;
@@ -300,74 +341,79 @@ static long long ustime(void) {
     return ust;
 }
 
+/* 获取当前时间，单位为毫秒 */
 static long long mstime(void) {
     return ustime()/1000;
 }
 
+/* 刷新交互模式下的命令行提示符 */
 static void cliRefreshPrompt(void) {
-    if (config.eval_ldb) return;
+    if (config.eval_ldb) return;  /* Lua 调试模式下不刷新提示符 */
 
     sds prompt = sdsempty();
     if (config.hostsocket != NULL) {
+        /* 使用 Unix 套接字连接 */
         prompt = sdscatfmt(prompt,"redis %s",config.hostsocket);
     } else {
+        /* 使用 TCP 连接，格式化主机地址 */
         char addr[256];
         formatAddr(addr, sizeof(addr), config.conn_info.hostip, config.conn_info.hostport);
         prompt = sdscatlen(prompt,addr,strlen(addr));
     }
 
-    /* Add [dbnum] if needed */
+    /* 如有必要添加 [dbnum] */
     if (config.dbnum != 0)
         prompt = sdscatfmt(prompt,"[%i]",config.dbnum);
 
-    /* Add TX if in transaction state*/
-    if (config.in_multi)  
+    /* 如果处于事务状态则添加 TX 标识 */
+    if (config.in_multi)
         prompt = sdscatlen(prompt,"(TX)",4);
 
     if (config.pubsub_mode)
         prompt = sdscatfmt(prompt,"(subscribed mode)");
 
-    /* Copy the prompt in the static buffer. */
+    /* 复制提示符到静态缓冲区，附加 "> " */
     prompt = sdscatlen(prompt,"> ",2);
     snprintf(config.prompt,sizeof(config.prompt),"%s",prompt);
     sdsfree(prompt);
 }
 
-/* Return the name of the dotfile for the specified 'dotfilename'.
- * Normally it just concatenates user $HOME to the file specified
- * in 'dotfilename'. However if the environment variable 'envoverride'
- * is set, its value is taken as the path.
+/* 获取指定 'dotfilename' 的完整路径。
  *
- * The function returns NULL (if the file is /dev/null or cannot be
- * obtained for some error), or an SDS string that must be freed by
- * the user. */
+ * 通常只是简单地将用户的 $HOME 与 'dotfilename' 拼接。
+ * 但是如果环境变量 'envoverride' 被设置，则使用其值作为路径。
+ *
+ * 返回值：若文件是 /dev/null 或因错误无法获取则返回 NULL；
+ * 否则返回一个 SDS 字符串，调用者需要负责释放。 */
 static sds getDotfilePath(char *envoverride, char *dotfilename) {
     char *path = NULL;
     sds dotPath = NULL;
 
-    /* Check the env for a dotfile override. */
+    /* 检查环境变量是否覆盖了点文件路径 */
     path = getenv(envoverride);
     if (path != NULL && *path != '\0') {
         if (!strcmp("/dev/null", path)) {
-            return NULL;
+            return NULL;  /* 显式禁用配置文件 */
         }
 
-        /* If the env is set, return it. */
+        /* 如果环境变量已设置，直接返回其值 */
         dotPath = sdsnew(path);
     } else {
         char *home = getenv("HOME");
         if (home != NULL && *home != '\0') {
-            /* If no override is set use $HOME/<dotfilename>. */
+            /* 未设置覆盖则使用 $HOME/<dotfilename> */
             dotPath = sdscatprintf(sdsempty(), "%s/%s", home, dotfilename);
         }
     }
     return dotPath;
 }
 
+/* SDS 字典键的哈希函数 */
 static uint64_t dictSdsHash(const void *key) {
     return dictGenHashFunction((unsigned char*)key, sdslen((char*)key));
 }
 
+/* SDS 字典键的比较函数 */
 static int dictSdsKeyCompare(dict *d, const void *key1, const void *key2)
 {
     int l1,l2;
@@ -375,29 +421,31 @@ static int dictSdsKeyCompare(dict *d, const void *key1, const void *key2)
 
     l1 = sdslen((sds)key1);
     l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
+    if (l1 != l2) return 0;       /* 长度不同则不相等 */
     return memcmp(key1, key2, l1) == 0;
 }
 
+/* SDS 字典值的析构函数：释放 sds 字符串 */
 static void dictSdsDestructor(dict *d, void *val)
 {
     UNUSED(d);
     sdsfree(val);
 }
 
+/* 链表字典值的析构函数：释放 adlist 链表 */
 void dictListDestructor(dict *d, void *val)
 {
     UNUSED(d);
     listRelease((list*)val);
 }
 
-/* Erase the lines before printing, and returns the number of lines printed */
+/* 打印前先清除当前行（在 TTY 中），返回打印的行数 */
 int cleanPrintfln(char *fmt, ...) {
     va_list args;
-    char buf[1024]; /* limitation */
+    char buf[1024]; /* 输出长度限制 */
     int char_count, line_count = 0;
 
-    /* Clear the line if in TTY */
+    /* 如果处于 TTY 模式则先清除当前行 */
     if (IS_TTY_OR_FAKETTY()) {
         printf("\033[2K\r");
     }
@@ -410,6 +458,7 @@ int cleanPrintfln(char *fmt, ...) {
         fprintf(stderr, "Warning: String was trimmed in cleanPrintln\n");
     }
 
+    /* 逐行输出，并统计行数 */
     char *position, *string = buf;
     while ((position = strchr(string, '\n')) != NULL) {
         int line_length = (int)(position - string);
@@ -423,7 +472,7 @@ int cleanPrintfln(char *fmt, ...) {
 }
 
 /*------------------------------------------------------------------------------
- * Help functions
+ * Help functions — 帮助信息相关函数
  *--------------------------------------------------------------------------- */
 
 #define CLI_HELP_COMMAND 1
@@ -442,20 +491,18 @@ typedef struct {
 static helpEntry *helpEntries = NULL;
 static int helpEntriesLen = 0;
 
-/* For backwards compatibility with pre-7.0 servers.
- * cliLegacyInitHelp() sets up the helpEntries array with the command and group
- * names from the commands.c file. However the Redis instance we are connecting
- * to may support more commands, so this function integrates the previous
- * entries with additional entries obtained using the COMMAND command
- * available in recent versions of Redis. */
+/* 兼容 7.0 之前服务器的帮助信息整合函数。
+ * cliLegacyInitHelp() 使用 commands.c 中的命令和分组名称初始化
+ * helpEntries 数组。但是我们连接的 Redis 实例可能支持更多命令，
+ * 所以此函数将旧的条目与使用新版 Redis 的 COMMAND 命令获取的
+ * 额外条目进行整合。 */
 static void cliLegacyIntegrateHelp(void) {
     if (cliConnect(CC_QUIET) == REDIS_ERR) return;
 
     redisReply *reply = redisCommand(context, "COMMAND");
     if(reply == NULL || reply->type != REDIS_REPLY_ARRAY) return;
 
-    /* Scan the array reported by COMMAND and fill only the entries that
-     * don't already match what we have. */
+    /* 遍历 COMMAND 返回的数组，只填充尚不存在的条目 */
     for (size_t j = 0; j < reply->elements; j++) {
         redisReply *entry = reply->element[j];
         if (entry->type != REDIS_REPLY_ARRAY || entry->elements < 4 ||
@@ -496,14 +543,14 @@ static void cliLegacyIntegrateHelp(void) {
         while(args-- > 0) new->docs.params = sdscat(new->docs.params,"arg ");
         if (entry->element[1]->integer < 0)
             new->docs.params = sdscat(new->docs.params,"...options...");
-        new->docs.summary = "Help not available";
-        new->docs.since = "Not known";
-        new->docs.group = "generic";
+        new->docs.summary = "Help not available";  /* 无可用帮助摘要 */
+        new->docs.since = "Not known";           /* 引入版本未知 */
+        new->docs.group = "generic";             /* 通用分组 */
     }
     freeReplyObject(reply);
 }
 
-/* Concatenate a string to an sds string, but if it's empty substitute double quote marks. */
+/* 将字符串拼接到 sds 末尾，若字符串为空则改为拼接双引号 */
 static sds sdscat_orempty(sds params, const char *value) {
     if (value[0] == '\0') {
         return sdscat(params, "\"\"");
@@ -515,12 +562,14 @@ static sds makeHint(char **inputargv, int inputargc, int cmdlen, struct commandD
 
 static void cliAddCommandDocArg(cliCommandArg *cmdArg, redisReply *argMap);
 
+/* 递归构建命令参数文档数组 */
 static void cliMakeCommandDocArgs(redisReply *arguments, cliCommandArg *result) {
     for (size_t j = 0; j < arguments->elements; j++) {
         cliAddCommandDocArg(&result[j], arguments->element[j]);
     }
 }
 
+/* 解析单个命令参数的元数据（name/type/flags 等） */
 static void cliAddCommandDocArg(cliCommandArg *cmdArg, redisReply *argMap) {
     if (argMap->type != REDIS_REPLY_MAP && argMap->type != REDIS_REPLY_ARRAY) {
         return;
@@ -530,15 +579,19 @@ static void cliAddCommandDocArg(cliCommandArg *cmdArg, redisReply *argMap) {
         assert(argMap->element[i]->type == REDIS_REPLY_STRING);
         char *key = argMap->element[i]->str;
         if (!strcmp(key, "name")) {
+            /* 参数名 */
             assert(argMap->element[i + 1]->type == REDIS_REPLY_STRING);
             cmdArg->name = sdsnew(argMap->element[i + 1]->str);
         } else if (!strcmp(key, "display_text")) {
+            /* 显示文本 */
             assert(argMap->element[i + 1]->type == REDIS_REPLY_STRING);
             cmdArg->display_text = sdsnew(argMap->element[i + 1]->str);
         } else if (!strcmp(key, "token")) {
+            /* 参数标记 */
             assert(argMap->element[i + 1]->type == REDIS_REPLY_STRING);
             cmdArg->token = sdsnew(argMap->element[i + 1]->str);
         } else if (!strcmp(key, "type")) {
+            /* 参数类型 */
             assert(argMap->element[i + 1]->type == REDIS_REPLY_STRING);
             char *type = argMap->element[i + 1]->str;
             if (!strcmp(type, "string")) {
@@ -561,36 +614,38 @@ static void cliAddCommandDocArg(cliCommandArg *cmdArg, redisReply *argMap) {
                 cmdArg->type = ARG_TYPE_BLOCK;
             }
         } else if (!strcmp(key, "arguments")) {
+            /* 子参数列表 */
             redisReply *arguments = argMap->element[i + 1];
             cmdArg->subargs = zcalloc(arguments->elements * sizeof(cliCommandArg));
             cmdArg->numsubargs = arguments->elements;
             cliMakeCommandDocArgs(arguments, cmdArg->subargs);
         } else if (!strcmp(key, "flags")) {
+            /* 参数标志：optional/multiple 等 */
             redisReply *flags = argMap->element[i + 1];
             assert(flags->type == REDIS_REPLY_SET || flags->type == REDIS_REPLY_ARRAY);
             for (size_t j = 0; j < flags->elements; j++) {
                 assert(flags->element[j]->type == REDIS_REPLY_STATUS);
                 char *flag = flags->element[j]->str;
                 if (!strcmp(flag, "optional")) {
-                    cmdArg->flags |= CMD_ARG_OPTIONAL;
+                    cmdArg->flags |= CMD_ARG_OPTIONAL;        /* 可选参数 */
                 } else if (!strcmp(flag, "multiple")) {
-                    cmdArg->flags |= CMD_ARG_MULTIPLE;
+                    cmdArg->flags |= CMD_ARG_MULTIPLE;        /* 可重复 */
                 } else if (!strcmp(flag, "multiple_token")) {
-                    cmdArg->flags |= CMD_ARG_MULTIPLE_TOKEN;
+                    cmdArg->flags |= CMD_ARG_MULTIPLE_TOKEN;  /* 可重复标记 */
                 }
             }
         }
     }
 }
 
-/* Fill in the fields of a help entry for the command/subcommand name. */
+/* 填充命令/子命令名称对应的帮助条目字段 */
 static void cliFillInCommandHelpEntry(helpEntry *help, char *cmdname, char *subcommandname) {
     help->argc = subcommandname ? 2 : 1;
     help->argv = zmalloc(sizeof(sds) * help->argc);
     help->argv[0] = sdsnew(cmdname);
-    sdstoupper(help->argv[0]);
+    sdstoupper(help->argv[0]);  /* 命令名转大写 */
     if (subcommandname) {
-        /* Subcommand name may be two words separated by a pipe character. */
+        /* 子命令名称可能由竖线分隔的两个单词组成 */
         char *pipe = strchr(subcommandname, '|');
         if (pipe != NULL) {
             help->argv[1] = sdsnew(pipe + 1);
@@ -614,12 +669,11 @@ static void cliFillInCommandHelpEntry(helpEntry *help, char *cmdname, char *subc
     help->docs.since = NULL;
 }
 
-/* Initialize a command help entry for the command/subcommand described in 'specs'.
- * 'next' points to the next help entry to be filled in.
- * 'groups' is a set of command group names to be filled in.
- * Returns a pointer to the next available position in the help entries table.
- * If the command has subcommands, this is called recursively for the subcommands.
- */
+/* 为 'specs' 所描述的命令/子命令初始化帮助条目。
+ * 'next' 指向下一个待填充的帮助条目。
+ * 'groups' 是要填充的命令分组名集合。
+ * 返回帮助条目表中的下一个可用位置指针。
+ * 如果命令有子命令，则会递归调用自身处理子命令。 */
 static helpEntry *cliInitCommandHelpEntry(char *cmdname, char *subcommandname,
                                           helpEntry *next, redisReply *specs,
                                           dict *groups) {
@@ -631,14 +685,17 @@ static helpEntry *cliInitCommandHelpEntry(char *cmdname, char *subcommandname,
         assert(specs->element[j]->type == REDIS_REPLY_STRING);
         char *key = specs->element[j]->str;
         if (!strcmp(key, "summary")) {
+            /* 命令摘要 */
             redisReply *reply = specs->element[j + 1];
             assert(reply->type == REDIS_REPLY_STRING);
             help->docs.summary = sdsnew(reply->str);
         } else if (!strcmp(key, "since")) {
+            /* 引入版本 */
             redisReply *reply = specs->element[j + 1];
             assert(reply->type == REDIS_REPLY_STRING);
             help->docs.since = sdsnew(reply->str);
         } else if (!strcmp(key, "group")) {
+            /* 命令分组 */
             redisReply *reply = specs->element[j + 1];
             assert(reply->type == REDIS_REPLY_STRING);
             help->docs.group = sdsnew(reply->str);
@@ -647,6 +704,7 @@ static helpEntry *cliInitCommandHelpEntry(char *cmdname, char *subcommandname,
                 sdsfree(group);
             }
         } else if (!strcmp(key, "arguments")) {
+            /* 参数列表 */
             redisReply *arguments = specs->element[j + 1];
             assert(arguments->type == REDIS_REPLY_ARRAY);
             help->docs.args = zcalloc(arguments->elements * sizeof(cliCommandArg));
@@ -654,6 +712,7 @@ static helpEntry *cliInitCommandHelpEntry(char *cmdname, char *subcommandname,
             cliMakeCommandDocArgs(arguments, help->docs.args);
             help->docs.params = makeHint(NULL, 0, 0, help->docs);
         } else if (!strcmp(key, "subcommands")) {
+            /* 子命令列表，递归处理 */
             redisReply *subcommands = specs->element[j + 1];
             assert(subcommands->type == REDIS_REPLY_MAP || subcommands->type == REDIS_REPLY_ARRAY);
             for (size_t i = 0; i < subcommands->elements; i += 2) {
@@ -668,13 +727,13 @@ static helpEntry *cliInitCommandHelpEntry(char *cmdname, char *subcommandname,
     return next;
 }
 
-/* Returns the total number of commands and subcommands in the command docs table. */
+/* 返回命令文档表中所有命令及子命令的总数 */
 static size_t cliCountCommands(redisReply* commandTable) {
     size_t numCommands = commandTable->elements / 2;
 
-    /* The command docs table maps command names to a map of their specs. */    
+    /* 命令文档表将命令名映射到其规格说明 */
     for (size_t i = 0; i < commandTable->elements; i += 2) {
-        assert(commandTable->element[i]->type == REDIS_REPLY_STRING);  /* Command name. */
+        assert(commandTable->element[i]->type == REDIS_REPLY_STRING);  /* 命令名 */
         assert(commandTable->element[i + 1]->type == REDIS_REPLY_MAP ||
                commandTable->element[i + 1]->type == REDIS_REPLY_ARRAY);
         redisReply *map = commandTable->element[i + 1];
@@ -691,17 +750,15 @@ static size_t cliCountCommands(redisReply* commandTable) {
     return numCommands;
 }
 
-/* Comparator for sorting help table entries. */
+/* 帮助条目排序的比较函数：按完整名称字典序比较 */
 int helpEntryCompare(const void *entry1, const void *entry2) {
     helpEntry *i1 = (helpEntry *)entry1;
     helpEntry *i2 = (helpEntry *)entry2;
     return strcmp(i1->full, i2->full);
 }
 
-/* Initializes command help entries for command groups.
- * Called after the command help entries have already been filled in.
- * Extends the help table with new entries for the command groups.
- */
+/* 为命令分组初始化帮助条目。
+ * 在命令帮助条目填充完毕后调用，用于扩展帮助表添加分组条目。 */
 void cliInitGroupHelpEntries(dict *groups) {
     dictIterator *iter = dictGetIterator(groups);
     dictEntry *entry;
@@ -730,7 +787,7 @@ void cliInitGroupHelpEntries(dict *groups) {
     dictReleaseIterator(iter);
 }
 
-/* Initializes help entries for all commands in the COMMAND DOCS reply. */
+/* 为 COMMAND DOCS 回复中所有命令初始化帮助条目 */
 void cliInitCommandHelpEntries(redisReply *commandTable, dict *groups) {
     helpEntry *next = helpEntries;
     for (size_t i = 0; i < commandTable->elements; i += 2) {
@@ -744,16 +801,17 @@ void cliInitCommandHelpEntries(redisReply *commandTable, dict *groups) {
     }
 }
 
-/* Does the server version support a command/argument only available "since" some version?
- * Returns 1 when supported, or 0 when the "since" version is newer than "version". */
+/* 判断服务器版本是否支持自某版本起才可用的命令/参数。
+ * 支持则返回 1，"since" 版本比 "version" 新则返回 0。 */
 static int versionIsSupported(sds version, sds since) {
     int i;
     char *versionPos = version;
     char *sincePos = since;
     if (!since) {
-        return 1;
+        return 1;  /* 没有 since 信息默认支持 */
     }
 
+    /* 比较主版本、次版本、修订号 */
     for (i = 0; i != 3; i++) {
         int versionPart = atoi(versionPos);
         int sincePart = atoi(sincePos);
@@ -765,10 +823,10 @@ static int versionIsSupported(sds version, sds since) {
         versionPos = strchr(versionPos, '.');
         sincePos = strchr(sincePos, '.');
 
-        /* If we finished to parse both `version` and `since`, it means they are equal */
+        /* 同时解析完两个版本号说明二者相等 */
         if (!versionPos && !sincePos) return 1;
 
-        /* Different number of digits considered as not supported */
+        /* 位数不同视为不支持 */
         if (!versionPos || !sincePos) return 0;
 
         versionPos++;
@@ -777,6 +835,7 @@ static int versionIsSupported(sds version, sds since) {
     return 0;
 }
 
+/* 移除当前服务器版本不支持的参数项 */
 static void removeUnsupportedArgs(struct cliCommandArg *args, int *numargs, sds version) {
     int i = 0, j;
     while (i != *numargs) {
@@ -794,12 +853,13 @@ static void removeUnsupportedArgs(struct cliCommandArg *args, int *numargs, sds 
     }
 }
 
+/* 旧版帮助条目初始化：使用静态 commandDocs 数据 */
 static helpEntry *cliLegacyInitCommandHelpEntry(char *cmdname, char *subcommandname,
                                                 helpEntry *next, struct commandDocs *command,
                                                 dict *groups, sds version) {
     helpEntry *help = next++;
     cliFillInCommandHelpEntry(help, cmdname, subcommandname);
-    
+
     help->docs.summary = sdsnew(command->summary);
     help->docs.since = sdsnew(command->since);
     help->docs.group = sdsnew(command->group);
@@ -811,6 +871,7 @@ static helpEntry *cliLegacyInitCommandHelpEntry(char *cmdname, char *subcommandn
     if (command->args != NULL) {
         help->docs.args = command->args;
         help->docs.numargs = command->numargs;
+        /* 移除当前服务器版本不支持的参数 */
         if (version)
             removeUnsupportedArgs(help->docs.args, &help->docs.numargs, version);
         help->docs.params = makeHint(NULL, 0, 0, help->docs);
@@ -838,9 +899,7 @@ int cliLegacyInitCommandHelpEntries(struct commandDocs *commands, dict *groups, 
     return next - helpEntries;
 }
 
-/* Returns the total number of commands and subcommands in the command docs table,
- * filtered by server version (if provided).
- */
+/* 返回命令文档表中所有命令及子命令的总数（可选按服务器版本过滤） */
 static size_t cliLegacyCountCommands(struct commandDocs *commands, sds version) {
     int numCommands = 0;
     for (size_t i = 0; commands[i].name != NULL; i++) {
@@ -855,16 +914,16 @@ static size_t cliLegacyCountCommands(struct commandDocs *commands, sds version) 
     return numCommands;
 }
 
-/* Gets the server version string by calling INFO SERVER.
- * Stores the result in config.server_version.
- * When not connected, or not possible, returns NULL. */
+/* 通过调用 INFO SERVER 获取服务器版本字符串。
+ * 结果存储在 config.server_version 中。
+ * 未连接或无法获取时返回 NULL。 */
 static sds cliGetServerVersion(void) {
     static const char *key = "\nredis_version:";
     redisReply *serverInfo = NULL;
     char *pos;
 
     if (config.server_version != NULL) {
-        return config.server_version;
+        return config.server_version;  /* 缓存命中 */
     }
 
     if (!context) return NULL;
@@ -877,7 +936,7 @@ static sds cliGetServerVersion(void) {
     assert(serverInfo->type == REDIS_REPLY_STRING || serverInfo->type == REDIS_REPLY_VERB);
     sds info = serverInfo->str;
 
-    /* Finds the first appearance of "redis_version" in the INFO SERVER reply. */
+    /* 在 INFO SERVER 输出中找到 "redis_version" 的首次出现位置 */
     pos = strstr(info, key);
     if (pos) {
         pos += strlen(key);
@@ -893,10 +952,11 @@ static sds cliGetServerVersion(void) {
     return NULL;
 }
 
+/* 使用静态 cli_commands.c 数据初始化帮助信息（兼容旧版本） */
 static void cliLegacyInitHelp(dict *groups) {
     sds serverVersion = cliGetServerVersion();
-    
-    /* Scan the commandDocs array and fill in the entries */
+
+    /* 遍历 commandDocs 数组并填充条目 */
     helpEntriesLen = cliLegacyCountCommands(redisCommandTable, serverVersion);
     helpEntries = zmalloc(sizeof(helpEntry)*helpEntriesLen);
 
@@ -907,34 +967,32 @@ static void cliLegacyInitHelp(dict *groups) {
     dictRelease(groups);
 }
 
-/* cliInitHelp() sets up the helpEntries array with the command and group
- * names and command descriptions obtained using the COMMAND DOCS command.
- */
+/* cliInitHelp() 通过 COMMAND DOCS 命令获取命令与分组名称
+ * 以及命令描述，并据此设置 helpEntries 数组。 */
 static void cliInitHelp(void) {
-    /* Dict type for a set of strings, used to collect names of command groups. */
+    /* 字符串集合的字典类型，用于收集命令分组名 */
     dictType groupsdt = {
-        dictSdsHash,                /* hash function */
-        NULL,                       /* key dup */
-        NULL,                       /* val dup */
-        dictSdsKeyCompare,          /* key compare */
-        dictSdsDestructor,          /* key destructor */
-        NULL,                       /* val destructor */
-        NULL                        /* allow to expand */
+        dictSdsHash,                /* 哈希函数 */
+        NULL,                       /* 键复制函数 */
+        NULL,                       /* 值复制函数 */
+        dictSdsKeyCompare,          /* 键比较函数 */
+        dictSdsDestructor,          /* 键析构函数 */
+        NULL,                       /* 值析构函数 */
+        NULL                        /* 允许扩展回调 */
     };
     redisReply *commandTable;
     dict *groups;
 
     if (cliConnect(CC_QUIET) == REDIS_ERR) {
-        /* Can not connect to the server, but we still want to provide
-         * help, generate it only from the static cli_commands.c data instead. */
+        /* 无法连接服务器，但仍然希望提供帮助信息，
+         * 改为从静态 cli_commands.c 数据生成。 */
         groups = dictCreate(&groupsdt);
         cliLegacyInitHelp(groups);
         return;
     }
     commandTable = redisCommand(context, "COMMAND DOCS");
     if (commandTable == NULL || commandTable->type == REDIS_REPLY_ERROR) {
-        /* New COMMAND DOCS subcommand not supported - generate help from
-         * static cli_commands.c data instead. */
+        /* 不支持新的 COMMAND DOCS 子命令，改用静态数据生成 */
         freeReplyObject(commandTable);
 
         groups = dictCreate(&groupsdt);
@@ -944,7 +1002,7 @@ static void cliInitHelp(void) {
     };
     if (commandTable->type != REDIS_REPLY_MAP && commandTable->type != REDIS_REPLY_ARRAY) return;
 
-    /* Scan the array reported by COMMAND DOCS and fill in the entries */
+    /* 遍历 COMMAND DOCS 返回的数组并填充条目 */
     helpEntriesLen = cliCountCommands(commandTable);
     helpEntries = zmalloc(sizeof(helpEntry)*helpEntriesLen);
 
@@ -957,7 +1015,7 @@ static void cliInitHelp(void) {
     dictRelease(groups);
 }
 
-/* Output command help to stdout. */
+/* 将命令帮助信息输出到标准输出 */
 static void cliOutputCommandHelp(struct commandDocs *help, int group) {
     printf("\r\n  \x1b[1m%s\x1b[0m \x1b[90m%s\x1b[0m\r\n", help->name, help->params);
     printf("  \x1b[33msummary:\x1b[0m %s\r\n", help->summary);
@@ -969,7 +1027,7 @@ static void cliOutputCommandHelp(struct commandDocs *help, int group) {
     }
 }
 
-/* Print generic help. */
+/* 打印通用帮助信息 */
 static void cliOutputGenericHelp(void) {
     sds version = cliVersion();
     printf(
@@ -989,7 +1047,7 @@ static void cliOutputGenericHelp(void) {
     sdsfree(version);
 }
 
-/* Output all command help, filtering by group or command name. */
+/* 输出命令帮助，按分组或命令名过滤 */
 static void cliOutputHelp(int argc, char **argv) {
     int i, j;
     char *group = NULL;
@@ -1004,8 +1062,8 @@ static void cliOutputHelp(int argc, char **argv) {
     }
 
     if (helpEntries == NULL) {
-        /* Initialize the help using the results of the COMMAND command.
-         * In case we are using redis-cli help XXX, we need to init it. */
+        /* 使用 COMMAND 命令的结果初始化帮助信息。
+         * 当使用 redis-cli help XXX 时需要先初始化。 */
         cliInitHelp();
     }
 
@@ -1016,7 +1074,7 @@ static void cliOutputHelp(int argc, char **argv) {
 
         help = &entry->docs;
         if (group == NULL) {
-            /* Compare all arguments */
+            /* 比较所有参数 */
             if (argc <= entry->argc) {
                 for (j = 0; j < argc; j++) {
                     if (strcasecmp(argv[j],entry->argv[j]) != 0) break;
@@ -1032,7 +1090,7 @@ static void cliOutputHelp(int argc, char **argv) {
     printf("\r\n");
 }
 
-/* Linenoise completion callback. */
+/* linenoise 库的 Tab 补全回调函数 */
 static void completionCallback(const char *buf, linenoiseCompletions *lc) {
     size_t startpos = 0;
     int mask;
@@ -1041,10 +1099,12 @@ static void completionCallback(const char *buf, linenoiseCompletions *lc) {
     sds tmp;
 
     if (strncasecmp(buf,"help ",5) == 0) {
+        /* "help " 命令的补全 */
         startpos = 5;
         while (isspace(buf[startpos])) startpos++;
         mask = CLI_HELP_COMMAND | CLI_HELP_GROUP;
     } else {
+        /* 普通命令补全 */
         mask = CLI_HELP_COMMAND;
     }
 
@@ -1063,10 +1123,9 @@ static void completionCallback(const char *buf, linenoiseCompletions *lc) {
 
 static sds addHintForArgument(sds hint, cliCommandArg *arg);
 
-/* Adds a separator character between words of a string under construction.
- * A separator is added if the string length is greater than its previously-recorded
- * length (*len), which is then updated, and it's not the last word to be added.
- */
+/* 在构造字符串时给词与词之间添加分隔符。
+ * 当字符串长度大于其先前记录的长度 (*len) 且不是最后一个词时
+ * 添加分隔符，随后更新长度记录。 */
 static sds addSeparator(sds str, size_t *len, char *separator, int is_last) {
     if (sdslen(str) > *len && !is_last) {
         str = sdscat(str, separator);
@@ -1075,7 +1134,7 @@ static sds addSeparator(sds str, size_t *len, char *separator, int is_last) {
     return str;
 }
 
-/* Recursively zeros the matched* fields of all arguments. */
+/* 递归地将所有参数的 matched* 字段清零 */
 static void clearMatchedArgs(cliCommandArg *args, int numargs) {
     for (int i = 0; i != numargs; ++i) {
         args[i].matched = 0;
@@ -1088,9 +1147,8 @@ static void clearMatchedArgs(cliCommandArg *args, int numargs) {
     }
 }
 
-/* Builds a completion hint string describing the arguments, skipping parts already matched.
- * Hints for all arguments are added to the input 'hint' parameter, separated by 'separator'.
- */
+/* 构造描述参数的补全提示字符串，跳过已经匹配的部分。
+ * 所有参数的提示被添加到输入的 'hint' 字符串中，使用 'separator' 分隔。 */
 static sds addHintForArguments(sds hint, cliCommandArg *args, int numargs, char *separator) {
     int i, j, incomplete;
     size_t len=sdslen(hint);
@@ -1101,26 +1159,22 @@ static sds addHintForArguments(sds hint, cliCommandArg *args, int numargs, char 
             continue;
         }
 
-        /* The rule is that successive "optional" arguments can appear in any order.
-         * But if they are followed by a required argument, no more of those optional arguments
-         * can appear after that.
-         * 
-         * This code handles all successive optional args together. This lets us show the
-         * completion of the currently-incomplete optional arg first, if there is one.
-         */
+        /* 规则：连续的"可选"参数可以以任意顺序出现。
+         * 但如果它们后面跟着必需参数，则这些可选参数之后不再出现可选参数。
+         *
+         * 本段代码将所有连续可选参数作为整体处理，
+         * 便于优先显示当前未完成的可选参数补全。 */
         for (j = i, incomplete = -1; j < numargs; j++) {
             if (!(args[j].flags & CMD_ARG_OPTIONAL)) break;
             if (args[j].matched != 0 && args[j].matched_all == 0) {
-                /* User has started typing this arg; show its completion first. */
+                /* 用户已开始输入该参数；优先显示其补全 */
                 hint = addHintForArgument(hint, &args[j]);
                 hint = addSeparator(hint, &len, separator, i == numargs-1);
                 incomplete = j;
             }
         }
 
-        /* If the following non-optional arg has not been matched, add hints for
-         * any remaining optional args in this group. 
-         */
+        /* 如果后续非可选参数尚未匹配，则为本组剩余可选参数也添加提示 */
         if (j == numargs || args[j].matched == 0) {
             for (; i < j; i++) {
                 if (incomplete != i) {
@@ -1135,19 +1189,17 @@ static sds addHintForArguments(sds hint, cliCommandArg *args, int numargs, char 
     return hint;
 }
 
-/* Adds the "repeating" section of the hint string for a multiple-typed argument: [ABC def ...]
- * The repeating part is a fixed unit; we don't filter matched elements from it.
- */
+/* 为可重复（multiple）类型的参数添加提示字符串中的"重复"片段：[ABC def ...]
+ * 重复片段是固定单元，不过滤已匹配元素。 */
 static sds addHintForRepeatedArgument(sds hint, cliCommandArg *arg) {
     if (!(arg->flags & CMD_ARG_MULTIPLE)) {
         return hint;
     }
 
-    /* The repeating part is always shown at the end of the argument's hint,
-     * so we can safely clear its matched flags before printing it.
-     */
+    /* 重复片段总是显示在参数提示末尾，因此输出前
+     * 可以安全地清空其匹配标志。 */
     clearMatchedArgs(arg, 1);
-        
+
     if (hint[0] != '\0') {
         hint = sdscat(hint, " ");
     }
@@ -1181,18 +1233,18 @@ static sds addHintForRepeatedArgument(sds hint, cliCommandArg *arg) {
     return hint;
 }
 
-/* Adds hint string for one argument, if not already matched. */
+/* 若参数尚未完全匹配，则为单个参数添加提示字符串 */
 static sds addHintForArgument(sds hint, cliCommandArg *arg) {
     if (arg->matched_all) {
         return hint;
     }
 
-    /* Surround an optional arg with brackets, unless it's partially matched. */
+    /* 可选参数用方括号包围，除非它已被部分匹配 */
     if ((arg->flags & CMD_ARG_OPTIONAL) && !arg->matched) {
         hint = sdscat(hint, "[");
     }
 
-    /* Start with the token, if present and not matched. */
+    /* 如果有标记 token 且尚未匹配，则以 token 开头 */
     if (arg->token != NULL && !arg->matched_token) {
         hint = sdscat_orempty(hint, arg->token);
         if (arg->type != ARG_TYPE_PURE_TOKEN) {
@@ -1200,7 +1252,7 @@ static sds addHintForArgument(sds hint, cliCommandArg *arg) {
         }
     }
 
-    /* Add the body of the syntax string. */
+    /* 添加参数语法字符串的主体部分 */
     switch (arg->type) {
      case ARG_TYPE_ONEOF:
         if (arg->matched == 0) {
@@ -1241,14 +1293,14 @@ static sds addHintForArgument(sds hint, cliCommandArg *arg) {
 static int matchArg(char **nextword, int numwords, cliCommandArg *arg);
 static int matchArgs(char **words, int numwords, cliCommandArg *args, int numargs);
 
-/* Tries to match the next words of the input against an argument. */
+/* 尝试将输入的下一组单词与某个参数进行匹配 */
 static int matchNoTokenArg(char **nextword, int numwords, cliCommandArg *arg) {
     int i;
     switch (arg->type) {
     case ARG_TYPE_BLOCK: {
         arg->matched += matchArgs(nextword, numwords, arg->subargs, arg->numsubargs);
 
-        /* All the subargs must be matched for the block to match. */
+        /* 所有子参数都必须匹配，块才算匹配 */
         arg->matched_all = 1;
         for (i = 0; i < arg->numsubargs; i++) {
             if (arg->subargs[i].matched_all == 0) {
@@ -1258,6 +1310,7 @@ static int matchNoTokenArg(char **nextword, int numwords, cliCommandArg *arg) {
         break;
     }
     case ARG_TYPE_ONEOF: {
+        /* 二选一/多选一：任意子参数匹配即可 */
         for (i = 0; i < arg->numsubargs; i++) {
             if (matchArg(nextword, numwords, &arg->subargs[i])) {
                 arg->matched += arg->subargs[i].matched;
@@ -1276,7 +1329,7 @@ static int matchNoTokenArg(char **nextword, int numwords, cliCommandArg *arg) {
             arg->matched_name = 1;
             arg->matched_all = 1;
         } else {
-            /* Matching failed due to incorrect arg type. */
+            /* 类型不正确导致匹配失败 */
             arg->matched = 0;
             arg->matched_name = 0;
         }
@@ -1290,7 +1343,7 @@ static int matchNoTokenArg(char **nextword, int numwords, cliCommandArg *arg) {
             arg->matched_name = 1;
             arg->matched_all = 1;
         } else {
-            /* Matching failed due to incorrect arg type. */
+            /* 类型不正确导致匹配失败 */
             arg->matched = 0;
             arg->matched_name = 0;
         }
@@ -1306,7 +1359,7 @@ static int matchNoTokenArg(char **nextword, int numwords, cliCommandArg *arg) {
     return arg->matched;
 }
 
-/* Tries to match the next word of the input against a token literal. */
+/* 尝试将输入的下一个单词与 token 字面量进行匹配 */
 static int matchToken(char **nextword, cliCommandArg *arg) {
     if (strcasecmp(arg->token, nextword[0]) != 0) {
         return 0;
@@ -1316,12 +1369,11 @@ static int matchToken(char **nextword, cliCommandArg *arg) {
     return 1;
 }
 
-/* Tries to match the next words of the input against the next argument.
- * If the arg is repeated ("multiple"), it will be matched only once.
- * If the next input word(s) can't be matched, returns 0 for failure.
- */
+/* 尝试将输入的下一组单词与下一个参数进行匹配。
+ * 若参数标记为 multiple（可重复），仅匹配一次。
+ * 若下一个输入单词无法匹配则返回 0 表示失败。 */
 static int matchArgOnce(char **nextword, int numwords, cliCommandArg *arg) {
-    /* First match the token, if present. */
+    /* 首先匹配 token（若存在） */
     if (arg->token != NULL) {
         if (!matchToken(nextword, arg)) {
             return 0;
@@ -1337,16 +1389,15 @@ static int matchArgOnce(char **nextword, int numwords, cliCommandArg *arg) {
         numwords--;
     }
 
-    /* Then match the rest of the argument. */
+    /* 然后匹配参数剩余部分 */
     if (!matchNoTokenArg(nextword, numwords, arg)) {
         return 0;
     }
     return arg->matched;
 }
 
-/* Tries to match the next words of the input against the next argument.
- * If the arg is repeated ("multiple"), it will be matched as many times as possible.
- */
+/* 尝试将输入的下一组单词与下一个参数进行匹配。
+ * 若参数标记为 multiple（可重复），尽可能多次匹配。 */
 static int matchArg(char **nextword, int numwords, cliCommandArg *arg) {
     int matchedWords = 0;
     int matchedOnce = matchArgOnce(nextword, numwords, arg);
@@ -1354,14 +1405,13 @@ static int matchArg(char **nextword, int numwords, cliCommandArg *arg) {
         return matchedOnce;
     }
 
-    /* Found one match; now match a "multiple" argument as many times as possible. */
+    /* 已成功匹配一次；尽可能多次匹配 multiple 参数 */
     matchedWords += matchedOnce;
     while (arg->matched_all && matchedWords < numwords) {
         clearMatchedArgs(arg, 1);
         if (arg->token != NULL && !(arg->flags & CMD_ARG_MULTIPLE_TOKEN)) {
-            /* The token only appears the first time; the rest of the times,
-             * pretend we saw it so we don't hint it.
-             */
+            /* token 仅在首次出现，后续匹配假装 token 已出现
+             * 以便不再提示。 */
             matchedOnce = matchNoTokenArg(nextword + matchedWords, numwords - matchedWords, arg);
             if (arg->matched) {
                 arg->matched_token = 1;
@@ -1371,17 +1421,15 @@ static int matchArg(char **nextword, int numwords, cliCommandArg *arg) {
         }
         matchedWords += matchedOnce;
     }
-    arg->matched_all = 0;  /* Because more repetitions are still possible. */
+    arg->matched_all = 0;  /* 因为还可能有更多次重复 */
     return matchedWords;
 }
 
-/* Tries to match the next words of the input against
- * any one of a consecutive set of optional arguments.
- */
+/* 尝试将输入的下一组单词与某一组连续可选参数中的任一项匹配 */
 static int matchOneOptionalArg(char **words, int numwords, cliCommandArg *args, int numargs, int *matchedarg) {
     for (int nextword = 0, nextarg = 0; nextword != numwords && nextarg != numargs; ++nextarg) {
         if (args[nextarg].matched) {
-            /* Already matched this arg. */
+            /* 已经匹配过该参数 */
             continue;
         }
 
@@ -1394,7 +1442,7 @@ static int matchOneOptionalArg(char **words, int numwords, cliCommandArg *args, 
     return 0;
 }
 
-/* Matches as many input words as possible against a set of consecutive optional arguments. */
+/* 在一组连续可选参数中尽可能多地匹配输入单词 */
 static int matchOptionalArgs(char **words, int numwords, cliCommandArg *args, int numargs) {
     int nextword = 0;
     int matchedarg = -1, lastmatchedarg = -1;
@@ -1403,9 +1451,8 @@ static int matchOptionalArgs(char **words, int numwords, cliCommandArg *args, in
         if (matchedWords == 0) {
             break;
         }
-        /* Successfully matched an optional arg; mark any previous match as completed
-         * so it won't be partially hinted.
-         */
+        /* 成功匹配一个可选参数；将前一个匹配标记为已完成，
+         * 避免出现部分提示。 */
         if (lastmatchedarg != -1) {
             args[lastmatchedarg].matched_all = 1;
         }
@@ -1415,7 +1462,7 @@ static int matchOptionalArgs(char **words, int numwords, cliCommandArg *args, in
     return nextword;
 }
 
-/* Matches as many input words as possible against command arguments. */
+/* 尽可能多地将输入单词与命令参数匹配 */
 static int matchArgs(char **words, int numwords, cliCommandArg *args, int numargs) {
     int nextword, nextarg, matchedWords;
     for (nextword = 0, nextarg = 0; nextword != numwords && nextarg != numargs; ++nextarg) {
@@ -1451,8 +1498,7 @@ static sds makeHint(char **inputargv, int inputargc, int cmdlen, struct commandD
     sds hint;
 
     if (docs.args) {
-        /* Remove arguments from the returned hint to show only the
-         * ones the user did not yet type. */
+        /* 清空返回提示中的已匹配参数，仅显示用户尚未输入的部分 */
         clearMatchedArgs(docs.args, docs.numargs);
         hint = sdsempty();
         int matchedWords = 0;
@@ -1464,7 +1510,7 @@ static sds makeHint(char **inputargv, int inputargc, int cmdlen, struct commandD
         return hint;
     }
 
-    /* If arg specs are not available, show the hint string until the user types something. */
+    /* 若无参数规格，在用户开始输入前直接显示提示字符串 */
     if (inputargc <= cmdlen) {
         hint = sdsnew(docs.params);
     } else {
@@ -1473,7 +1519,7 @@ static sds makeHint(char **inputargv, int inputargc, int cmdlen, struct commandD
     return hint;
 }
 
-/* Search for a command matching the longest possible prefix of input words. */
+/* 搜索匹配输入单词最长前缀的命令 */
 static helpEntry* findHelpEntry(int argc, char **argv) {
     helpEntry *entry = NULL;
     int i, rawargc, matchlen = 0;
@@ -1500,14 +1546,14 @@ static helpEntry* findHelpEntry(int argc, char **argv) {
     return entry;
 }
 
-/* Returns the command-line hint string for a given partial input. */
+/* 返回给定部分输入的命令行提示字符串 */
 static sds getHintForInput(const char *charinput) {
     sds hint = NULL;
     int inputargc, inputlen = strlen(charinput);
     sds *inputargv = sdssplitargs(charinput, &inputargc);
     int endspace = inputlen && isspace(charinput[inputlen-1]);
 
-    /* Don't match the last word until the user has typed a space after it. */
+    /* 在用户输入空格之前不匹配最后一个单词 */
     int matchargc = endspace ? inputargc : inputargc - 1;
 
     helpEntry *entry = findHelpEntry(matchargc, inputargv);
@@ -1518,19 +1564,19 @@ static sds getHintForInput(const char *charinput) {
     return hint;
 }
 
-/* Linenoise hints callback. */
+/* linenoise 提示回调函数 */
 static char *hintsCallback(const char *buf, int *color, int *bold) {
-    if (!pref.hints) return NULL;
+    if (!pref.hints) return NULL;  /* 用户关闭了提示功能 */
 
     sds hint = getHintForInput(buf);
     if (hint == NULL) {
         return NULL;
     }
 
-    *color = 90;
+    *color = 90;   /* 灰色 */
     *bold = 0;
 
-    /* Add an initial space if needed. */
+    /* 必要时在开头添加空格 */
     int len = strlen(buf);
     int endspace = len && isspace(buf[len-1]);
     if (!endspace) {
@@ -1548,16 +1594,16 @@ static void freeHintsCallback(void *ptr) {
 }
 
 /*------------------------------------------------------------------------------
- * TTY manipulation
+ * TTY manipulation — 终端控制
  *--------------------------------------------------------------------------- */
 
-/* Restore terminal if we've changed it. */
+/* 若已修改终端属性，则恢复 */
 void cliRestoreTTY(void) {
     if (orig_termios_saved)
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
 }
 
-/* Put the terminal in "press any key" mode */
+/* 将终端切换到"按任意键继续"模式（关闭回显与规范模式） */
 static void cliPressAnyKeyTTY(void) {
     if (!isatty(STDIN_FILENO)) return;
     if (!orig_termios_saved) {
@@ -1566,18 +1612,18 @@ static void cliPressAnyKeyTTY(void) {
         orig_termios_saved = 1;
     }
     struct termios mode = orig_termios;
-    mode.c_lflag &= ~(ECHO | ICANON); /* echoing off, canonical off */
+    mode.c_lflag &= ~(ECHO | ICANON); /* 关闭回显、关闭规范模式 */
     tcsetattr(STDIN_FILENO, TCSANOW, &mode);
 }
 
 /*------------------------------------------------------------------------------
- * Networking / parsing
+ * Networking / parsing — 网络与解析
  *--------------------------------------------------------------------------- */
 
-/* Send AUTH command to the server */
+/* 向服务器发送 AUTH 命令进行身份认证 */
 static int cliAuth(redisContext *ctx, char *user, char *auth) {
     redisReply *reply;
-    if (auth == NULL) return REDIS_OK;
+    if (auth == NULL) return REDIS_OK;  /* 无密码直接返回成功 */
 
     if (user == NULL)
         reply = redisCommand(ctx,"AUTH %s",auth);
@@ -1598,7 +1644,7 @@ static int cliAuth(redisContext *ctx, char *user, char *auth) {
     return result;
 }
 
-/* Send SELECT input_dbnum to the server */
+/* 向服务器发送 SELECT input_dbnum 切换数据库 */
 static int cliSelect(void) {
     redisReply *reply;
     if (config.conn_info.input_dbnum == config.dbnum) return REDIS_OK;
@@ -1621,7 +1667,7 @@ static int cliSelect(void) {
     return result;
 }
 
-/* Select RESP3 mode if redis-cli was started with the -3 option.  */
+/* 若 redis-cli 启动时指定了 -3 选项，则切换到 RESP3 协议 */
 static int cliSwitchProto(void) {
     redisReply *reply;
     if (!config.resp3 || config.resp2) return REDIS_OK;
@@ -1636,13 +1682,13 @@ static int cliSwitchProto(void) {
     if (reply->type == REDIS_REPLY_ERROR) {
         fprintf(stderr,"HELLO 3 failed: %s\n",reply->str);
         if (config.resp3 == 1) {
-            result = REDIS_ERR;
+            result = REDIS_ERR;   /* 显式 -3，要求必须成功 */
         } else if (config.resp3 == 2) {
-            result = REDIS_OK;
+            result = REDIS_OK;    /* 隐式（如 --json），允许失败 */
         }
     }
 
-    /* Retrieve server version string for later use. */
+    /* 获取服务器版本字符串以备后用 */
     for (size_t i = 0; i < reply->elements; i += 2) {
         assert(reply->element[i]->type == REDIS_REPLY_STRING);
         char *key = reply->element[i]->str;
@@ -1656,10 +1702,9 @@ static int cliSwitchProto(void) {
     return result;
 }
 
-/* Connect to the server. It is possible to pass certain flags to the function:
- *      CC_FORCE: The connection is performed even if there is already
- *                a connected socket.
- *      CC_QUIET: Don't print errors if connection fails. */
+/* 连接到 Redis 服务器。可通过以下标志控制行为：
+ *      CC_FORCE : 即使已存在连接也强制重连。
+ *      CC_QUIET : 连接失败时不打印错误信息。 */
 static int cliConnect(int flags) {
     if (context == NULL || flags & CC_FORCE) {
         if (context != NULL) {
@@ -1670,7 +1715,7 @@ static int cliConnect(int flags) {
             cliRefreshPrompt();
         }
 
-        /* Do not use hostsocket when we got redirected in cluster mode */
+        /* 在集群模式下被重定向后不再使用 Unix 套接字 */
         if (config.hostsocket == NULL ||
             (config.cluster_mode && config.cluster_reissue_command)) {
             context = redisConnectWrapper(config.conn_info.hostip, config.conn_info.hostport,
@@ -1679,6 +1724,7 @@ static int cliConnect(int flags) {
             context = redisConnectUnixWrapper(config.hostsocket, config.connect_timeout);
         }
 
+        /* 启用 TLS 时进行安全握手 */
         if (!context->err && config.tls) {
             const char *err = NULL;
             if (cliSecureConnection(context, config.sslconfig, &err) == REDIS_ERR && err) {
@@ -1708,16 +1754,14 @@ static int cliConnect(int flags) {
         }
 
 
-        /* Set aggressive KEEP_ALIVE socket option in the Redis context socket
-         * in order to prevent timeouts caused by the execution of long
-         * commands. At the same time this improves the detection of real
-         * errors. */
+        /* 在 Redis 上下文的套接字上启用激进的 KEEP_ALIVE 选项，
+         * 以避免执行长命令时出现超时，同时也有助于更及时发现真实错误。 */
         anetKeepAlive(NULL, context->fd, REDIS_CLI_KEEPALIVE_INTERVAL);
 
-        /* State of the current connection. */
+        /* 当前连接状态 */
         config.current_resp3 = 0;
 
-        /* Do AUTH, select the right DB, switch to RESP3 if needed. */
+        /* 执行 AUTH、选择数据库、视需要切换到 RESP3 协议 */
         if (cliAuth(context, config.conn_info.user, config.conn_info.auth) != REDIS_OK)
             return REDIS_ERR;
         if (cliSelect() != REDIS_OK)
@@ -1726,7 +1770,7 @@ static int cliConnect(int flags) {
             return REDIS_ERR;
     }
 
-    /* Set a PUSH handler if configured to do so. */
+    /* 若需要则注册 PUSH 消息回调 */
     if (config.push_output) {
         redisSetPushCallback(context, cliPushHandler);
     }
@@ -1734,8 +1778,8 @@ static int cliConnect(int flags) {
     return REDIS_OK;
 }
 
-/* In cluster, if server replies ASK, we will redirect to a different node.
- * Before sending the real command, we need to send ASKING command first. */
+/* 在集群模式下，若服务器返回 ASK 错误需要重定向到另一节点，
+ * 在发送真实命令前需要先发送 ASKING 命令。 */
 static int cliSendAsking(void) {
     redisReply *reply;
 
@@ -1757,11 +1801,13 @@ static int cliSendAsking(void) {
     return result;
 }
 
+/* 打印 Redis 上下文的错误信息 */
 static void cliPrintContextError(void) {
     if (context == NULL) return;
     fprintf(stderr,"Error: %s\n",context->errstr);
 }
 
+/* 判断 reply 是否为 RESP3 的 invalidate 推送消息 */
 static int isInvalidateReply(redisReply *reply) {
     return reply->type == REDIS_REPLY_PUSH && reply->elements == 2 &&
         reply->element[0]->type == REDIS_REPLY_STRING &&
@@ -1769,9 +1815,8 @@ static int isInvalidateReply(redisReply *reply) {
         reply->element[1]->type == REDIS_REPLY_ARRAY;
 }
 
-/* Special display handler for RESP3 'invalidate' messages.
- * This function does not validate the reply, so it should
- * already be confirmed correct */
+/* RESP3 'invalidate' 消息的专用显示处理器。
+ * 本函数不对 reply 做合法性校验，因此调用前应已经确认其正确性。 */
 static sds cliFormatInvalidateTTY(redisReply *r) {
     sds out = sdsnew("-> invalidate: ");
 
@@ -1787,7 +1832,7 @@ static sds cliFormatInvalidateTTY(redisReply *r) {
     return sdscatlen(out, "\n", 1);
 }
 
-/* Returns non-zero if cliFormatReplyTTY renders the reply in multiple lines. */
+/* 当 cliFormatReplyTTY 以多行形式渲染 reply 时返回非零值 */
 static int cliIsMultilineValueTTY(redisReply *r) {
     switch (r->type) {
     case REDIS_REPLY_ARRAY:
@@ -1805,27 +1850,31 @@ static int cliIsMultilineValueTTY(redisReply *r) {
     }
 }
 
+/* 将 reply 格式化为人类可读的字符串（TTY 友好的多行输出） */
 static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
     sds out = sdsempty();
     switch (r->type) {
     case REDIS_REPLY_ERROR:
+        /* 错误响应 */
         out = sdscatprintf(out,"(error) %s\n", r->str);
     break;
     case REDIS_REPLY_STATUS:
+        /* 状态响应 */
         out = sdscat(out,r->str);
         out = sdscat(out,"\n");
     break;
     case REDIS_REPLY_INTEGER:
+        /* 整数响应 */
         out = sdscatprintf(out,"(integer) %lld\n",r->integer);
     break;
     case REDIS_REPLY_DOUBLE:
+        /* 双精度浮点响应 */
         out = sdscatprintf(out,"(double) %s\n",r->str);
     break;
     case REDIS_REPLY_STRING:
     case REDIS_REPLY_VERB:
-        /* If you are producing output for the standard output we want
-        * a more interesting output with quoted characters and so forth,
-        * unless it's a verbatim string type. */
+        /* 为标准输出生成内容时希望带有引号等丰富展示，
+         * verbatim（逐字）字符串类型除外。 */
         if (r->type == REDIS_REPLY_STRING) {
             out = sdscatrepr(out,r->str,r->len);
             out = sdscat(out,"\n");
@@ -1835,15 +1884,18 @@ static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
         }
     break;
     case REDIS_REPLY_NIL:
+        /* 空响应 */
         out = sdscat(out,"(nil)\n");
     break;
     case REDIS_REPLY_BOOL:
+        /* 布尔响应 */
         out = sdscat(out,r->integer ? "(true)\n" : "(false)\n");
     break;
     case REDIS_REPLY_ARRAY:
     case REDIS_REPLY_MAP:
     case REDIS_REPLY_SET:
     case REDIS_REPLY_PUSH:
+        /* 聚合类型：数组/映射/集合/推送 */
         if (r->elements == 0) {
             if (r->type == REDIS_REPLY_ARRAY)
                 out = sdscat(out,"(empty array)\n");
@@ -1862,7 +1914,7 @@ static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
             sds _prefix;
             sds tmp;
 
-            /* Calculate chars needed to represent the largest index */
+            /* 计算表示最大索引所需的字符数 */
             i = r->elements;
             if (r->type == REDIS_REPLY_MAP) i /= 2;
             do {
@@ -1870,16 +1922,16 @@ static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
                 i /= 10;
             } while(i);
 
-            /* Prefix for nested multi bulks should grow with idxlen+2 spaces */
+            /* 嵌套多层 bulk 的前缀应随 idxlen+2 个空格增长 */
             memset(_prefixlen,' ',idxlen+2);
             _prefixlen[idxlen+2] = '\0';
             _prefix = sdscat(sdsnew(prefix),_prefixlen);
 
-            /* Setup prefix format for every entry */
+            /* 设置每条条目的前缀格式 */
             char numsep;
             if (r->type == REDIS_REPLY_SET) numsep = '~';
             else if (r->type == REDIS_REPLY_MAP) numsep = '#';
-            /* TODO: this would be a breaking change for scripts, do that in a major version. */
+            /* TODO: 此处将是脚本的破坏性变更，需在主版本中处理 */
             /* else if (r->type == REDIS_REPLY_PUSH) numsep = '>'; */
             else numsep = ')';
             snprintf(_prefixfmt,sizeof(_prefixfmt),"%%s%%%ud%c ",idxlen,numsep);
@@ -1887,24 +1939,23 @@ static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
             for (i = 0; i < r->elements; i++) {
                 unsigned int human_idx = (r->type == REDIS_REPLY_MAP) ?
                                          i/2 : i;
-                human_idx++; /* Make it 1-based. */
+                human_idx++; /* 改为 1-based 索引 */
 
-                /* Don't use the prefix for the first element, as the parent
-                 * caller already prepended the index number. */
+                /* 第一个元素不使用前缀，因为父调用方已添加索引号 */
                 out = sdscatprintf(out,_prefixfmt,i == 0 ? "" : prefix,human_idx);
 
-                /* Format the multi bulk entry */
+                /* 格式化 multi bulk 条目 */
                 tmp = cliFormatReplyTTY(r->element[i],_prefix);
                 out = sdscatlen(out,tmp,sdslen(tmp));
                 sdsfree(tmp);
 
-                /* For maps, format the value as well. */
+                /* map 类型还要格式化 value */
                 if (r->type == REDIS_REPLY_MAP) {
                     i++;
                     sdsrange(out,0,-2);
                     out = sdscat(out," => ");
                     if (cliIsMultilineValueTTY(r->element[i])) {
-                        /* linebreak before multiline value to fix alignment */
+                        /* 多行 value 之前换行以对齐 */
                         out = sdscat(out, "\n");
                         out = sdscat(out, _prefix);
                     }
@@ -1923,7 +1974,7 @@ static sds cliFormatReplyTTY(redisReply *r, char *prefix) {
     return out;
 }
 
-/* Returns 1 if the reply is a pubsub pushed reply. */
+/* 若 reply 是 pubsub 推送消息则返回 1 */
 int isPubsubPush(redisReply *r) {
     if (r == NULL ||
         r->type != (config.current_resp3 ? REDIS_REPLY_PUSH : REDIS_REPLY_ARRAY) ||
@@ -1934,26 +1985,26 @@ int isPubsubPush(redisReply *r) {
     }
     char *str = r->element[0]->str;
     size_t len = r->element[0]->len;
-    /* Check if it is [p|s][un]subscribe or [p|s]message, but even simpler, we
-     * just check that it ends with "message" or "subscribe". */
+    /* 判断是否为 [p|s][un]subscribe 或 [p|s]message，
+     * 但更简单的方式是判断它是否以 "message" 或 "subscribe" 结尾。 */
     return ((len >= strlen("message") &&
              !strcmp(str + len - strlen("message"), "message")) ||
             (len >= strlen("subscribe") &&
              !strcmp(str + len - strlen("subscribe"), "subscribe")));
 }
 
+/* 判断当前终端是否支持 ANSI 颜色 */
 int isColorTerm(void) {
     char *t = getenv("TERM");
     return t != NULL && strstr(t,"xterm") != NULL;
 }
 
-/* Helper function for sdsCatColorizedLdbReply() appending colorize strings
- * to an SDS string. */
+/* sdsCatColorizedLdbReply() 的辅助函数：给 SDS 字符串追加带颜色片段 */
 sds sdscatcolor(sds o, char *s, size_t len, char *color) {
-    if (!isColorTerm()) return sdscatlen(o,s,len);
+    if (!isColorTerm()) return sdscatlen(o,s,len);  /* 不支持颜色则原样输出 */
 
     int bold = strstr(color,"bold") != NULL;
-    int ccode = 37; /* Defaults to white. */
+    int ccode = 37; /* 默认白色 */
     if (strstr(color,"red")) ccode = 31;
     else if (strstr(color,"green")) ccode = 32;
     else if (strstr(color,"yellow")) ccode = 33;
@@ -1968,8 +2019,7 @@ sds sdscatcolor(sds o, char *s, size_t len, char *color) {
     return o;
 }
 
-/* Colorize Lua debugger status replies according to the prefix they
- * have. */
+/* 根据 Lua 调试器回复的前缀为其上色 */
 sds sdsCatColorizedLdbReply(sds o, char *s, size_t len) {
     char *color = "white";
 
@@ -1980,19 +2030,20 @@ sds sdsCatColorizedLdbReply(sds o, char *s, size_t len) {
     if (strstr(s,"<hint>")) color = "bold";
     if (strstr(s,"<value>") || strstr(s,"<retval>")) color = "magenta";
     if (len > 4 && isdigit(s[3])) {
-        if (s[1] == '>') color = "yellow"; /* Current line. */
-        else if (s[2] == '#') color = "bold"; /* Break point. */
+        if (s[1] == '>') color = "yellow"; /* 当前行 */
+        else if (s[2] == '#') color = "bold"; /* 断点 */
     }
     return sdscatcolor(o,s,len,color);
 }
 
+/* 将 reply 格式化为最简原始字符串 */
 static sds cliFormatReplyRaw(redisReply *r) {
     sds out = sdsempty(), tmp;
     size_t i;
 
     switch (r->type) {
     case REDIS_REPLY_NIL:
-        /* Nothing... */
+        /* 空响应：无输出 */
         break;
     case REDIS_REPLY_ERROR:
         out = sdscatlen(out,r->str,r->len);
@@ -2002,15 +2053,14 @@ static sds cliFormatReplyRaw(redisReply *r) {
     case REDIS_REPLY_STRING:
     case REDIS_REPLY_VERB:
         if (r->type == REDIS_REPLY_STATUS && config.eval_ldb) {
-            /* The Lua debugger replies with arrays of simple (status)
-             * strings. We colorize the output for more fun if this
-             * is a debugging session. */
+            /* Lua 调试器以简单 status 字符串数组回复，
+             * 调试会话中为其染色以增强可读性。 */
 
-            /* Detect the end of a debugging session. */
+            /* 检测调试会话是否结束 */
             if (strstr(r->str,"<endsession>") == r->str) {
                 config.enable_ldb_on_eval = 0;
                 config.eval_ldb = 0;
-                config.eval_ldb_end = 1; /* Signal the caller session ended. */
+                config.eval_ldb_end = 1; /* 通知调用方会话结束 */
                 config.output = OUTPUT_STANDARD;
                 cliRefreshPrompt();
             } else {
@@ -2059,6 +2109,7 @@ static sds cliFormatReplyRaw(redisReply *r) {
     return out;
 }
 
+/* 将 reply 格式化为 CSV 字符串 */
 static sds cliFormatReplyCSV(redisReply *r) {
     unsigned int i;
 
@@ -2090,7 +2141,7 @@ static sds cliFormatReplyCSV(redisReply *r) {
     case REDIS_REPLY_ARRAY:
     case REDIS_REPLY_SET:
     case REDIS_REPLY_PUSH:
-    case REDIS_REPLY_MAP: /* CSV has no map type, just output flat list. */
+    case REDIS_REPLY_MAP: /* CSV 无 map 类型，按扁平列表输出 */
         for (i = 0; i < r->elements; i++) {
             sds tmp = cliFormatReplyCSV(r->element[i]);
             out = sdscatlen(out,tmp,sdslen(tmp));
@@ -2105,13 +2156,12 @@ static sds cliFormatReplyCSV(redisReply *r) {
     return out;
 }
 
-/* Append specified buffer to out and return it, using required JSON output
- * mode. */
+/* 将指定缓冲区按所需 JSON 输出模式追加到 out 并返回 */
 static sds jsonStringOutput(sds out, const char *p, int len, int mode) {
     if (mode == OUTPUT_JSON) {
         return escapeJsonString(out, p, len);
     } else if (mode == OUTPUT_QUOTED_JSON) {
-        /* Need to double-quote backslashes */
+        /* 需要对反斜杠进行双重转义 */
         sds tmp = sdscatrepr(sdsempty(), p, len);
         int tmplen = sdslen(tmp);
         char *n = tmp;
@@ -2128,6 +2178,7 @@ static sds jsonStringOutput(sds out, const char *p, int len, int mode) {
     }
 }
 
+/* 将 reply 格式化为 JSON 字符串 */
 static sds cliFormatReplyJson(sds out, redisReply *r, int mode) {
     unsigned int i;
 
@@ -2176,10 +2227,10 @@ static sds cliFormatReplyJson(sds out, redisReply *r, int mode) {
             {
                 out = cliFormatReplyJson(out,key,mode);
             } else {
-                /* According to JSON spec, JSON map keys must be strings,
-                 * and in RESP3, they can be other types. 
-                 * The first one(cliFormatReplyJson) is to convert non string type to string
-                 * The Second one(escapeJsonString) is to escape the converted string */
+                /* 根据 JSON 规范，map 的 key 必须是字符串，
+                 * 但 RESP3 中 key 可以是其他类型。
+                 * 第一个 cliFormatReplyJson 调用将非字符串类型转为字符串，
+                 * 第二个 escapeJsonString 调用对转换后的字符串进行转义。 */
                 sds keystr = cliFormatReplyJson(sdsempty(),key,mode);
                 if (keystr[0] == '"') out = sdscatsds(out,keystr);
                 else out = sdscatfmt(out,"\"%S\"",keystr);
@@ -2199,7 +2250,7 @@ static sds cliFormatReplyJson(sds out, redisReply *r, int mode) {
     return out;
 }
 
-/* Generate reply strings in various output modes */
+/* 根据不同输出模式生成回复字符串 */
 static sds cliFormatReply(redisReply *reply, int mode, int verbatim) {
     sds out;
 
@@ -2224,7 +2275,7 @@ static sds cliFormatReply(redisReply *reply, int mode, int verbatim) {
     return out;
 }
 
-/* Output any spontaneous PUSH reply we receive */
+/* 输出任何接收到的自发性 PUSH 回复 */
 static void cliPushHandler(void *privdata, void *reply) {
     UNUSED(privdata);
     sds out;
@@ -2241,6 +2292,7 @@ static void cliPushHandler(void *privdata, void *reply) {
     sdsfree(out);
 }
 
+/* 读取服务器回复，并按当前输出模式打印 */
 static int cliReadReply(int output_raw_strings) {
     void *_reply;
     redisReply *reply;
@@ -2254,6 +2306,7 @@ static int cliReadReply(int output_raw_strings) {
 
     if (redisGetReply(context,&_reply) != REDIS_OK) {
         if (config.blocking_state_aborted) {
+            /* Ctrl-C 中断了阻塞状态 */
             config.blocking_state_aborted = 0;
             config.monitor_mode = 0;
             config.pubsub_mode = 0;
@@ -2266,7 +2319,7 @@ static int cliReadReply(int output_raw_strings) {
             return REDIS_OK;
         }
         if (config.interactive) {
-            /* Filter cases where we should reconnect */
+            /* 过滤需要重连的情况 */
             if (context->err == REDIS_ERR_IO &&
                 (errno == ECONNRESET || errno == EPIPE))
                 return REDIS_ERR;
@@ -2275,15 +2328,14 @@ static int cliReadReply(int output_raw_strings) {
         }
         cliPrintContextError();
         exit(1);
-        return REDIS_ERR; /* avoid compiler warning */
+        return REDIS_ERR; /* 避免编译器警告 */
     }
 
     config.last_reply = reply = (redisReply*)_reply;
 
     config.last_cmd_type = reply->type;
 
-    /* Check if we need to connect to a different node and reissue the
-     * request. */
+    /* 检查是否需要连接到其他节点并重新提交请求 */
     if (config.cluster_mode && reply->type == REDIS_REPLY_ERROR &&
         (!strncmp(reply->str,"MOVED ",6) || !strncmp(reply->str,"ASK ",4)))
     {
@@ -2291,10 +2343,10 @@ static int cliReadReply(int output_raw_strings) {
         int slot;
 
         output = 0;
-        /* Comments show the position of the pointer as:
+        /* 注释以指针位置标识：
          *
-         * [S] for pointer 's'
-         * [P] for pointer 'p'
+         * [S] 表示指针 s 的位置
+         * [P] 表示指针 p 的位置
          */
         s = strchr(p,' ');      /* MOVED[S]3999 127.0.0.1:6381 */
         p = strchr(s+1,' ');    /* MOVED[S]3999[P]127.0.0.1:6381 */
@@ -2303,8 +2355,8 @@ static int cliReadReply(int output_raw_strings) {
         s = strrchr(p+1,':');    /* MOVED 3999[P]127.0.0.1[S]6381 */
         *s = '\0';
         if (p+1 != s) {
-            /* Host might be empty, like 'MOVED 3999 :6381', if endpoint type is unknown. Only update the
-             * host if it's non-empty. */
+            /* 主机名可能为空（如端点类型未知时的 'MOVED 3999 :6381'），
+             * 仅在主机名非空时更新。 */
             sdsfree(config.conn_info.hostip);
             config.conn_info.hostip = sdsnew(p+1);
         }
@@ -2317,12 +2369,12 @@ static int cliReadReply(int output_raw_strings) {
             config.cluster_send_asking = 1;
         }
         cliRefreshPrompt();
-    } else if (!config.interactive && config.set_errcode && 
-        reply->type == REDIS_REPLY_ERROR) 
+    } else if (!config.interactive && config.set_errcode &&
+        reply->type == REDIS_REPLY_ERROR)
     {
         fprintf(stderr,"%s\n",reply->str);
         exit(1);
-        return REDIS_ERR; /* avoid compiler warning */
+        return REDIS_ERR; /* 避免编译器警告 */
     }
 
     if (output) {
@@ -2334,14 +2386,14 @@ static int cliReadReply(int output_raw_strings) {
     return REDIS_OK;
 }
 
-/* Simultaneously wait for pubsub messages from redis and input on stdin. */
+/* 同时等待 Redis pubsub 消息和标准输入 */
 static void cliWaitForMessagesOrStdin(void) {
     int show_info = config.output != OUTPUT_RAW && (isatty(STDOUT_FILENO) ||
                                                     getenv("FAKETTY"));
     int use_color = show_info && isColorTerm();
     cliPressAnyKeyTTY();
     while (config.pubsub_mode) {
-        /* First check if there are any buffered replies. */
+        /* 首先检查是否有已缓冲的回复 */
         redisReply *reply;
         do {
             if (redisGetReplyFromReader(context, (void **)&reply) != REDIS_OK) {
@@ -2356,7 +2408,7 @@ static void cliWaitForMessagesOrStdin(void) {
             }
         } while(reply);
 
-        /* Wait for input, either on the Redis socket or on stdin. */
+        /* 等待来自 Redis 套接字或标准输入的输入 */
         struct timeval tv;
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -2365,18 +2417,18 @@ static void cliWaitForMessagesOrStdin(void) {
         tv.tv_sec = 5;
         tv.tv_usec = 0;
         if (show_info) {
-            if (use_color) printf("\033[1;90m"); /* Bold, bright color. */
+            if (use_color) printf("\033[1;90m"); /* 加粗、亮色 */
             printf("Reading messages... (press Ctrl-C to quit or any key to type command)\r");
-            if (use_color) printf("\033[0m"); /* Reset color. */
+            if (use_color) printf("\033[0m"); /* 复位颜色 */
             fflush(stdout);
         }
         select(context->fd + 1, &readfds, NULL, NULL, &tv);
         if (show_info) {
-            printf("\033[K"); /* Erase current line */
+            printf("\033[K"); /* 清除当前行 */
             fflush(stdout);
         }
         if (config.blocking_state_aborted) {
-            /* Ctrl-C pressed */
+            /* 用户按下了 Ctrl-C */
             config.blocking_state_aborted = 0;
             config.pubsub_mode = 0;
             if (cliConnect(CC_FORCE) != REDIS_OK) {
@@ -2385,20 +2437,21 @@ static void cliWaitForMessagesOrStdin(void) {
             }
             break;
         } else if (FD_ISSET(context->fd, &readfds)) {
-            /* Message from Redis */
+            /* 来自 Redis 的消息 */
             if (cliReadReply(0) != REDIS_OK) {
                 cliPrintContextError();
                 exit(1);
             }
             fflush(stdout);
         } else if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            /* Any key pressed */
+            /* 用户按下了任意键 */
             break;
         }
     }
     cliRestoreTTY();
 }
 
+/* 向服务器发送 Redis 命令。repeat 参数指定重复执行的次数。 */
 static int cliSendCommand(int argc, char **argv, long repeat) {
     char *command = argv[0];
     size_t *argvlen;
@@ -2406,6 +2459,7 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
 
     if (context == NULL) return REDIS_ERR;
 
+    /* 识别输出格式应为原始格式的命令 */
     output_raw = 0;
     if (!strcasecmp(command,"info") ||
         !strcasecmp(command,"lolwut") ||
@@ -2428,7 +2482,7 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                        !strcasecmp(argv[1],"graph")) ||
         (argc == 2 && !strcasecmp(command,"latency") &&
                        !strcasecmp(argv[1],"doctor")) ||
-        /* Format PROXY INFO command for Redis Cluster Proxy:
+        /* 为 Redis Cluster Proxy 格式化 PROXY INFO 命令：
          * https://github.com/artix75/redis-cluster-proxy */
         (argc >= 2 && !strcasecmp(command,"proxy") &&
                        !strcasecmp(argv[1],"info")))
@@ -2436,6 +2490,7 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
         output_raw = 1;
     }
 
+    /* 根据命令名设置相应的运行模式 */
     if (!strcasecmp(command,"shutdown")) config.shutdown = 1;
     if (!strcasecmp(command,"monitor")) config.monitor_mode = 1;
     int is_subscribe = (!strcasecmp(command, "subscribe") ||
@@ -2447,8 +2502,8 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
     if (!strcasecmp(command,"sync") ||
         !strcasecmp(command,"psync")) config.slave_mode = 1;
 
-    /* When the user manually calls SCRIPT DEBUG, setup the activation of
-     * debugging mode on the next eval if needed. */
+    /* 当用户手动调用 SCRIPT DEBUG 时，按需在下一次 EVAL
+     * 启用调试模式。 */
     if (argc == 3 && !strcasecmp(argv[0],"script") &&
                      !strcasecmp(argv[1],"debug"))
     {
@@ -2459,19 +2514,19 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
         }
     }
 
-    /* Actually activate LDB on EVAL if needed. */
+    /* 如有需要则在 EVAL 上真正激活 LDB */
     if (!strcasecmp(command,"eval") && config.enable_ldb_on_eval) {
         config.eval_ldb = 1;
         config.output = OUTPUT_RAW;
     }
 
-    /* Setup argument length */
+    /* 设置各参数长度 */
     argvlen = zmalloc(argc*sizeof(size_t));
     for (j = 0; j < argc; j++)
         argvlen[j] = sdslen(argv[j]);
 
-    /* Negative repeat is allowed and causes infinite loop,
-       works well with the interval option. */
+    /* 允许负的 repeat，表示无限循环，
+     * 与 -i 选项配合工作良好。 */
     while(repeat < 0 || repeat-- > 0) {
         redisAppendCommandArgv(context,argc,(const char**)argv,argvlen);
 
@@ -2483,7 +2538,7 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                 }
                 fflush(stdout);
 
-                /* This happens when the MONITOR command returns an error. */
+                /* 当 MONITOR 命令返回错误时退出循环 */
                 if (config.last_cmd_type == REDIS_REPLY_ERROR)
                     config.monitor_mode = 0;
             } while(config.monitor_mode);
@@ -2493,12 +2548,12 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
 
         int num_expected_pubsub_push = 0;
         if (is_subscribe || is_unsubscribe) {
-            /* When a push callback is set, redisGetReply (hiredis) loops until
-             * an in-band message is received, but these commands are confirmed
-             * using push replies only. There is one push reply per channel if
-             * channels are specified, otherwise at least one. */
+            /* 当设置了 push 回调时，redisGetReply（hiredis）会循环读取
+             * 直到收到 in-band 消息；但这些命令仅通过 push 回复确认。
+             * 若指定了 channel，每个 channel 有一个 push 回复；
+             * 否则至少有一个。 */
             num_expected_pubsub_push = argc > 1 ? argc - 1 : 1;
-            /* Unset our default PUSH handler so this works in RESP2/RESP3 */
+            /* 临时取消默认 PUSH 回调以兼容 RESP2/RESP3 */
             redisSetPushCallback(context, NULL);
         }
 
@@ -2507,10 +2562,10 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
             slaveMode(0);
             config.slave_mode = 0;
             zfree(argvlen);
-            return REDIS_ERR;  /* Error = slaveMode lost connection to master */
+            return REDIS_ERR;  /* 返回错误表示 slaveMode 与主节点断开 */
         }
 
-        /* Read response, possibly skipping pubsub/push messages. */
+        /* 读取回复，必要时跳过 pubsub/push 消息 */
         while (1) {
             if (cliReadReply(output_raw) != REDIS_OK) {
                 zfree(argvlen);
@@ -2522,53 +2577,57 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                     if (num_expected_pubsub_push > 0 &&
                         !strcasecmp(config.last_reply->element[0]->str, command))
                     {
-                        /* This pushed message confirms the
-                         * [p|s][un]subscribe command. */
+                        /* 此推送消息确认了 [p|s][un]subscribe 命令 */
                         if (is_subscribe && !config.pubsub_mode) {
                             config.pubsub_mode = 1;
                             cliRefreshPrompt();
                         }
                         if (--num_expected_pubsub_push > 0) {
-                            continue; /* We need more of these. */
+                            continue; /* 还需要更多确认消息 */
                         }
                     } else {
-                        continue; /* Skip this pubsub message. */
+                        continue; /* 跳过该 pubsub 消息 */
                     }
                 } else if (config.last_reply->type == REDIS_REPLY_PUSH) {
-                    continue; /* Skip other push message. */
+                    continue; /* 跳过其他推送消息 */
                 }
             }
 
-            /* Store database number when SELECT was successfully executed. */
-            if (!strcasecmp(command,"select") && argc == 2 && 
-                config.last_cmd_type != REDIS_REPLY_ERROR) 
+            /* SELECT 成功执行时记录新的数据库编号 */
+            if (!strcasecmp(command,"select") && argc == 2 &&
+                config.last_cmd_type != REDIS_REPLY_ERROR)
             {
                 config.conn_info.input_dbnum = config.dbnum = atoi(argv[1]);
                 cliRefreshPrompt();
             } else if (!strcasecmp(command,"auth") && (argc == 2 || argc == 3)) {
                 cliSelect();
             } else if (!strcasecmp(command,"multi") && argc == 1 &&
-                config.last_cmd_type != REDIS_REPLY_ERROR) 
+                config.last_cmd_type != REDIS_REPLY_ERROR)
             {
+                /* 进入 MULTI 事务状态 */
                 config.in_multi = 1;
                 config.pre_multi_dbnum = config.dbnum;
                 cliRefreshPrompt();
             } else if (!strcasecmp(command,"exec") && argc == 1 && config.in_multi) {
+                /* 结束事务 */
                 config.in_multi = 0;
                 if (config.last_cmd_type == REDIS_REPLY_ERROR ||
                     config.last_cmd_type == REDIS_REPLY_NIL)
                 {
+                    /* 事务被丢弃，恢复事务前的数据库 */
                     config.conn_info.input_dbnum = config.dbnum = config.pre_multi_dbnum;
                 }
                 cliRefreshPrompt();
-            } else if (!strcasecmp(command,"discard") && argc == 1 && 
-                config.last_cmd_type != REDIS_REPLY_ERROR) 
+            } else if (!strcasecmp(command,"discard") && argc == 1 &&
+                config.last_cmd_type != REDIS_REPLY_ERROR)
             {
+                /* 显式 DISCARD */
                 config.in_multi = 0;
                 config.conn_info.input_dbnum = config.dbnum = config.pre_multi_dbnum;
                 cliRefreshPrompt();
             } else if (!strcasecmp(command,"reset") && argc == 1 &&
                                      config.last_cmd_type != REDIS_REPLY_ERROR) {
+                /* RESET 命令会重置连接状态 */
                 config.in_multi = 0;
                 config.dbnum = 0;
                 config.conn_info.input_dbnum = 0;
@@ -2579,13 +2638,14 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                 config.pubsub_mode = 0;
                 cliRefreshPrompt();
             } else if (!strcasecmp(command,"hello")) {
+                /* HELLO 命令可能在 RESP2 与 RESP3 之间切换 */
                 if (config.last_cmd_type == REDIS_REPLY_MAP) {
                     config.current_resp3 = 1;
                 } else if (config.last_cmd_type == REDIS_REPLY_ARRAY) {
                     config.current_resp3 = 0;
                 }
             } else if ((is_subscribe || is_unsubscribe) && !config.pubsub_mode) {
-                /* We didn't enter pubsub mode. Restore push callback. */
+                /* 未进入 pubsub 模式，恢复 push 回调 */
                 if (config.push_output)
                     redisSetPushCallback(context, cliPushHandler);
             }
@@ -2593,19 +2653,19 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
             break;
         }
         if (config.cluster_reissue_command){
-            /* If we need to reissue the command, break to prevent a
-               further 'repeat' number of dud interactions */
+            /* 若需要重发命令则跳出循环，
+             * 避免更多 repeat 次数的空操作。 */
             break;
         }
         if (config.interval) usleep(config.interval);
-        fflush(stdout); /* Make it grep friendly */
+        fflush(stdout); /* 便于 grep 处理输出 */
     }
 
     zfree(argvlen);
     return REDIS_OK;
 }
 
-/* Send a command reconnecting the link if needed. */
+/* 发送命令，若连接断开则自动重连 */
 static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ...) {
     redisReply *reply = NULL;
     int tries = 0;
@@ -2614,7 +2674,7 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
     assert(!c->err);
     while(reply == NULL) {
         while (c->err & (REDIS_ERR_IO | REDIS_ERR_EOF)) {
-            printf("\r\x1b[0K"); /* Cursor to left edge + clear line. */
+            printf("\r\x1b[0K"); /* 光标回到行首并清除该行 */
             printf("Reconnecting... %d\r", ++tries);
             fflush(stdout);
 
@@ -2639,7 +2699,7 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
             fprintf(stderr, "Error: %s\n", c->errstr);
             exit(1);
         } else if (tries > 0) {
-            printf("\r\x1b[0K"); /* Cursor to left edge + clear line. */
+            printf("\r\x1b[0K"); /* 光标回到行首并清除该行 */
         }
     }
 
@@ -2648,9 +2708,10 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
 }
 
 /*------------------------------------------------------------------------------
- * User interface
+ * User interface — 用户界面与命令行解析
  *--------------------------------------------------------------------------- */
 
+/* 解析命令行选项，填充 config 结构体 */
 static int parseOptions(int argc, char **argv) {
     int i;
 
@@ -2944,6 +3005,7 @@ static int parseOptions(int argc, char **argv) {
             config.cluster_manager_command.flags |=
                 CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS;
         } else if (!strcmp(argv[i],"--cluster-fix-with-unreachable-masters")) {
+            /* 修复集群时允许包含不可达的主节点 */
             config.cluster_manager_command.flags |=
                 CLUSTER_MANAGER_CMD_FLAG_FIX_WITH_UNREACHABLE_MASTERS;
         } else if (!strcmp(argv[i],"--test_hint") && !lastarg) {
@@ -2952,23 +3014,32 @@ static int parseOptions(int argc, char **argv) {
             config.test_hint_file = argv[++i];
 #ifdef USE_OPENSSL
         } else if (!strcmp(argv[i],"--tls")) {
+            /* 启用 TLS 安全连接 */
             config.tls = 1;
         } else if (!strcmp(argv[i],"--sni") && !lastarg) {
+            /* TLS SNI（服务器名称指示） */
             config.sslconfig.sni = argv[++i];
         } else if (!strcmp(argv[i],"--cacertdir") && !lastarg) {
+            /* CA 证书目录 */
             config.sslconfig.cacertdir = argv[++i];
         } else if (!strcmp(argv[i],"--cacert") && !lastarg) {
+            /* CA 证书文件 */
             config.sslconfig.cacert = argv[++i];
         } else if (!strcmp(argv[i],"--cert") && !lastarg) {
+            /* 客户端证书文件 */
             config.sslconfig.cert = argv[++i];
         } else if (!strcmp(argv[i],"--key") && !lastarg) {
+            /* 客户端私钥文件 */
             config.sslconfig.key = argv[++i];
         } else if (!strcmp(argv[i],"--tls-ciphers") && !lastarg) {
+            /* TLSv1.2 及以下版本的密码套件列表 */
             config.sslconfig.ciphers = argv[++i];
         } else if (!strcmp(argv[i],"--insecure")) {
+            /* 跳过证书校验，允许不安全连接 */
             config.sslconfig.skip_cert_verify = 1;
         #ifdef TLS1_3_VERSION
         } else if (!strcmp(argv[i],"--tls-ciphersuites") && !lastarg) {
+            /* TLSv1.3 版本的密码套件列表 */
             config.sslconfig.ciphersuites = argv[++i];
         #endif
 #endif
@@ -2978,10 +3049,13 @@ static int parseOptions(int argc, char **argv) {
             sdsfree(version);
             exit(0);
         } else if (!strcmp(argv[i],"-2")) {
+            /* 显式使用 RESP2 协议 */
             config.resp2 = 1;
         } else if (!strcmp(argv[i],"-3")) {
+            /* 显式使用 RESP3 协议 */
             config.resp3 = 1;
         } else if (!strcmp(argv[i],"--show-pushes") && !lastarg) {
+            /* 是否打印 RESP3 PUSH 消息 */
             char *argval = argv[++i];
             if (!strncasecmp(argval, "n", 1)) {
                 config.push_output = 0;
@@ -2992,6 +3066,7 @@ static int parseOptions(int argc, char **argv) {
                         "(valid: '[y]es', '[n]o')\n", argval);
             }
         } else if (CLUSTER_MANAGER_MODE() && argv[i][0] != '-') {
+            /* 收集集群管理子命令的参数 */
             if (config.cluster_manager_command.argc == 0) {
                 int j = i + 1;
                 while (j < argc && argv[j][0] != '-') j++;
@@ -3007,12 +3082,13 @@ static int parseOptions(int argc, char **argv) {
                     argv[i]);
                 exit(1);
             } else {
-                /* Likely the command name, stop here. */
+                /* 看起来是命令名，停止解析选项 */
                 break;
             }
         }
     }
 
+    /* 校验互斥选项组合 */
     if (config.hostsocket && config.cluster_mode) {
         fprintf(stderr,"Options -c and -s are mutually exclusive.\n");
         exit(1);
@@ -3023,13 +3099,14 @@ static int parseOptions(int argc, char **argv) {
         exit(1);
     }
 
-    /* --ldb requires --eval. */
+    /* --ldb 需要配合 --eval 使用 */
     if (config.eval_ldb && config.eval == NULL) {
         fprintf(stderr,"Options --ldb and --ldb-sync-mode require --eval.\n");
         fprintf(stderr,"Try %s --help for more information.\n", argv[0]);
         exit(1);
     }
 
+    /* 若未禁用则打印密码安全警告 */
     if (!config.no_auth_warning && config.conn_info.auth != NULL) {
         fputs("Warning: Using a password with '-a' or '-u' option on the command"
               " line interface may not be safe.\n", stderr);
@@ -3039,7 +3116,7 @@ static int parseOptions(int argc, char **argv) {
         fprintf(stderr,"Option --functions-rdb and --rdb are mutually exclusive.\n");
         exit(1);
     }
- 
+
     if (config.stdin_lastarg && config.stdin_tag_arg) {
         fprintf(stderr, "Options -x and -X are mutually exclusive.\n");
         exit(1);
@@ -3053,8 +3130,9 @@ static int parseOptions(int argc, char **argv) {
     return i;
 }
 
+/* 解析环境变量设置 */
 static void parseEnv(void) {
-    /* Set auth from env, but do not overwrite CLI arguments if passed */
+    /* 从环境变量读取密码，但不覆盖 CLI 参数 */
     char *auth = getenv(REDIS_CLI_AUTH_ENV);
     if (auth != NULL && config.conn_info.auth == NULL) {
         config.conn_info.auth = auth;
@@ -3066,9 +3144,11 @@ static void parseEnv(void) {
     }
 }
 
+/* 打印 redis-cli 的帮助信息；err 非零时输出到 stderr 并以非零码退出 */
 static void usage(int err) {
     sds version = cliVersion();
     FILE *target = err ? stderr: stdout;
+    /* TLS 相关使用说明（仅在启用 OpenSSL 时编译进二进制） */
     const char *tls_usage =
 #ifdef USE_OPENSSL
 "  --tls              Establish a secure TLS connection.\n"
@@ -3228,8 +3308,7 @@ version,tls_usage);
 }
 
 static int confirmWithYes(char *msg, int ignore_force) {
-    /* if --cluster-yes option is set and ignore_force is false,
-     * do not prompt for an answer */
+    /* 若设置了 --cluster-yes 且未忽略强制标志则直接确认 */
     if (!ignore_force &&
         (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_YES)) {
         return 1;
@@ -3243,11 +3322,12 @@ static int confirmWithYes(char *msg, int ignore_force) {
     return (nread != 0 && !strcmp("yes", buf));
 }
 
+/* 发送命令，必要时进行 repeat 重复。处理重定向和重连。 */
 static int issueCommandRepeat(int argc, char **argv, long repeat) {
-    /* In Lua debugging mode, we want to pass the "help" to Redis to get
-     * it's own HELP message, rather than handle it by the CLI, see ldbRepl.
+    /* Lua 调试模式下希望把 "help" 透传给 Redis，由其自身处理 HELP 消息，
+     * 而非由 CLI 处理（详见 ldbRepl）。
      *
-     * For the normal Redis HELP, we can process it without a connection. */
+     * 对于普通 Redis HELP，无需连接即可处理。 */
     if (!config.eval_ldb &&
         (!strcasecmp(argv[0],"help") || !strcasecmp(argv[0],"?")))
     {
@@ -3279,7 +3359,7 @@ static int issueCommandRepeat(int argc, char **argv, long repeat) {
             return REDIS_ERR;
         }
 
-        /* Issue the command again if we got redirected in cluster mode */
+        /* 集群模式下若被重定向则再次发送命令 */
         if (config.cluster_mode && config.cluster_reissue_command) {
             continue;
         }
@@ -3288,16 +3368,15 @@ static int issueCommandRepeat(int argc, char **argv, long repeat) {
     return REDIS_OK;
 }
 
+/* 使用配置中的 repeat 次数发送命令 */
 static int issueCommand(int argc, char **argv) {
     return issueCommandRepeat(argc, argv, config.repeat);
 }
 
-/* Split the user provided command into multiple SDS arguments.
- * This function normally uses sdssplitargs() from sds.c which is able
- * to understand "quoted strings", escapes and so forth. However when
- * we are in Lua debugging mode and the "eval" command is used, we want
- * the remaining Lua script (after "e " or "eval ") to be passed verbatim
- * as a single big argument. */
+/* 将用户输入的命令拆分为多个 SDS 参数。
+ * 通常使用 sds.c 中的 sdssplitargs()，它支持引号字符串、转义等。
+ * 但在 Lua 调试模式下使用 "eval" 命令时，希望把 "e " 或 "eval "
+ * 后面的整个 Lua 脚本原样作为一个大参数传递。 */
 static sds *cliSplitArgs(char *line, int *argc) {
     if (config.eval_ldb && (strstr(line,"eval ") == line ||
                             strstr(line,"e ") == line))
@@ -3305,7 +3384,7 @@ static sds *cliSplitArgs(char *line, int *argc) {
         sds *argv = sds_malloc(sizeof(sds)*2);
         *argc = 2;
         int len = strlen(line);
-        int elen = line[1] == ' ' ? 2 : 5; /* "e " or "eval "? */
+        int elen = line[1] == ' ' ? 2 : 5; /* "e " 还是 "eval "？ */
         argv[0] = sdsnewlen(line,elen-1);
         argv[1] = sdsnewlen(line+elen,len-elen);
         return argv;
@@ -3314,9 +3393,7 @@ static sds *cliSplitArgs(char *line, int *argc) {
     }
 }
 
-/* Set the CLI preferences. This function is invoked when an interactive
- * ":command" is called, or when reading ~/.redisclirc file, in order to
- * set user preferences. */
+/* 设置 CLI 偏好。该函数在交互模式下调用 ":command" 或读取 ~/.redisclirc 时执行。 */
 void cliSetPreferences(char **argv, int argc, int interactive) {
     if (!strcasecmp(argv[0],":set") && argc >= 2) {
         if (!strcasecmp(argv[1],"hints")) pref.hints = 1;
@@ -3333,7 +3410,7 @@ void cliSetPreferences(char **argv, int argc, int interactive) {
     }
 }
 
-/* Load the ~/.redisclirc file if any. */
+/* 加载 ~/.redisclirc 文件（若存在） */
 void cliLoadPreferences(void) {
     sds rcfile = getDotfilePath(REDIS_CLI_RCFILE_ENV,REDIS_CLI_RCFILE_DEFAULT);
     if (rcfile == NULL) return;
@@ -3354,15 +3431,14 @@ void cliLoadPreferences(void) {
     sdsfree(rcfile);
 }
 
-/* Some commands can include sensitive information and shouldn't be put in the
- * history file. Currently these commands are include:
+/* 部分命令可能包含敏感信息，不应写入历史文件。当前包含：
  * - AUTH
- * - ACL DELUSER, ACL SETUSER, ACL GETUSER
+ * - ACL DELUSER、ACL SETUSER、ACL GETUSER
  * - CONFIG SET masterauth/masteruser/tls-key-file-pass/tls-client-key-file-pass/requirepass
- * - HELLO with [AUTH username password]
- * - MIGRATE with [AUTH password] or [AUTH2 username password] 
- * - SENTINEL CONFIG SET sentinel-pass password, SENTINEL CONFIG SET sentinel-user username 
- * - SENTINEL SET <mastername> auth-pass password, SENTINEL SET <mastername> auth-user username */
+ * - HELLO 携带 [AUTH username password]
+ * - MIGRATE 携带 [AUTH password] 或 [AUTH2 username password]
+ * - SENTINEL CONFIG SET sentinel-pass password、SENTINEL CONFIG SET sentinel-user username
+ * - SENTINEL SET <mastername> auth-pass password、SENTINEL SET <mastername> auth-user username */
 static int isSensitiveCommand(int argc, char **argv) {
     if (!strcasecmp(argv[0],"auth")) {
         return 1;
@@ -3433,6 +3509,7 @@ static int isSensitiveCommand(int argc, char **argv) {
     return 0;
 }
 
+/* redis-cli 的交互式命令行主循环（REPL） */
 static void repl(void) {
     sds historyfile = NULL;
     int history = 0;
@@ -3440,11 +3517,11 @@ static void repl(void) {
     int argc;
     sds *argv;
 
-    /* There is no need to initialize redis HELP when we are in lua debugger mode.
-     * It has its own HELP and commands (COMMAND or COMMAND DOCS will fail and got nothing).
-     * We will initialize the redis HELP after the Lua debugging session ended.*/
+    /* Lua 调试模式下不需要初始化 redis HELP。
+     * 它有自己的一套 HELP 和命令（COMMAND/COMMAND DOCS 会失败且无返回）。
+     * 我们会在 Lua 调试会话结束后再初始化 redis HELP。 */
     if ((!config.eval_ldb) && isatty(fileno(stdin))) {
-        /* Initialize the help using the results of the COMMAND command. */
+        /* 使用 COMMAND 命令的结果初始化帮助信息 */
         cliInitHelp();
     }
 
@@ -3454,10 +3531,10 @@ static void repl(void) {
     linenoiseSetHintsCallback(hintsCallback);
     linenoiseSetFreeHintsCallback(freeHintsCallback);
 
-    /* Only use history and load the rc file when stdin is a tty. */
+    /* 仅当 stdin 是 TTY 时才使用历史记录和加载 rc 文件 */
     if (getenv("FAKETTY_WITH_PROMPT") != NULL || isatty(fileno(stdin))) {
         historyfile = getDotfilePath(REDIS_CLI_HISTFILE_ENV,REDIS_CLI_HISTFILE_DEFAULT);
-        //keep in-memory history always regardless if history file can be determined
+        // 始终保留内存中的历史，无论历史文件路径是否能确定
         history = 1;
         if (historyfile != NULL) {
             linenoiseHistoryLoad(historyfile);
@@ -3469,7 +3546,7 @@ static void repl(void) {
     while(1) {
         line = linenoise(context ? config.prompt : "not connected> ");
         if (line == NULL) {
-            /* ^C, ^D or similar. */
+            /* ^C、^D 或类似中断 */
             if (config.pubsub_mode) {
                 config.pubsub_mode = 0;
                 if (cliConnect(CC_FORCE) == REDIS_OK)
@@ -3495,8 +3572,7 @@ static void repl(void) {
                 continue;
             }
 
-            /* check if we have a repeat command option and
-             * need to skip the first arg */
+            /* 检查是否为 repeat 命令选项（数字前缀），若是则需跳过该参数 */
             errno = 0;
             repeat = strtol(argv[0], &endptr, 10);
             if (argc > 1 && *endptr == '\0') {
@@ -3511,8 +3587,8 @@ static void repl(void) {
                 repeat = 1;
             }
 
-            /* Always keep in-memory history. But for commands with sensitive information,
-             * avoid writing them to the history file. */
+            /* 始终保留内存中的历史记录。但对于包含敏感信息的命令，
+             * 避免写入历史文件。 */
             int is_sensitive = isSensitiveCommand(argc - skipargs, argv + skipargs);
             if (history) linenoiseHistoryAdd(line, is_sensitive);
             if (!is_sensitive && historyfile) linenoiseHistorySave(historyfile);
@@ -3520,38 +3596,42 @@ static void repl(void) {
             if (strcasecmp(argv[0],"quit") == 0 ||
                 strcasecmp(argv[0],"exit") == 0)
             {
+                /* 用户请求退出 */
                 exit(0);
             } else if (argv[0][0] == ':') {
+                /* 以 ':' 开头的命令用于设置偏好 */
                 cliSetPreferences(argv,argc,1);
                 sdsfreesplitres(argv,argc);
                 linenoiseFree(line);
                 continue;
             } else if (strcasecmp(argv[0],"restart") == 0) {
                 if (config.eval) {
+                    /* Lua 调试模式下重启会话 */
                     config.eval_ldb = 1;
                     config.output = OUTPUT_RAW;
                     sdsfreesplitres(argv,argc);
                     linenoiseFree(line);
-                    return; /* Return to evalMode to restart the session. */
+                    return; /* 返回 evalMode 重启会话 */
                 } else {
                     printf("Use 'restart' only in Lua debugging mode.\n");
                     fflush(stdout);
                 }
             } else if (argc == 3 && !strcasecmp(argv[0],"connect")) {
+                /* 切换连接 */
                 sdsfree(config.conn_info.hostip);
                 config.conn_info.hostip = sdsnew(argv[1]);
                 config.conn_info.hostport = atoi(argv[2]);
                 cliRefreshPrompt();
                 cliConnect(CC_FORCE);
             } else if (argc == 1 && !strcasecmp(argv[0],"clear")) {
+                /* 清屏 */
                 linenoiseClearScreen();
             } else {
                 long long start_time = mstime(), elapsed;
 
                 issueCommandRepeat(argc-skipargs, argv+skipargs, repeat);
 
-                /* If our debugging session ended, show the EVAL final
-                    * reply. */
+                /* 调试会话结束时显示 EVAL 最终回复 */
                 if (config.eval_ldb_end) {
                     config.eval_ldb_end = 0;
                     cliReadReply(0);
@@ -3565,10 +3645,11 @@ static void repl(void) {
                 if (elapsed >= 500 &&
                     config.output == OUTPUT_STANDARD)
                 {
+                    /* 命令耗时较长时打印耗时 */
                     printf("(%.2fs)\n",(double)elapsed/1000);
                 }
             }
-            /* Free the argument vector */
+            /* 释放参数数组 */
             sdsfreesplitres(argv,argc);
         }
 
@@ -3576,12 +3657,13 @@ static void repl(void) {
             cliWaitForMessagesOrStdin();
         }
 
-        /* linenoise() returns malloc-ed lines like readline() */
+        /* linenoise() 返回的是 malloc 分配的字符串，类似于 readline() */
         linenoiseFree(line);
     }
     exit(0);
 }
 
+/* 非交互模式：根据命令行参数直接执行命令 */
 static int noninteractive(int argc, char **argv) {
     int retval = 0;
     sds *sds_args = getSdsArrayFromArgv(argc, argv, config.quoted_input);
@@ -3592,10 +3674,12 @@ static int noninteractive(int argc, char **argv) {
     }
 
     if (config.stdin_lastarg) {
+        /* -x：从标准输入读取最后一个参数 */
         sds_args = sds_realloc(sds_args, (argc + 1) * sizeof(sds));
         sds_args[argc] = readArgFromStdin();
         argc++;
     } else if (config.stdin_tag_arg) {
+        /* -X：替换参数中匹配的标签 */
         int i = 0, tag_match = 0;
 
         for (; i < argc; i++) {
@@ -3627,9 +3711,10 @@ static int noninteractive(int argc, char **argv) {
 }
 
 /*------------------------------------------------------------------------------
- * Eval mode
+ * Eval mode — EVAL 模式（执行 Lua 脚本）
  *--------------------------------------------------------------------------- */
 
+/* EVAL 模式主入口：加载脚本、调用 EVAL，必要时进入调试 REPL */
 static int evalMode(int argc, char **argv) {
     sds script = NULL;
     FILE *fp;
@@ -3654,7 +3739,7 @@ static int evalMode(int argc, char **argv) {
         got_comma = 0;
         keys = 0;
 
-        /* Load the script from the file, as an sds string. */
+        /* 从文件加载脚本内容为 sds 字符串 */
         fp = fopen(config.eval,"r");
         if (!fp) {
             fprintf(stderr,
@@ -3666,7 +3751,7 @@ static int evalMode(int argc, char **argv) {
         }
         fclose(fp);
 
-        /* If we are debugging a script, enable the Lua debugger. */
+        /* 若处于调试模式则启用 Lua 调试器 */
         if (config.eval_ldb) {
             redisReply *reply = redisCommand(context,
                     config.eval_ldb_sync ?
@@ -3674,12 +3759,14 @@ static int evalMode(int argc, char **argv) {
             if (reply) freeReplyObject(reply);
         }
 
-        /* Create our argument vector */
+        /* 构造 EVAL 命令的参数数组：
+         * EVAL <script> <numkeys> <key1> ... <keyN> <arg1> ... <argN> */
         argv2 = zmalloc(sizeof(sds)*(argc+3));
         argv2[0] = sdsnew("EVAL");
         argv2[1] = script;
         for (j = 0; j < argc; j++) {
             if (!got_comma && argv[j][0] == ',' && argv[j][1] == 0) {
+                /* ',' 分隔 KEYS 和 ARGV */
                 got_comma = 1;
                 continue;
             }
@@ -3688,70 +3775,68 @@ static int evalMode(int argc, char **argv) {
         }
         argv2[2] = sdscatprintf(sdsempty(),"%d",keys);
 
-        /* Call it */
-        int eval_ldb = config.eval_ldb; /* Save it, may be reverted. */
+        /* 执行 EVAL */
+        int eval_ldb = config.eval_ldb; /* 保存当前调试状态，可能被改写 */
         retval = issueCommand(argc+3-got_comma, argv2);
         if (eval_ldb) {
             if (!config.eval_ldb) {
-                /* If the debugging session ended immediately, there was an
-                 * error compiling the script. Show it and they don't enter
-                 * the REPL at all. */
+                /* 调试会话立即结束说明脚本编译出错，
+                 * 直接显示错误并不进入 REPL。 */
                 printf("Eval debugging session can't start:\n");
                 cliReadReply(0);
-                break; /* Return to the caller. */
+                break; /* 返回调用方 */
             } else {
                 strncpy(config.prompt,"lua debugger> ",sizeof(config.prompt));
                 repl();
-                /* Restart the session if repl() returned. */
+                /* 若 repl() 返回则重启会话 */
                 cliConnect(CC_FORCE);
                 printf("\n");
             }
         } else {
-            break; /* Return to the caller. */
+            break; /* 返回调用方 */
         }
     }
     return retval == REDIS_OK ? 0 : 1;
 }
 
 /*------------------------------------------------------------------------------
- * Cluster Manager
+ * Cluster Manager — 集群管理子系统
  *--------------------------------------------------------------------------- */
 
-/* The Cluster Manager global structure */
+/* 集群管理器全局状态 */
 static struct clusterManager {
-    list *nodes;    /* List of nodes in the configuration. */
+    list *nodes;    /* 配置中的节点列表 */
     list *errors;
-    int unreachable_masters;    /* Masters we are not able to reach. */
+    int unreachable_masters;    /* 不可达的主节点数 */
 } cluster_manager;
 
-/* Used by clusterManagerFixSlotsCoverage */
+/* clusterManagerFixSlotsCoverage 使用的全局变量 */
 dict *clusterManagerUncoveredSlots = NULL;
 
+/* 集群管理节点结构 */
 typedef struct clusterManagerNode {
     redisContext *context;
     sds name;
     char *ip;
     int port;
-    int bus_port; /* cluster-port */
+    int bus_port; /* 集群总线端口 */
     uint64_t current_epoch;
     time_t ping_sent;
     time_t ping_recv;
     int flags;
-    list *flags_str; /* Flags string representations */
-    sds replicate;  /* Master ID if node is a slave */
-    int dirty;      /* Node has changes that can be flushed */
+    list *flags_str; /* 标志的字符串形式 */
+    sds replicate;  /* 若为从节点则为主节点 ID */
+    int dirty;      /* 节点有尚未刷新的修改 */
     uint8_t slots[CLUSTER_MANAGER_SLOTS];
     int slots_count;
     int replicas_count;
     list *friends;
-    sds *migrating; /* An array of sds where even strings are slots and odd
-                     * strings are the destination node IDs. */
-    sds *importing; /* An array of sds where even strings are slots and odd
-                     * strings are the source node IDs. */
-    int migrating_count; /* Length of the migrating array (migrating slots*2) */
-    int importing_count; /* Length of the importing array (importing slots*2) */
-    float weight;   /* Weight used by rebalance */
-    int balance;    /* Used by rebalance */
+    sds *migrating; /* sds 数组，偶数下标是槽位、奇数下标是目标节点 ID */
+    sds *importing; /* sds 数组，偶数下标是槽位、奇数下标是源节点 ID */
+    int migrating_count; /* migrating 数组长度（迁移槽位数 × 2） */
+    int importing_count; /* importing 数组长度（导入槽位数 × 2） */
+    float weight;   /* rebalance 使用的权重 */
+    int balance;    /* rebalance 内部使用 */
 } clusterManagerNode;
 
 /* Data structure used to represent a sequence of cluster nodes. */
@@ -3957,6 +4042,7 @@ static clusterManagerCommandProc *validateClusterManagerCommand(void) {
     return proc;
 }
 
+/* 解析形如 ip:port[@bus_port] 的集群节点地址 */
 static int parseClusterNodeAddress(char *addr, char **ip_ptr, int *port_ptr,
                                    int *bus_port_ptr)
 {
@@ -3976,12 +4062,10 @@ static int parseClusterNodeAddress(char *addr, char **ip_ptr, int *port_ptr,
     return 1;
 }
 
-/* Get host ip and port from command arguments. If only one argument has
- * been provided it must be in the form of 'ip:port', elsewhere
- * the first argument must be the ip and the second one the port.
- * If host and port can be detected, it returns 1 and it stores host and
- * port into variables referenced by 'ip_ptr' and 'port_ptr' pointers,
- * elsewhere it returns 0. */
+/* 从命令行参数中解析主机 IP 和端口。
+ * 若仅提供一个参数，则必须是 ip:port 格式；
+ * 否则第一个参数为 IP，第二个参数为端口。
+ * 解析成功返回 1 并通过 ip_ptr/port_ptr 输出；失败返回 0。 */
 static int getClusterHostFromCmdArgs(int argc, char **argv,
                                      char **ip_ptr, int *port_ptr) {
     int port = 0;
@@ -4001,6 +4085,7 @@ static int getClusterHostFromCmdArgs(int argc, char **argv,
     return 1;
 }
 
+/* 释放节点 flags 链表 */
 static void freeClusterManagerNodeFlags(list *flags) {
     listIter li;
     listNode *ln;
@@ -4012,6 +4097,7 @@ static void freeClusterManagerNodeFlags(list *flags) {
     listRelease(flags);
 }
 
+/* 递归释放集群管理节点及其 friends 子树 */
 static void freeClusterManagerNode(clusterManagerNode *node) {
     if (node->context != NULL) redisFree(node->context);
     if (node->friends != NULL) {
@@ -4045,6 +4131,7 @@ static void freeClusterManagerNode(clusterManagerNode *node) {
     zfree(node);
 }
 
+/* 释放整个集群管理器全局状态 */
 static void freeClusterManager(void) {
     listIter li;
     listNode *ln;
@@ -4070,14 +4157,15 @@ static void freeClusterManager(void) {
         dictRelease(clusterManagerUncoveredSlots);
 }
 
+/* 创建一个新的集群节点对象（默认值） */
 static clusterManagerNode *clusterManagerNewNode(char *ip, int port, int bus_port) {
     clusterManagerNode *node = zmalloc(sizeof(*node));
     node->context = NULL;
     node->name = NULL;
     node->ip = ip;
     node->port = port;
-    /* We don't need to know the bus_port, at this point this value may be wrong.
-     * If it is used, it will be corrected in clusterManagerLoadInfoFromNode. */
+    /* 此时 bus_port 可能不正确，若被使用会在 clusterManagerLoadInfoFromNode
+     * 中被纠正。 */
     node->bus_port = bus_port ? bus_port : port + CLUSTER_MANAGER_PORT_INCR;
     node->current_epoch = 0;
     node->ping_sent = 0;
@@ -4098,6 +4186,7 @@ static clusterManagerNode *clusterManagerNewNode(char *ip, int port, int bus_por
     return node;
 }
 
+/* 构造集群节点 RDB 备份文件的完整路径 */
 static sds clusterManagerGetNodeRDBFilename(clusterManagerNode *node) {
     assert(config.cluster_manager_command.backup_dir);
     sds filename = sdsnew(config.cluster_manager_command.backup_dir);
@@ -4108,10 +4197,9 @@ static sds clusterManagerGetNodeRDBFilename(clusterManagerNode *node) {
     return filename;
 }
 
-/* Check whether reply is NULL or its type is REDIS_REPLY_ERROR. In the
- * latest case, if the 'err' arg is not NULL, it gets allocated with a copy
- * of reply error (it's up to the caller function to free it), elsewhere
- * the error is directly printed. */
+/* 检查 reply 是否为 NULL 或 REDIS_REPLY_ERROR。
+ * 若为错误且 err 不为 NULL，则将错误字符串复制到 err（由调用方释放）；
+ * 否则直接打印错误。 */
 static int clusterManagerCheckRedisReply(clusterManagerNode *n,
                                          redisReply *r, char **err)
 {
@@ -4128,7 +4216,7 @@ static int clusterManagerCheckRedisReply(clusterManagerNode *n,
     return 1;
 }
 
-/* Call MULTI command on a cluster node. */
+/* 在指定集群节点上执行 MULTI 命令，开启事务 */
 static int clusterManagerStartTransaction(clusterManagerNode *node) {
     redisReply *reply = CLUSTER_MANAGER_COMMAND(node, "MULTI");
     int success = clusterManagerCheckRedisReply(node, reply, NULL);
@@ -4136,7 +4224,7 @@ static int clusterManagerStartTransaction(clusterManagerNode *node) {
     return success;
 }
 
-/* Call EXEC command on a cluster node. */
+/* 在指定集群节点上执行 EXEC 命令，提交事务 */
 static int clusterManagerExecTransaction(clusterManagerNode *node,
                                          clusterManagerOnReplyError onerror)
 {
@@ -4166,6 +4254,7 @@ cleanup:
     return success;
 }
 
+/* 建立到指定集群节点的 Redis 连接（含 TLS 与 AUTH） */
 static int clusterManagerNodeConnect(clusterManagerNode *node) {
     if (node->context) redisFree(node->context);
     node->context = redisConnectWrapper(node->ip, node->port, config.connect_timeout);
@@ -4186,10 +4275,8 @@ static int clusterManagerNodeConnect(clusterManagerNode *node) {
         node->context = NULL;
         return 0;
     }
-    /* Set aggressive KEEP_ALIVE socket option in the Redis context socket
-     * in order to prevent timeouts caused by the execution of long
-     * commands. At the same time this improves the detection of real
-     * errors. */
+    /* 在 Redis 上下文套接字上设置激进的 KEEP_ALIVE 选项，
+     * 以避免长命令执行超时，也有助于及时发现真实错误。 */
     anetKeepAlive(NULL, node->context->fd, REDIS_CLI_KEEPALIVE_INTERVAL);
     if (config.conn_info.auth) {
         redisReply *reply;
@@ -4205,6 +4292,7 @@ static int clusterManagerNodeConnect(clusterManagerNode *node) {
     return 1;
 }
 
+/* 从链表中移除指定节点 */
 static void clusterManagerRemoveNodeFromList(list *nodelist,
                                              clusterManagerNode *node) {
     listIter li;
@@ -4218,7 +4306,7 @@ static void clusterManagerRemoveNodeFromList(list *nodelist,
     }
 }
 
-/* Return the node with the specified name (ID) or NULL. */
+/* 按完整名称（节点 ID）查找节点；未找到返回 NULL */
 static clusterManagerNode *clusterManagerNodeByName(const char *name) {
     if (cluster_manager.nodes == NULL) return NULL;
     clusterManagerNode *found = NULL;
@@ -4239,10 +4327,8 @@ static clusterManagerNode *clusterManagerNodeByName(const char *name) {
     return found;
 }
 
-/* Like clusterManagerNodeByName but the specified name can be just the first
- * part of the node ID as long as the prefix in unique across the
- * cluster.
- */
+/* 类似 clusterManagerNodeByName，但允许使用节点 ID 的前缀，
+ * 只要该前缀在集群中唯一。 */
 static clusterManagerNode *clusterManagerNodeByAbbreviatedName(const char*name)
 {
     if (cluster_manager.nodes == NULL) return NULL;
@@ -4265,12 +4351,13 @@ static clusterManagerNode *clusterManagerNodeByAbbreviatedName(const char*name)
     return found;
 }
 
+/* 重置节点的槽位数组与计数 */
 static void clusterManagerNodeResetSlots(clusterManagerNode *node) {
     memset(node->slots, 0, sizeof(node->slots));
     node->slots_count = 0;
 }
 
-/* Call "INFO" redis command on the specified node and return the reply. */
+/* 在指定节点上执行 INFO 命令并返回 reply */
 static redisReply *clusterManagerGetNodeRedisInfo(clusterManagerNode *node,
                                                   char **err)
 {
@@ -4288,6 +4375,7 @@ static redisReply *clusterManagerGetNodeRedisInfo(clusterManagerNode *node,
     return info;
 }
 
+/* 判断指定节点是否启用了集群模式 */
 static int clusterManagerNodeIsCluster(clusterManagerNode *node, char **err) {
     redisReply *info = clusterManagerGetNodeRedisInfo(node, err);
     if (info == NULL) return 0;
@@ -4296,8 +4384,7 @@ static int clusterManagerNodeIsCluster(clusterManagerNode *node, char **err) {
     return is_cluster;
 }
 
-/* Checks whether the node is empty. Node is considered not-empty if it has
- * some key or if it already knows other nodes */
+/* 检查节点是否为空：节点有任何 key 或已知其他节点都视为非空 */
 static int clusterManagerNodeIsEmpty(clusterManagerNode *node, char **err) {
     redisReply *info = clusterManagerGetNodeRedisInfo(node, err);
     int is_empty = 1;
@@ -4359,9 +4446,8 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
         *offending = zcalloc(node_len * sizeof(clusterManagerNode*));
         offending_p = *offending;
     }
-    /* For each set of nodes in the same host, split by
-     * related nodes (masters and slaves which are involved in
-     * replication of each other) */
+    /* 对同一主机内的每组节点，按相关节点（互相复制的
+     * 主从节点）分组计算。 */
     for (i = 0; i < ip_count; i++) {
         clusterManagerNodeArray *node_array = &(ipnodes[i]);
         dict *related = dictCreate(&clusterManagerDictType);
@@ -4371,14 +4457,13 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
             if (node == NULL) continue;
             if (!ip) ip = node->ip;
             sds types;
-            /* We always use the Master ID as key. */
+            /* 始终使用主节点 ID 作为 key */
             sds key = (!node->replicate ? node->name : node->replicate);
             assert(key != NULL);
             dictEntry *entry = dictFind(related, key);
             if (entry) types = sdsdup((sds) dictGetVal(entry));
             else types = sdsempty();
-            /* Master type 'm' is always set as the first character of the
-             * types string. */
+            /* 主节点类型 'm' 总是作为 types 字符串的第一个字符 */
             if (node->replicate) types = sdscat(types, "s");
             else {
                 sds s = sdscatsds(sdsnew("m"), types);
@@ -4387,8 +4472,7 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
             }
             dictReplace(related, key, types);
         }
-        /* Now it's trivial to check, for each related group having the
-         * same host, what is their local score. */
+        /* 现在很容易为同一主机的每个相关组计算本地得分 */
         dictIterator *iter = dictGetIterator(related);
         dictEntry *entry;
         while ((entry = dictNext(iter)) != NULL) {
@@ -4399,7 +4483,7 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
             if (types[0] == 'm') score += (10000 * (typeslen - 1));
             else score += (1 * typeslen);
             if (offending == NULL) continue;
-            /* Populate the list of offending nodes. */
+            /* 填充违规节点列表 */
             listIter li;
             listNode *ln;
             listRewind(cluster_manager.nodes, &li);
@@ -4420,6 +4504,7 @@ static int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
     return score;
 }
 
+/* 通过随机交换主从关系优化 anti-affinity 评分 */
 static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
     int ip_count)
 {
@@ -4430,7 +4515,7 @@ static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
     clusterManagerLogInfo(">>> Trying to optimize slaves allocation "
                           "for anti-affinity\n");
     int node_len = cluster_manager.nodes->len;
-    int maxiter = 500 * node_len; // Effort is proportional to cluster size...
+    int maxiter = 500 * node_len; // 迭代次数与集群规模成正比
     srand(time(NULL));
     while (maxiter > 0) {
         int offending_len = 0;
@@ -4442,10 +4527,9 @@ static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
                                                    ip_count,
                                                    &offenders,
                                                    &offending_len);
-        if (score == 0 || offending_len == 0) break; // Optimal anti affinity reached
-        /* We'll try to randomly swap a slave's assigned master causing
-         * an affinity problem with another random slave, to see if we
-         * can improve the affinity. */
+        if (score == 0 || offending_len == 0) break; // 已达到最佳 anti-affinity
+        /* 尝试随机交换一个造成亲和性问题的从节点的主节点，
+         * 看看是否能改善亲和性。 */
         int rand_idx = rand() % offending_len;
         clusterManagerNode *first = offenders[rand_idx],
                            *second = NULL;
@@ -4473,9 +4557,8 @@ static void clusterManagerOptimizeAntiAffinity(clusterManagerNodeArray *ipnodes,
         int new_score = clusterManagerGetAntiAffinityScore(ipnodes,
                                                            ip_count,
                                                            NULL, NULL);
-        /* If the change actually makes thing worse, revert. Otherwise
-         * leave as it is because the best solution may need a few
-         * combined swaps. */
+        /* 若变更使情况变差则回滚；否则保留，因为最优解
+         * 可能需要多次组合交换。 */
         if (new_score > score) {
             first->replicate = first_master;
             second->replicate = second_master;
@@ -4498,7 +4581,7 @@ cleanup:
     zfree(offenders);
 }
 
-/* Return a representable string of the node's flags */
+/* 返回节点 flags 的字符串表示 */
 static sds clusterManagerNodeFlagString(clusterManagerNode *node) {
     sds flags = sdsempty();
     if (!node->flags_str) return flags;
@@ -4516,7 +4599,7 @@ static sds clusterManagerNodeFlagString(clusterManagerNode *node) {
     return flags;
 }
 
-/* Return a representable string of the node's slots */
+/* 返回节点槽位的字符串表示（如 [0-3,5,7-10]） */
 static sds clusterManagerNodeSlotsString(clusterManagerNode *node) {
     sds slots = sdsempty();
     int first_range_idx = -1, last_slot_idx = -1, i;
@@ -4622,15 +4705,15 @@ static sds clusterManagerNodeGetJSON(clusterManagerNode *node,
 
 
 /* -----------------------------------------------------------------------------
- * Key space handling
+ * Key space handling — 键空间处理（CRC16 与 hash slot 计算）
  * -------------------------------------------------------------------------- */
 
-/* We have 16384 hash slots. The hash slot of a given key is obtained
- * as the least significant 14 bits of the crc16 of the key.
+/* 共有 16384 个哈希槽。key 的 hash slot 由 key 的
+ * crc16 的低 14 位计算得到。
  *
- * However if the key contains the {...} pattern, only the part between
- * { and } is hashed. This may be useful in the future to force certain
- * keys to be in the same node (assuming no resharding is in progress). */
+ * 若 key 包含 {...} 模式，则只对 {} 之间的部分计算哈希。
+ * 该规则未来可用于强制某些 key 位于同一节点
+ * （前提是没有 reshard 进行中）。 */
 static unsigned int clusterManagerKeyHashSlot(char *key, int keylen) {
     int s, e; /* start-end indexes of { and } */
 
@@ -4652,7 +4735,7 @@ static unsigned int clusterManagerKeyHashSlot(char *key, int keylen) {
     return crc16(key+s+1,e-s-1) & 0x3FFF;
 }
 
-/* Return a string representation of the cluster node. */
+/* 返回集群节点的字符串表示 */
 static sds clusterManagerNodeInfo(clusterManagerNode *node, int indent) {
     sds info = sdsempty();
     sds spaces = sdsempty();
@@ -4745,13 +4828,13 @@ static void clusterManagerShowClusterInfo(void) {
     printf("%.2f keys per slot on average.\n", keys_per_slot);
 }
 
-/* Flush dirty slots configuration of the node by calling CLUSTER ADDSLOTS */
+/* 通过执行 CLUSTER ADDSLOTS 将节点的脏槽位配置刷到服务器 */
 static int clusterManagerAddSlots(clusterManagerNode *node, char**err)
 {
     redisReply *reply = NULL;
     void *_reply = NULL;
     int success = 1;
-    /* First two args are used for the command itself. */
+    /* 前两个参数为命令本身 */
     int argc = node->slots_count + 2;
     sds *argv = zmalloc(argc * sizeof(*argv));
     size_t *argvlen = zmalloc(argc * sizeof(*argvlen));
@@ -4790,10 +4873,9 @@ cleanup:
     return success;
 }
 
-/* Get the node the slot is assigned to from the point of view of node *n.
- * If the slot is unassigned or if the reply is an error, return NULL.
- * Use the **err argument in order to check whether the slot is unassigned
- * or the reply resulted in an error. */
+/* 从节点 *n 的视角获取槽位的拥有者节点。
+ * 若槽位未分配或回复为错误则返回 NULL。
+ * 可通过 **err 区分槽位未分配与回复错误。 */
 static clusterManagerNode *clusterManagerGetSlotOwner(clusterManagerNode *n,
                                                       int slot, char **err)
 {
@@ -4839,7 +4921,7 @@ static clusterManagerNode *clusterManagerGetSlotOwner(clusterManagerNode *n,
     return owner;
 }
 
-/* Set slot status to "importing" or "migrating" */
+/* 设置槽位状态为 "importing" 或 "migrating" */
 static int clusterManagerSetSlot(clusterManagerNode *node1,
                                  clusterManagerNode *node2,
                                  int slot, const char *status, char **err) {
@@ -4866,6 +4948,7 @@ cleanup:
     return success;
 }
 
+/* 将槽位状态清除为 STABLE */
 static int clusterManagerClearSlotStatus(clusterManagerNode *node, int slot) {
     redisReply *reply = CLUSTER_MANAGER_COMMAND(node,
         "CLUSTER SETSLOT %d %s", slot, "STABLE");
@@ -4874,6 +4957,7 @@ static int clusterManagerClearSlotStatus(clusterManagerNode *node, int slot) {
     return success;
 }
 
+/* 删除节点上的指定槽位分配；ignore_unassigned_err 为 1 时忽略未分配错误 */
 static int clusterManagerDelSlot(clusterManagerNode *node, int slot,
                                  int ignore_unassigned_err)
 {
@@ -4903,6 +4987,7 @@ static int clusterManagerDelSlot(clusterManagerNode *node, int slot,
     return success;
 }
 
+/* 在节点上添加单个槽位 */
 static int clusterManagerAddSlot(clusterManagerNode *node, int slot) {
     redisReply *reply = CLUSTER_MANAGER_COMMAND(node,
         "CLUSTER ADDSLOTS %d", slot);
@@ -4911,6 +4996,7 @@ static int clusterManagerAddSlot(clusterManagerNode *node, int slot) {
     return success;
 }
 
+/* 查询节点指定槽位中的 key 数量 */
 static signed int clusterManagerCountKeysInSlot(clusterManagerNode *node,
                                                 int slot)
 {
@@ -4923,6 +5009,7 @@ static signed int clusterManagerCountKeysInSlot(clusterManagerNode *node,
     return count;
 }
 
+/* 在节点上执行 CLUSTER BUMPEPOCH，提升集群 epoch */
 static int clusterManagerBumpEpoch(clusterManagerNode *node) {
     redisReply *reply = CLUSTER_MANAGER_COMMAND(node, "CLUSTER BUMPEPOCH");
     int success = clusterManagerCheckRedisReply(node, reply, NULL);
@@ -4930,27 +5017,27 @@ static int clusterManagerBumpEpoch(clusterManagerNode *node) {
     return success;
 }
 
-/* Callback used by clusterManagerSetSlotOwner transaction. It should ignore
- * errors except for ADDSLOTS errors.
- * Return 1 if the error should be ignored. */
+/* clusterManagerSetSlotOwner 事务使用的回调：仅忽略
+ * 非 ADDSLOTS 错误。返回 1 表示应忽略该错误。 */
 static int clusterManagerOnSetOwnerErr(redisReply *reply,
     clusterManagerNode *n, int bulk_idx)
 {
     UNUSED(reply);
     UNUSED(n);
-    /* Only raise error when ADDSLOTS fail (bulk_idx == 1). */
+    /* 仅当 ADDSLOTS 失败（bulk_idx == 1）时上报错误 */
     return (bulk_idx != 1);
 }
 
+/* 在事务中把槽位所有权赋予指定 owner */
 static int clusterManagerSetSlotOwner(clusterManagerNode *owner,
                                       int slot,
                                       int do_clear)
 {
     int success = clusterManagerStartTransaction(owner);
     if (!success) return 0;
-    /* Ensure the slot is not already assigned. */
+    /* 确保槽位当前未被分配 */
     clusterManagerDelSlot(owner, slot, 1);
-    /* Add the slot and bump epoch. */
+    /* 添加槽位并 bump epoch */
     clusterManagerAddSlot(owner, slot);
     if (do_clear) clusterManagerClearSlotStatus(owner, slot);
     clusterManagerBumpEpoch(owner);
@@ -4958,11 +5045,9 @@ static int clusterManagerSetSlotOwner(clusterManagerNode *owner,
     return success;
 }
 
-/* Get the hash for the values of the specified keys in *keys_reply for the
- * specified nodes *n1 and *n2, by calling DEBUG DIGEST-VALUE redis command
- * on both nodes. Every key with same name on both nodes but having different
- * values will be added to the *diffs list. Return 0 in case of reply
- * error. */
+/* 在两个节点 n1、n2 上通过 DEBUG DIGEST-VALUE 命令对 keys_reply 中
+ * 指定 key 的值进行哈希计算。两个节点上同名但哈希不同的 key
+ * 会被加入 *diffs 列表。reply 出错时返回 0。 */
 static int clusterManagerCompareKeysValues(clusterManagerNode *n1,
                                           clusterManagerNode *n2,
                                           redisReply *keys_reply,
@@ -5022,9 +5107,8 @@ cleanup:
     return success;
 }
 
-/* Migrate keys taken from reply->elements. It returns the reply from the
- * MIGRATE command, or NULL if something goes wrong. If the argument 'dots'
- * is not NULL, a dot will be printed for every migrated key. */
+/* 迁移 reply->elements 中的所有 key。返回 MIGRATE 命令的 reply，
+ * 出错则返回 NULL。若 'dots' 不为 NULL，则每迁移一个 key 打印一个点。 */
 static redisReply *clusterManagerMigrateKeysInReply(clusterManagerNode *source,
                                                     clusterManagerNode *target,
                                                     redisReply *reply,
@@ -5107,7 +5191,7 @@ cleanup:
     return migrate_reply;
 }
 
-/* Migrate all keys in the given slot from source to target.*/
+/* 将指定槽位内的所有 key 从 source 迁移到 target */
 static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
                                            clusterManagerNode *target,
                                            int slot, int timeout,
@@ -5265,15 +5349,14 @@ next:
     return success;
 }
 
-/* Move slots between source and target nodes using MIGRATE.
+/* 通过 MIGRATE 在 source 和 target 之间迁移槽位。
  *
- * Options:
- * CLUSTER_MANAGER_OPT_VERBOSE -- Print a dot for every moved key.
- * CLUSTER_MANAGER_OPT_COLD    -- Move keys without opening slots /
- *                                reconfiguring the nodes.
- * CLUSTER_MANAGER_OPT_UPDATE  -- Update node->slots for source/target nodes.
- * CLUSTER_MANAGER_OPT_QUIET   -- Don't print info messages.
-*/
+ * 选项：
+ * CLUSTER_MANAGER_OPT_VERBOSE -- 每迁移一个 key 打印一个点。
+ * CLUSTER_MANAGER_OPT_COLD    -- 迁移 key 但不打开槽位 / 不重新配置节点。
+ * CLUSTER_MANAGER_OPT_UPDATE  -- 更新 source/target 节点的 slots。
+ * CLUSTER_MANAGER_OPT_QUIET   -- 不打印信息消息。
+ */
 static int clusterManagerMoveSlot(clusterManagerNode *source,
                                   clusterManagerNode *target,
                                   int slot, int opts,  char**err)
@@ -5347,8 +5430,7 @@ static int clusterManagerMoveSlot(clusterManagerNode *source,
     return 1;
 }
 
-/* Flush the dirty node configuration by calling replicate for slaves or
- * adding the slots defined in the masters. */
+/* 通过 REPLICATE 或 ADDSLOTS 把节点的脏配置刷到服务器 */
 static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err) {
     if (!node->dirty) return 0;
     redisReply *reply = NULL;
@@ -5379,7 +5461,7 @@ cleanup:
     return success;
 }
 
-/* Wait until the cluster configuration is consistent. */
+/* 阻塞等待集群配置达到一致状态 */
 static void clusterManagerWaitForClusterJoin(void) {
     printf("Waiting for the cluster to join\n");
     int counter = 0,
@@ -5435,11 +5517,10 @@ static void clusterManagerWaitForClusterJoin(void) {
     printf("\n");
 }
 
-/* Load node's cluster configuration by calling "CLUSTER NODES" command.
- * Node's configuration (name, replicate, slots, ...) is then updated.
- * If CLUSTER_MANAGER_OPT_GETFRIENDS flag is set into 'opts' argument,
- * and node already knows other nodes, the node's friends list is populated
- * with the other nodes info. */
+/* 通过执行 CLUSTER NODES 命令加载节点的集群配置，并据此更新
+ * node 的 name、replicate、slots 等信息。
+ * 若 'opts' 设置了 CLUSTER_MANAGER_OPT_GETFRIENDS，且节点已知
+ * 其他节点，则会把其他节点信息填充到 node 的 friends 列表。 */
 static int clusterManagerNodeLoadInfo(clusterManagerNode *node, int opts,
                                       char **err)
 {
@@ -5612,10 +5693,9 @@ cleanup:
     return success;
 }
 
-/* Retrieves info about the cluster using argument 'node' as the starting
- * point. All nodes will be loaded inside the cluster_manager.nodes list.
- * Warning: if something goes wrong, it will free the starting node before
- * returning 0. */
+/* 以 'node' 为起点加载集群信息，所有节点会被加入
+ * cluster_manager.nodes 列表。
+ * 注意：若出错，会在返回 0 前释放起始节点。 */
 static int clusterManagerLoadInfoFromNode(clusterManagerNode *node) {
     if (node->context == NULL && !clusterManagerNodeConnect(node)) {
         freeClusterManagerNode(node);
@@ -5694,7 +5774,7 @@ invalid_friend:
     return 1;
 }
 
-/* Compare functions used by various sorting operations. */
+/* 各种排序操作所用的比较函数 */
 int clusterManagerSlotCompare(const void *slot1, const void *slot2) {
     const char **i1 = (const char **)slot1;
     const char **i2 = (const char **)slot2;
@@ -5877,9 +5957,8 @@ cleanup:
     return links;
 }
 
-/* Check for disconnected cluster links. It returns a dict whose keys
- * are the unreachable node addresses and the values are lists of
- * node addresses that cannot reach the unreachable node. */
+/* 检查集群中断开的链路。返回的字典 key 是不可达节点地址，
+ * value 是无法到达该节点的其他节点地址列表。 */
 static dict *clusterManagerGetLinkStatus(void) {
     if (cluster_manager.nodes == NULL) return NULL;
     dict *status = dictCreate(&clusterManagerLinkDictType);
@@ -5915,7 +5994,7 @@ static dict *clusterManagerGetLinkStatus(void) {
     return status;
 }
 
-/* Add the error string to cluster_manager.errors and print it. */
+/* 将错误信息添加到 cluster_manager.errors 并打印 */
 static void clusterManagerOnError(sds err) {
     if (cluster_manager.errors == NULL)
         cluster_manager.errors = listCreate();
@@ -5923,9 +6002,8 @@ static void clusterManagerOnError(sds err) {
     clusterManagerLogErr("%s\n", (char *) err);
 }
 
-/* Check the slots coverage of the cluster. The 'all_slots' argument must be
- * and array of 16384 bytes. Every covered slot will be set to 1 in the
- * 'all_slots' array. The function returns the total number if covered slots.*/
+/* 检查集群的槽位覆盖情况。'all_slots' 必须是长度为 16384 的数组。
+ * 已覆盖的槽位会被置 1，函数返回已覆盖槽位的总数。 */
 static int clusterManagerGetCoveredSlots(char *all_slots) {
     if (cluster_manager.nodes == NULL) return 0;
     listIter li;
@@ -5959,8 +6037,7 @@ static void clusterManagerPrintSlotsList(list *slots) {
     sdsfree(nodeslist);
 }
 
-/* Return the node, among 'nodes' with the greatest number of keys
- * in the specified slot. */
+/* 在 'nodes' 列表中返回指定槽位内 key 数最多的节点 */
 static clusterManagerNode * clusterManagerGetNodeWithMostKeysInSlot(list *nodes,
                                                                     int slot,
                                                                     char **err)
@@ -5996,9 +6073,8 @@ static clusterManagerNode * clusterManagerGetNodeWithMostKeysInSlot(list *nodes,
     return node;
 }
 
-/* This function returns the master that has the least number of replicas
- * in the cluster. If there are multiple masters with the same smaller
- * number of replicas, one at random is returned. */
+/* 返回集群中副本数最少的主节点。
+ * 若有多个主节点副本数相同则随机返回一个。 */
 
 static clusterManagerNode *clusterManagerNodeWithLeastReplicas(void) {
     clusterManagerNode *node = NULL;
@@ -6017,7 +6093,7 @@ static clusterManagerNode *clusterManagerNodeWithLeastReplicas(void) {
     return node;
 }
 
-/* This function returns a random master node, return NULL if none */
+/* 随机返回一个主节点；若不存在则返回 NULL */
 
 static clusterManagerNode *clusterManagerNodeMasterRandom(void) {
     int master_count = 0;
@@ -6245,9 +6321,8 @@ cleanup:
     return fixed;
 }
 
-/* Slot 'slot' was found to be in importing or migrating state in one or
- * more nodes. This function fixes this condition by migrating keys where
- * it seems more sensible. */
+/* 槽位 'slot' 在某些节点上被发现处于 importing 或 migrating 状态。
+ * 该函数通过在合理位置迁移 key 来修复此状态。 */
 static int clusterManagerFixOpenSlot(int slot) {
     int force_fix = config.cluster_manager_command.flags &
                     CLUSTER_MANAGER_CMD_FLAG_FIX_WITH_UNREACHABLE_MASTERS;
@@ -6580,6 +6655,7 @@ cleanup:
     return success;
 }
 
+/* 修复指定槽位存在多个 owner 的情况 */
 static int clusterManagerFixMultipleSlotOwners(int slot, list *owners) {
     clusterManagerLogInfo(">>> Fixing multiple owners for slot %d...\n", slot);
     int success = 0;
@@ -6590,14 +6666,13 @@ static int clusterManagerFixMultipleSlotOwners(int slot, list *owners) {
     if (!owner) owner = listFirst(owners)->value;
     clusterManagerLogInfo(">>> Setting slot %d owner: %s:%d\n",
                           slot, owner->ip, owner->port);
-    /* Set the slot owner. */
+    /* 设置槽位 owner */
     if (!clusterManagerSetSlotOwner(owner, slot, 0)) return 0;
     listIter li;
     listNode *ln;
     listRewind(cluster_manager.nodes, &li);
-    /* Update configuration in all the other master nodes by assigning the slot
-     * itself to the new owner, and by eventually migrating keys if the node
-     * has keys for the slot. */
+    /* 更新其他主节点上的配置：将槽位分配给新 owner，
+     * 若节点拥有该槽位的 key，则迁移这些 key。 */
     while ((ln = listNext(&li)) != NULL) {
         clusterManagerNode *n = ln->value;
         if (n == owner) continue;
@@ -6617,6 +6692,7 @@ static int clusterManagerFixMultipleSlotOwners(int slot, list *owners) {
     return success;
 }
 
+/* 检查集群一致性：节点视图、开放槽位、覆盖情况、多 owner 等 */
 static int clusterManagerCheckCluster(int quiet) {
     listNode *ln = listFirst(cluster_manager.nodes);
     if (!ln) return 0;
@@ -6781,6 +6857,7 @@ static int clusterManagerCheckCluster(int quiet) {
     return result;
 }
 
+/* 根据 ID 获取 reshard 源/目标节点，并校验其有效性 */
 static clusterManagerNode *clusterNodeForResharding(char *id,
                                                     clusterManagerNode *target,
                                                     int *raise_err)
@@ -6805,6 +6882,7 @@ static clusterManagerNode *clusterNodeForResharding(char *id,
     return node;
 }
 
+/* 计算 reshard 表：根据源节点列表和要迁移的槽位数生成迁移条目 */
 static list *clusterManagerComputeReshardTable(list *sources, int numslots) {
     list *moved = listCreate();
     int src_count = listLength(sources), i = 0, tot_slots = 0, j;
@@ -6840,6 +6918,7 @@ static list *clusterManagerComputeReshardTable(list *sources, int numslots) {
     return moved;
 }
 
+/* 显示 reshard 表的内容 */
 static void clusterManagerShowReshardTable(list *table) {
     listIter li;
     listNode *ln;
@@ -6851,6 +6930,7 @@ static void clusterManagerShowReshardTable(list *table) {
     }
 }
 
+/* 释放 reshard 表 */
 static void clusterManagerReleaseReshardTable(list *table) {
     if (table != NULL) {
         listIter li;
@@ -6864,6 +6944,7 @@ static void clusterManagerReleaseReshardTable(list *table) {
     }
 }
 
+/* 集群管理器日志输出函数，根据 level 与颜色标志输出带颜色的日志 */
 static void clusterManagerLog(int level, const char* fmt, ...) {
     int use_colors =
         (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_COLOR);
@@ -6950,7 +7031,7 @@ static void clusterManagerPrintNotClusterNodeError(clusterManagerNode *node,
     clusterManagerLogErr("[ERR] Node %s:%d %s\n", node->ip, node->port, msg);
 }
 
-/* Execute redis-cli in Cluster Manager mode */
+/* 以 Cluster Manager 模式执行 redis-cli */
 static void clusterManagerMode(clusterManagerCommandProc *proc) {
     int argc = config.cluster_manager_command.argc;
     char **argv = config.cluster_manager_command.argv;
@@ -6969,8 +7050,9 @@ static void clusterManagerMode(clusterManagerCommandProc *proc) {
     exit(success ? 0 : 1);
 }
 
-/* Cluster Manager Commands */
+/* 集群管理命令集合 */
 
+/* 创建集群（--cluster create） */
 static int clusterManagerCommandCreate(int argc, char **argv) {
     int i, j, success = 1;
     cluster_manager.nodes = listCreate();
@@ -7267,6 +7349,7 @@ cleanup:
     return success;
 }
 
+/* 添加节点（--cluster add-node） */
 static int clusterManagerCommandAddNode(int argc, char **argv) {
     int success = 1;
     redisReply *reply = NULL;
@@ -7425,6 +7508,7 @@ invalid_args:
     return 0;
 }
 
+/* 删除节点（--cluster del-node） */
 static int clusterManagerCommandDeleteNode(int argc, char **argv) {
     UNUSED(argc);
     int success = 1;
@@ -7492,6 +7576,7 @@ invalid_args:
     return 0;
 }
 
+/* 显示集群简要信息（--cluster info） */
 static int clusterManagerCommandInfo(int argc, char **argv) {
     int port = 0;
     char *ip = NULL;
@@ -7505,6 +7590,7 @@ invalid_args:
     return 0;
 }
 
+/* 检查集群（--cluster check） */
 static int clusterManagerCommandCheck(int argc, char **argv) {
     int port = 0;
     char *ip = NULL;
@@ -7518,11 +7604,13 @@ invalid_args:
     return 0;
 }
 
+/* 修复集群（--cluster fix） */
 static int clusterManagerCommandFix(int argc, char **argv) {
     config.cluster_manager_command.flags |= CLUSTER_MANAGER_CMD_FLAG_FIX;
     return clusterManagerCommandCheck(argc, argv);
 }
 
+/* 槽位重新分片（--cluster reshard） */
 static int clusterManagerCommandReshard(int argc, char **argv) {
     int port = 0;
     char *ip = NULL;
@@ -7710,6 +7798,7 @@ invalid_args:
     return 0;
 }
 
+/* 集群槽位再平衡（--cluster rebalance） */
 static int clusterManagerCommandRebalance(int argc, char **argv) {
     int port = 0;
     char *ip = NULL;
@@ -7905,6 +7994,7 @@ invalid_args:
     return 0;
 }
 
+/* 设置集群节点超时（--cluster set-timeout） */
 static int clusterManagerCommandSetTimeout(int argc, char **argv) {
     UNUSED(argc);
     int port = 0;
@@ -7963,6 +8053,7 @@ invalid_args:
     return 0;
 }
 
+/* 从外部 Redis 实例导入数据（--cluster import） */
 static int clusterManagerCommandImport(int argc, char **argv) {
     int success = 1;
     int port = 0, src_port = 0;
@@ -8118,6 +8209,7 @@ invalid_args:
     return 0;
 }
 
+/* 在所有集群节点上执行同一条命令（--cluster call） */
 static int clusterManagerCommandCall(int argc, char **argv) {
     int port = 0, i;
     char *ip = NULL;
@@ -8162,6 +8254,7 @@ invalid_args:
     return 0;
 }
 
+/* 备份集群所有节点的 RDB 与拓扑信息（--cluster backup） */
 static int clusterManagerCommandBackup(int argc, char **argv) {
     UNUSED(argc);
     int success = 1, port = 0;
@@ -8226,6 +8319,7 @@ invalid_args:
     return 0;
 }
 
+/* 打印集群管理命令帮助信息（--cluster help） */
 static int clusterManagerCommandHelp(int argc, char **argv) {
     UNUSED(argc);
     UNUSED(argv);
@@ -8282,9 +8376,10 @@ static int clusterManagerCommandHelp(int argc, char **argv) {
 }
 
 /*------------------------------------------------------------------------------
- * Latency and latency history modes
+ * Latency and latency history modes — 延迟测量与历史模式
  *--------------------------------------------------------------------------- */
 
+/* 按当前输出模式打印延迟统计信息 */
 static void latencyModePrint(long long min, long long max, double avg, long long count) {
     if (config.output == OUTPUT_STANDARD) {
         printf("min: %lld, max: %lld, avg: %.2f (%lld samples)",
@@ -8299,8 +8394,12 @@ static void latencyModePrint(long long min, long long max, double avg, long long
     }
 }
 
-#define LATENCY_SAMPLE_RATE 10 /* milliseconds. */
-#define LATENCY_HISTORY_DEFAULT_INTERVAL 15000 /* milliseconds. */
+/* 延迟采样间隔，单位毫秒 */
+#define LATENCY_SAMPLE_RATE 10
+/* 延迟历史模式默认间隔，单位毫秒 */
+#define LATENCY_HISTORY_DEFAULT_INTERVAL 15000
+
+/* --latency 与 --latency-history 模式主循环 */
 static void latencyMode(void) {
     redisReply *reply;
     long long start, latency, min = 0, max = 0, tot = 0, count = 0;
@@ -8362,29 +8461,30 @@ static void latencyMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Latency distribution mode -- requires 256 colors xterm
+ * Latency distribution mode -- 需要支持 256 色的 xterm
  *--------------------------------------------------------------------------- */
 
-#define LATENCY_DIST_DEFAULT_INTERVAL 1000 /* milliseconds. */
+/* 延迟分布模式默认采样间隔，单位毫秒 */
+#define LATENCY_DIST_DEFAULT_INTERVAL 1000
 
-/* Structure to store samples distribution. */
+/* 用于存储采样分布的结构 */
 struct distsamples {
-    long long max;   /* Max latency to fit into this interval (usec). */
-    long long count; /* Number of samples in this interval. */
-    int character;   /* Associated character in visualization. */
+    long long max;   /* 本区间所能容纳的最大延迟（微秒） */
+    long long count; /* 落入本区间的样本数 */
+    int character;   /* 可视化时对应的字符 */
 };
 
-/* Helper function for latencyDistMode(). Performs the spectrum visualization
- * of the collected samples targeting an xterm 256 terminal.
+/* latencyDistMode() 的辅助函数：以 256 色 xterm 终端可视化
+ * 已收集的样本。
  *
- * Takes an array of distsamples structures, ordered from smaller to bigger
- * 'max' value. Last sample max must be 0, to mean that it holds all the
- * samples greater than the previous one, and is also the stop sentinel.
+ * 接受一个按 max 值从小到大排列的 distsamples 数组。
+ * 最后一项的 max 必须为 0，表示它承接所有大于前一项的样本，
+ * 同时也作为循环终止哨兵。
  *
- * "tot' is the total number of samples in the different buckets, so it
- * is the SUM(samples[i].count) for i to 0 up to the max sample.
+ * 'tot' 是各桶样本数总和，即从 i=0 累加到 max 哨兵之前的
+ * SUM(samples[i].count)。
  *
- * As a side effect the function sets all the buckets count to 0. */
+ * 该函数会将所有桶的 count 重置为 0（副作用）。 */
 void showLatencyDistSamples(struct distsamples *samples, long long tot) {
     int j;
 
@@ -8406,8 +8506,7 @@ void showLatencyDistSamples(struct distsamples *samples, long long tot) {
     fflush(stdout);
 }
 
-/* Show the legend: different buckets values and colors meaning, so
- * that the spectrum is more easily readable. */
+/* 显示图例：不同桶的值与颜色含义，便于阅读频谱 */
 void showLatencyDistLegend(void) {
     int j;
 
@@ -8425,6 +8524,7 @@ void showLatencyDistLegend(void) {
     printf("---------------------------------------------\n");
 }
 
+/* --latency-dist 模式主循环 */
 static void latencyDistMode(void) {
     redisReply *reply;
     long long start, latency, count = 0;
@@ -8504,11 +8604,13 @@ static void latencyDistMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Slave mode
+ * Slave mode — SLAVE/REPLICAOF 模式
  *--------------------------------------------------------------------------- */
 
+/* RDB 流的 EOF 标记字节数 */
 #define RDB_EOF_MARK_SIZE 40
 
+/* 向服务器发送 REPLCONF 命令并处理响应 */
 int sendReplconf(const char* arg1, const char* arg2) {
     int res = 1;
     fprintf(stderr, "sending REPLCONF %s %s\n", arg1, arg2);
@@ -8535,24 +8637,22 @@ void sendRdbOnly(void) {
     sendReplconf("rdb-only", "1");
 }
 
-/* Read raw bytes through a redisContext. The read operation is not greedy
- * and may not fill the buffer entirely.
- */
+/* 通过 redisContext 读取原始字节。
+ * 读操作是非贪婪的，不一定会填满整个缓冲区。 */
 static ssize_t readConn(redisContext *c, char *buf, size_t len)
 {
     return c->funcs->read(c, buf, len);
 }
 
-/* Sends SYNC and reads the number of bytes in the payload. Used both by
- * slaveMode() and getRDB().
+/* 发送 SYNC 命令并读取 payload 大小。slaveMode() 与 getRDB() 都会使用。
  *
- * send_sync if 1 means we will explicitly send SYNC command. If 0 means
- * we will not send SYNC command, will send the command that in c->obuf.
+ * send_sync 为 1 表示显式发送 SYNC 命令；为 0 表示不再发送 SYNC，
+ * 而是把 c->obuf 中已有的命令发送出去。
  *
- * Returns the size of the RDB payload to read, or 0 in case an EOF marker is used and the size
- * is unknown, also returns 0 in case a PSYNC +CONTINUE was found (no RDB payload).
+ * 返回要读取的 RDB payload 大小；若使用 EOF 标记且大小未知则返回 0；
+ * 若收到 PSYNC +CONTINUE（无 RDB payload）也返回 0。
  *
- * The out_full_mode parameter if 1 means this is a full sync, if 0 means this is partial mode. */
+ * out_full_mode 为 1 表示本次为 full sync；为 0 表示 partial mode。 */
 unsigned long long sendSync(redisContext *c, int send_sync, char *out_eof, int *out_full_mode) {
     /* To start we need to send the SYNC command and return the payload.
      * The hiredis client lib does not understand this part of the protocol
@@ -8629,6 +8729,7 @@ unsigned long long sendSync(redisContext *c, int send_sync, char *out_eof, int *
     return strtoull(buf+1,NULL,10);
 }
 
+/* --slave / --replica 模式：模拟从节点接收并打印主节点的命令流 */
 static void slaveMode(int send_sync) {
     static char eofmark[RDB_EOF_MARK_SIZE];
     static char lastbytes[RDB_EOF_MARK_SIZE];
@@ -8696,11 +8797,10 @@ static void slaveMode(int send_sync) {
 }
 
 /*------------------------------------------------------------------------------
- * RDB transfer mode
+ * RDB transfer mode — RDB 转储模式
  *--------------------------------------------------------------------------- */
 
-/* This function implements --rdb, so it uses the replication protocol in order
- * to fetch the RDB file from a remote server. */
+/* 实现 --rdb 选项：通过复制协议从远程服务器拉取 RDB 文件 */
 static void getRDB(clusterManagerNode *node) {
     int fd;
     redisContext *s;
@@ -8796,10 +8896,13 @@ static void getRDB(clusterManagerNode *node) {
 }
 
 /*------------------------------------------------------------------------------
- * Bulk import (pipe) mode
+ * Bulk import (pipe) mode — 管道批量导入模式
  *--------------------------------------------------------------------------- */
 
+/* 管道模式单次写循环允许的最大字节数 */
 #define PIPEMODE_WRITE_LOOP_MAX_BYTES (128*1024)
+
+/* --pipe 模式：从 stdin 读取 RESP 协议并批量发送给服务器 */
 static void pipeMode(void) {
     long long errors = 0, replies = 0, obuf_len = 0, obuf_pos = 0;
     char obuf[1024*16]; /* Output buffer */
@@ -8955,9 +9058,10 @@ static void pipeMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Find big keys
+ * Find big keys — 查找大 key / 内存占用大的 key
  *--------------------------------------------------------------------------- */
 
+/* 发送 SCAN 命令并返回 reply；it 是用于迭代的游标 */
 static redisReply *sendScan(unsigned long long *it) {
     redisReply *reply;
 
@@ -8993,6 +9097,7 @@ static redisReply *sendScan(unsigned long long *it) {
     return reply;
 }
 
+/* 通过 DBSIZE 获取当前数据库 key 数量 */
 static int getDbSize(void) {
     redisReply *reply;
     int size;
@@ -9017,6 +9122,7 @@ static int getDbSize(void) {
     return size;
 }
 
+/* 通过 CONFIG GET databases 获取数据库数量 */
 static int getDatabases(void) {
     redisReply *reply;
     int dbnum;
@@ -9184,13 +9290,14 @@ static void getKeySizes(redisReply *keys, typeinfo **types,
     }
 }
 
+/* 长时统计循环的 SIGINT 处理函数：通知循环优雅退出 */
 static void longStatLoopModeStop(int s) {
     UNUSED(s);
     force_cancel_loop = 1;
 }
 
-/* In cluster mode we may need to send the READONLY command.
-   Ignore the error in case the server isn't using cluster mode. */
+/* 集群模式下需要先发送 READONLY 才能访问从节点。
+ * 若服务器未启用集群则忽略相关错误。 */
 static void sendReadOnly(void) {
     redisReply *read_reply;
     read_reply = redisCommand(context, "READONLY");
@@ -9206,9 +9313,11 @@ static void sendReadOnly(void) {
     freeReplyObject(read_reply);
 }
 
+/* 进度条显示函数声明 */
 static int displayKeyStatsProgressbar(unsigned long long sampled,
                                       unsigned long long total_keys);
 
+/* --bigkeys / --memkeys / --hotkeys 共用的统计扫描主循环 */
 static void findBigKeys(int memkeys, long long memkeys_samples) {
     unsigned long long sampled = 0, total_keys, totlen=0, *sizes=NULL, it=0, scan_loops = 0;
     redisReply *reply, *keys;
@@ -9429,7 +9538,10 @@ static void getKeyFreqs(redisReply *keys, unsigned long long *freqs) {
     }
 }
 
+/* 热门 key 采样保留个数 */
 #define HOTKEYS_SAMPLE 16
+
+/* --hotkeys 模式：找出访问频率最高的 key（需要 maxmemory-policy *lfu） */
 static void findHotKeys(void) {
     redisReply *keys, *reply;
     unsigned long long counters[HOTKEYS_SAMPLE] = {0};
@@ -9567,12 +9679,11 @@ static void findHotKeys(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Stats mode
+ * Stats mode — 服务器统计模式
  *--------------------------------------------------------------------------- */
 
-/* Return the specified INFO field from the INFO command output "info".
- * A new buffer is allocated for the result, that needs to be free'd.
- * If the field is not found NULL is returned. */
+/* 从 INFO 命令输出 'info' 中取回指定字段值。
+ * 返回的缓冲区需要由调用者释放；若字段不存在则返回 NULL。 */
 static char *getInfoField(char *info, char *field) {
     char *p = strstr(info,field);
     char *n1, *n2;
@@ -9589,8 +9700,7 @@ static char *getInfoField(char *info, char *field) {
     return result;
 }
 
-/* Like the above function but automatically convert the result into
- * a long. On error (missing field) LONG_MIN is returned. */
+/* 与 getInfoField 类似，但自动转换为 long。出错（字段缺失）时返回 LONG_MIN。 */
 static long getLongInfoField(char *info, char *field) {
     char *value = getInfoField(info,field);
     long l;
@@ -9601,9 +9711,9 @@ static long getLongInfoField(char *info, char *field) {
     return l;
 }
 
-/* Convert number of bytes into a human readable string of the form:
- * 1003B, 4.03K, 100.00M, 2.32G, 3.01T 
- * Returns the parameter `s` containing the converted number. */
+/* 将字节数转换为人类可读字符串，形式为：
+ * 1003B, 4.03K, 100.00M, 2.32G, 3.01T。
+ * 返回参数 's'，其中保存转换结果。 */
 char *bytesToHuman(char *s, size_t size, long long n) {
     double d;
     char *r = s;
@@ -9633,6 +9743,7 @@ char *bytesToHuman(char *s, size_t size, long long n) {
     return r;
 }
 
+/* --stat 模式：周期性打印服务器统计信息 */
 static void statMode(void) {
     redisReply *reply;
     long aux, requests = 0;
@@ -9724,9 +9835,10 @@ static void statMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Scan mode
+ * Scan mode — SCAN 模式
  *--------------------------------------------------------------------------- */
 
+/* --scan 模式：通过 SCAN 遍历并输出所有匹配 key */
 static void scanMode(void) {
     redisReply *reply;
     unsigned long long cur = 0;
@@ -9751,15 +9863,12 @@ static void scanMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * LRU test mode
+ * LRU test mode — LRU 缓存模拟测试
  *--------------------------------------------------------------------------- */
 
-/* Return an integer from min to max (both inclusive) using a power-law
- * distribution, depending on the value of alpha: the greater the alpha
- * the more bias towards lower values.
- *
- * With alpha = 6.2 the output follows the 80-20 rule where 20% of
- * the returned numbers will account for 80% of the frequency. */
+/* 返回一个 [min, max] 区间内（含两端）的整数，服从幂律分布。
+ * alpha 越大越偏向较小值；alpha = 6.2 时近似 80-20 分布，
+ * 即 20% 的返回值占总频次的 80%。 */
 long long powerLawRand(long long min, long long max, double alpha) {
     double pl, r;
 
@@ -9771,15 +9880,18 @@ long long powerLawRand(long long min, long long max, double alpha) {
     return (max-1-(long long)pl)+min;
 }
 
-/* Generates a key name among a set of lru_test_sample_size keys, using
- * an 80-20 distribution. */
+/* 在 lru_test_sample_size 个 key 中按 80-20 分布生成一个 key 名 */
 void LRUTestGenKey(char *buf, size_t buflen) {
     snprintf(buf, buflen, "lru:%lld",
         powerLawRand(1, config.lru_test_sample_size, 6.2));
 }
 
-#define LRU_CYCLE_PERIOD 1000 /* 1000 milliseconds. */
+/* LRU 测试每个周期长度（毫秒） */
+#define LRU_CYCLE_PERIOD 1000
+/* LRU 测试每个周期内的流水线命令数 */
 #define LRU_CYCLE_PIPELINE_SIZE 250
+
+/* --lru-test 模式：模拟缓存访问负载并报告命中率 */
 static void LRUTestMode(void) {
     redisReply *reply;
     char key[128];
@@ -9842,16 +9954,14 @@ static void LRUTestMode(void) {
 }
 
 /*------------------------------------------------------------------------------
- * Intrinsic latency mode.
+ * Intrinsic latency mode — 系统固有延迟测量
  *
- * Measure max latency of a running process that does not result from
- * syscalls. Basically this software should provide a hint about how much
- * time the kernel leaves the process without a chance to run.
+ * 测量进程自身的最大延迟（不涉及系统调用）。
+ * 用来估算内核在没有调度到本进程时消耗的时间。
  *--------------------------------------------------------------------------- */
 
-/* This is just some computation the compiler can't optimize out.
- * Should run in less than 100-200 microseconds even using very
- * slow hardware. Runs in less than 10 microseconds in modern HW. */
+/* 一段不会被编译器优化掉的计算逻辑。
+ * 在非常慢的硬件上也应在 100-200 微秒内完成；现代硬件一般 < 10 微秒。 */
 unsigned long compute_something_fast(void) {
     unsigned char s[256], i, j, t;
     int count = 1000, k;
@@ -9872,6 +9982,7 @@ unsigned long compute_something_fast(void) {
     return output;
 }
 
+/* SIGINT 处理：用于中断 MONITOR 或 pubsub 阻塞状态 */
 static void sigIntHandler(int s) {
     UNUSED(s);
 
@@ -9884,6 +9995,7 @@ static void sigIntHandler(int s) {
     }
 }
 
+/* --intrinsic-latency 模式：测量进程自身的固有延迟 */
 static void intrinsicLatencyMode(void) {
     long long test_end, run_time, max_latency = 0, runs = 0;
 
@@ -9921,6 +10033,7 @@ static void intrinsicLatencyMode(void) {
     }
 }
 
+/* 在终端上以隐藏输入方式提示输入密码 */
 static sds askPassword(const char *msg) {
     linenoiseMaskModeEnable();
     sds auth = linenoise(msg);
@@ -9928,7 +10041,7 @@ static sds askPassword(const char *msg) {
     return auth;
 }
 
-/* Prints out the hint completion string for a given input prefix string. */
+/* 输出给定输入前缀的提示补全字符串 */
 void testHint(const char *input) {
     cliInitHelp();
 
@@ -9950,7 +10063,7 @@ sds readHintSuiteLine(char buf[], size_t size, FILE *fp) {
     return NULL;
 }
 
-/* Runs a suite of hint completion tests contained in a file. */
+/* 运行文件中的提示补全测试套件 */
 void testHintSuite(char *filename) {
     FILE *fp;
     char buf[256];
@@ -10013,25 +10126,27 @@ void testHintSuite(char *filename) {
 }
 
 /*------------------------------------------------------------------------------
- * Keystats
+ * Keystats — 键统计信息展示
  *--------------------------------------------------------------------------- */
 
-/* Key name length distribution. */
+/* Key 名长度分布相关结构 */
 
+/* 单个长度区间的统计条目 */
 typedef struct size_dist_entry {
-    unsigned long long size;        /* Key name size in bytes. */
-    unsigned long long count;       /* Number of key names that are less or equal to the size. */
+    unsigned long long size;        /* Key 名长度（字节） */
+    unsigned long long count;       /* 长度小于等于 size 的 key 数量 */
 } size_dist_entry;
 
+/* Key 名长度分布统计 */
 typedef struct size_dist {
-    unsigned long long total_count; /* Total number of key names in the distribution. */
-    unsigned long long total_size;  /* Sum of all the key name sizes in bytes. */
-    unsigned long long max_size;    /* Highest key name size in bytes. */
-    size_dist_entry *size_dist;     /* Array of sizes and key names count per size. */
+    unsigned long long total_count; /* key 总数 */
+    unsigned long long total_size;  /* 所有 key 名长度总和（字节） */
+    unsigned long long max_size;    /* 最大的 key 名长度 */
+    size_dist_entry *size_dist;     /* 各区间的 size/count 数组 */
 } size_dist;
 
-/* distribution is an array initialized with last element {0, 0}
- * for instance: size_dist_entry distribution[] = { {32, 0}, {256, 0}, {0, 0} }; */
+/* 初始化 size_dist。distribution 是以 {0, 0} 结尾的 size_dist_entry 数组，
+ * 例如：size_dist_entry distribution[] = { {32, 0}, {256, 0}, {0, 0} }; */
 static void sizeDistInit(size_dist *dist, size_dist_entry *distribution) {
     dist->max_size = 0;
     dist->total_count = 0;
@@ -10085,7 +10200,10 @@ static int displayKeyStatsLengthDist(size_dist *dist) {
     return line_count;
 }
 
+/* 进度条字符宽度 */
 #define PROGRESSBAR_WIDTH 60
+
+/* 显示 bigkeys/memkeys/keystats 等扫描的进度条 */
 static int displayKeyStatsProgressbar(unsigned long long sampled,
                                       unsigned long long total_keys)
 {
@@ -10566,9 +10684,10 @@ static void keyStats(long long memkeys_samples, unsigned long long cursor, unsig
 }
 
 /*------------------------------------------------------------------------------
- * Program main()
+ * Program main() — 程序入口
  *--------------------------------------------------------------------------- */
 
+/* redis-cli 主入口：解析参数、按所选模式运行 */
 int main(int argc, char **argv) {
     int firstarg;
     struct timeval tv;
@@ -10783,28 +10902,28 @@ int main(int argc, char **argv) {
     /* Intrinsic latency mode */
     if (config.intrinsic_latency_mode) intrinsicLatencyMode();
 
-    /* Print command-line hint for an input prefix string */
+    /* 输出给定输入前缀的命令行提示 */
     if (config.test_hint) {
         testHint(config.test_hint);
     }
-    /* Run test suite for command-line hints */
+    /* 运行命令行提示测试套件 */
     if (config.test_hint_file) {
         testHintSuite(config.test_hint_file);
     }
 
-    /* Start interactive mode when no command is provided */
+    /* 未提供命令时进入交互模式 */
     if (argc == 0 && !config.eval) {
-        /* Ignore SIGPIPE in interactive mode to force a reconnect */
+        /* 交互模式下忽略 SIGPIPE，以便断线时强制重连 */
         signal(SIGPIPE, SIG_IGN);
         signal(SIGINT, sigIntHandler);
 
-        /* Note that in repl mode we don't abort on connection error.
-         * A new attempt will be performed for every command send. */
+        /* repl 模式下连接失败不直接退出，
+         * 每次发送命令时都会尝试重连。 */
         cliConnect(0);
         repl();
     }
 
-    /* Otherwise, we have some arguments to execute */
+    /* 否则按提供的参数执行命令 */
     if (config.eval) {
         if (cliConnect(0) != REDIS_OK) exit(1);
         return evalMode(argc,argv);
