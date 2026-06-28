@@ -53,11 +53,24 @@
 
 #define UNUSED(x) ((void)(x))
 
-/* Glob-style pattern matching. */
+/* Glob 风格的通配符模式匹配。
+ *
+ * 支持以下通配符：
+ *   '*' - 匹配任意数量的字符（包括零个）
+ *   '?' - 匹配单个字符
+ *   '[abc]' - 匹配方括号中的任意一个字符
+ *   '[a-z]' - 匹配指定范围内的字符
+ *   '[^abc]' - 匹配不在方括号中的任意字符
+ *   '\\' - 转义字符
+ *
+ * 参数 nocase 为 1 时进行不区分大小写的匹配。
+ * 参数 skipLongerMatches 用于优化：当更长的子串
+ * 不可能匹配时提前终止搜索。
+ * 参数 nesting 用于防止递归深度过大（上限 1000）。 */
 static int stringmatchlen_impl(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase, int *skipLongerMatches, int nesting)
 {
-    /* Protection against abusive patterns. */
+    /* 防止恶意模式导致递归过深。 */
     if (nesting > 1000) return 0;
 
     while(patternLen && stringLen) {
@@ -78,16 +91,12 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
                 string++;
                 stringLen--;
             }
-            /* There was no match for the rest of the pattern starting
-             * from anywhere in the rest of the string. If there were
-             * any '*' earlier in the pattern, we can terminate the
-             * search early without trying to match them to longer
-             * substrings. This is because a longer match for the
-             * earlier part of the pattern would require the rest of the
-             * pattern to match starting later in the string, and we
-             * have just determined that there is no match for the rest
-             * of the pattern starting from anywhere in the current
-             * string. */
+            /* 模式剩余部分在字符串剩余的任何位置都无法匹配。
+             * 如果模式中更早的位置有 '*'，可以提前终止搜索，
+             * 无需尝试将 '*' 匹配更长的子串。因为模式前半部分
+             * 的更长匹配要求模式剩余部分在字符串更靠后的位置
+             * 开始匹配，而我们刚刚已确定模式剩余部分在当前
+             * 字符串的任何位置都无法匹配。 */
             *skipLongerMatches = 1;
             return 0; /* no match */
             break;
@@ -190,17 +199,21 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
     return 0;
 }
 
+/* stringmatchlen_impl 的公共包装函数。
+ * 使用给定的模式和长度对字符串进行 Glob 风格匹配。
+ * nocase 为 1 时不区分大小写。 */
 int stringmatchlen(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase) {
     int skipLongerMatches = 0;
     return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches,0);
 }
 
+/* stringmatchlen 的便捷包装，自动使用 strlen 计算长度。 */
 int stringmatch(const char *pattern, const char *string, int nocase) {
     return stringmatchlen(pattern,strlen(pattern),string,strlen(string),nocase);
 }
 
-/* Fuzz stringmatchlen() trying to crash it with bad input. */
+/* 对 stringmatchlen() 进行模糊测试，尝试用随机输入使其崩溃。 */
 int stringmatchlen_fuzz_test(void) {
     char str[32];
     char pat[32];
@@ -217,23 +230,31 @@ int stringmatchlen_fuzz_test(void) {
 }
 
 
-/* Convert a string representing an amount of memory into the number of
- * bytes, so for instance memtoull("1Gb") will return 1073741824 that is
- * (1024*1024*1024).
+/* 将表示内存大小的字符串转换为字节数，
+ * 例如 memtoull("1Gb") 将返回 1073741824
+ * （即 1024*1024*1024）。
  *
- * On parsing error, if *err is not NULL, it's set to 1, otherwise it's
- * set to 0. On error the function return value is 0, regardless of the
- * fact 'err' is NULL or not. */
+ * 支持的单位后缀：
+ *   b/B  - 字节（乘数 1）
+ *   k    - 千字节（乘数 1000）
+ *   kb   - 千字节（乘数 1024）
+ *   m    - 兆字节（乘数 1000*1000）
+ *   mb   - 兆字节（乘数 1024*1024）
+ *   g    - 吉字节（乘数 1000*1000*1000）
+ *   gb   - 吉字节（乘数 1024*1024*1024）
+ *
+ * 解析出错时，若 *err 不为 NULL，则设为 1，否则设为 0。
+ * 出错时返回值始终为 0，无论 err 是否为 NULL。 */
 unsigned long long memtoull(const char *p, int *err) {
     const char *u;
     char buf[128];
-    long mul; /* unit multiplier */
+    long mul; /* 单位乘数 */
     unsigned long long val;
     unsigned int digits;
 
     if (err) *err = 0;
 
-    /* Search the first non digit character. */
+    /* 查找第一个非数字字符。 */
     u = p;
     if (*u == '-') {
         if (err) *err = 1;
@@ -259,8 +280,8 @@ unsigned long long memtoull(const char *p, int *err) {
         return 0;
     }
 
-    /* Copy the digits into a buffer, we'll use strtoll() to convert
-     * the digit (without the unit) into a number. */
+    /* 将数字部分复制到缓冲区中，然后使用 strtoll()
+     * 将纯数字（不含单位）转换为数值。 */
     digits = u-p;
     if (digits >= sizeof(buf)) {
         if (err) *err = 1;
@@ -279,8 +300,8 @@ unsigned long long memtoull(const char *p, int *err) {
     return val*mul;
 }
 
-/* Search a memory buffer for any set of bytes, like strpbrk().
- * Returns pointer to first found char or NULL.
+/* 在内存缓冲区中搜索指定字符集合中的任意字节，类似 strpbrk()。
+ * 返回指向第一个匹配字符的指针，未找到则返回 NULL。
  */
 const char *mempbrk(const char *s, size_t len, const char *chars, size_t charslen) {
     for (size_t j = 0; j < len; j++) {
@@ -291,8 +312,8 @@ const char *mempbrk(const char *s, size_t len, const char *chars, size_t charsle
     return NULL;
 }
 
-/* Modify the buffer replacing all occurrences of chars from the 'from'
- * set with the corresponding char in the 'to' set. Always returns s.
+/* 修改缓冲区，将所有出现在 'from' 集合中的字符替换为
+ * 'to' 集合中对应的字符。始终返回 s。
  */
 char *memmapchars(char *s, size_t len, const char *from, const char *to, size_t setlen) {
     for (size_t j = 0; j < len; j++) {
@@ -306,8 +327,9 @@ char *memmapchars(char *s, size_t len, const char *from, const char *to, size_t 
     return s;
 }
 
-/* Return the number of digits of 'v' when converted to string in radix 10.
- * See ll2string() for more information. */
+/* 返回 v 转换为十进制字符串时所需的位数。
+ * 使用二分查找法高效判断，最多 5 次比较即可得出结果。
+ * 更多信息参见 ll2string()。 */
 uint32_t digits10(uint64_t v) {
     if (v < 10) return 1;
     if (v < 100) return 2;

@@ -16,9 +16,9 @@
 #include <string.h>
 
 /*
- * Copy string src to buffer dst of size dsize.  At most dsize-1
- * chars will be copied.  Always NUL terminates (unless dsize == 0).
- * Returns strlen(src); if retval >= dsize, truncation occurred.
+ * 将字符串 src 复制到大小为 dsize 的缓冲区 dst 中。
+ * 最多复制 dsize-1 个字符。始终以 NUL 终止（除非 dsize == 0）。
+ * 返回 strlen(src)；若返回值 >= dsize，则发生了截断。
  */
 size_t
 redis_strlcpy(char *dst, const char *src, size_t dsize)
@@ -26,7 +26,7 @@ redis_strlcpy(char *dst, const char *src, size_t dsize)
     const char *osrc = src;
     size_t nleft = dsize;
 
-    /* Copy as many bytes as will fit. */
+    /* 尽可能多地复制字节。 */
     if (nleft != 0) {
         while (--nleft != 0) {
             if ((*dst++ = *src++) == '\0')
@@ -34,23 +34,24 @@ redis_strlcpy(char *dst, const char *src, size_t dsize)
         }
     }
 
-    /* Not enough room in dst, add NUL and traverse rest of src. */
+    /* dst 空间不足，添加 NUL 并遍历 src 剩余部分。 */
     if (nleft == 0) {
         if (dsize != 0)
-            *dst = '\0';        /* NUL-terminate dst */
+            *dst = '\0';        /* 以 NUL 终止 dst */
         while (*src++)
             ;
     }
 
-    return(src - osrc - 1); /* count does not include NUL */
+    return(src - osrc - 1); /* 计数不包含 NUL */
 }
 
 /*
- * Appends src to string dst of size dsize (unlike strncat, dsize is the
- * full size of dst, not space left).  At most dsize-1 characters
- * will be copied.  Always NUL terminates (unless dsize <= strlen(dst)).
- * Returns strlen(src) + MIN(dsize, strlen(initial dst)).
- * If retval >= dsize, truncation occurred.
+ * 将 src 追加到大小为 dsize 的字符串 dst 末尾
+ * （与 strncat 不同，dsize 是 dst 的总大小，而非剩余空间）。
+ * 最多复制 dsize-1 个字符。
+ * 始终以 NUL 终止（除非 dsize <= strlen(dst)）。
+ * 返回 strlen(src) + MIN(dsize, strlen(初始 dst))。
+ * 若返回值 >= dsize，则发生了截断。
  */
 size_t
 redis_strlcat(char *dst, const char *src, size_t dsize)
@@ -60,11 +61,11 @@ redis_strlcat(char *dst, const char *src, size_t dsize)
     size_t n = dsize;
     size_t dlen;
 
-    /* Find the end of dst and adjust bytes left but don't go past end. */
+    /* 找到 dst 的末尾，调整剩余字节数，但不超过缓冲区末尾。 */
     while (n-- != 0 && *dst != '\0')
         dst++;
-    dlen = dst - odst;
-    n = dsize - dlen;
+    dlen = dst - odst;          /* dst 当前已用长度 */
+    n = dsize - dlen;           /* dst 剩余可用空间 */
 
     if (n-- == 0)
         return(dlen + strlen(src));
@@ -77,7 +78,7 @@ redis_strlcat(char *dst, const char *src, size_t dsize)
     }
     *dst = '\0';
 
-    return(dlen + (src - osrc));    /* count does not include NUL */
+    return(dlen + (src - osrc));    /* 计数不包含 NUL */
 }
 
 

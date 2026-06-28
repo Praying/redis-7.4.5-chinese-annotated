@@ -28,6 +28,17 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* redis-check-aof.c - AOF 文件完整性检查与修复工具
+ *
+ * 本文件实现了 Redis AOF (Append Only File) 的离线检查和修复功能。
+ * 支持以下三种文件格式：
+ * 1. 旧式 RESP 格式 AOF
+ * 2. 旧式带 RDB 前导的 AOF
+ * 3. Multi Part AOF（多部分 AOF，包含 manifest 清单文件）
+ *
+ * 用法: redis-check-aof [--fix|--truncate-to-timestamp $timestamp] <file>
+ */
+
 #include "server.h"
 
 #include <sys/stat.h>
@@ -35,11 +46,13 @@
 #include <regex.h>
 #include <libgen.h>
 
-#define AOF_CHECK_OK 0
-#define AOF_CHECK_EMPTY 1
-#define AOF_CHECK_TRUNCATED 2
-#define AOF_CHECK_TIMESTAMP_TRUNCATED 3
+/* AOF 检查结果状态码 */
+#define AOF_CHECK_OK 0                    /* 检查通过 */
+#define AOF_CHECK_EMPTY 1                 /* 文件为空 */
+#define AOF_CHECK_TRUNCATED 2             /* 已截断修复 */
+#define AOF_CHECK_TIMESTAMP_TRUNCATED 3   /* 按时间戳截断 */
 
+/* 输入文件类型枚举 */
 typedef enum {
     AOF_RESP,
     AOF_RDB_PREAMBLE,
@@ -50,17 +63,21 @@ aofManifest *aofManifestCreate(void);
 void aofManifestFree(aofManifest *am);
 aofManifest *aofLoadManifestFromFile(sds am_filepath);
 
+/* 错误信息格式化宏，记录错误位置和描述 */
 #define ERROR(...) { \
     char __buf[1024]; \
     snprintf(__buf, sizeof(__buf), __VA_ARGS__); \
     snprintf(error, sizeof(error), "0x%16llx: %s", (long long)epos, __buf); \
 }
 
+/* 全局静态变量：错误信息缓冲区、错误位置、当前行号、截断目标时间戳 */
 static char error[1044];
 static off_t epos;
 static long long line = 1;
 static time_t to_timestamp = 0;
 
+/* 消费并验证 RESP 协议的 \r\n 行尾。
+ * 成功返回 1，失败设置错误并返回 0。 */
 int consumeNewline(char *buf) {
     if (strncmp(buf,"\r\n",2) != 0) {
         ERROR("Expected \\r\\n, got: %02x%02x",buf[0],buf[1]);
@@ -70,6 +87,9 @@ int consumeNewline(char *buf) {
     return 1;
 }
 
+/* 从文件中读取一个以指定前缀字符开头的长整数。
+ * 例如读取 "$123\r\n" 或 "*3\r\n"。
+ * 成功返回 1，失败返回 0。 */
 int readLong(FILE *fp, char prefix, long *target) {
     char buf[128], *eptr;
     epos = ftello(fp);

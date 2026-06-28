@@ -1,4 +1,4 @@
-/* Synchronous socket and file I/O operations useful across the core.
+/* 同步 Socket 和文件 I/O 操作，供核心模块使用。
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -9,34 +9,34 @@
 
 #include "server.h"
 
-/* ----------------- Blocking sockets I/O with timeouts --------------------- */
+/* ----------------- 带超时的阻塞式 Socket I/O --------------------- */
 
-/* Redis performs most of the I/O in a nonblocking way, with the exception
- * of the SYNC command where the slave does it in a blocking way, and
- * the MIGRATE command that must be blocking in order to be atomic from the
- * point of view of the two instances (one migrating the key and one receiving
- * the key). This is why need the following blocking I/O functions.
+/* Redis 大部分 I/O 以非阻塞方式进行，但有两个例外：
+ * 1) SYNC 命令中，从节点以阻塞方式执行；
+ * 2) MIGRATE 命令必须阻塞，以保证从两个实例的角度来看
+ *   （一个迁移键，一个接收键）操作是原子的。
+ * 因此需要以下阻塞式 I/O 函数。
  *
- * All the functions take the timeout in milliseconds. */
+ * 所有函数的超时参数单位均为毫秒。 */
 
-#define SYNCIO__RESOLUTION 10 /* Resolution in milliseconds */
+#define SYNCIO__RESOLUTION 10 /* 精度：毫秒 */
 
-/* Write the specified payload to 'fd'. If writing the whole payload will be
- * done within 'timeout' milliseconds the operation succeeds and 'size' is
- * returned. Otherwise the operation fails, -1 is returned, and an unspecified
- * partial write could be performed against the file descriptor. */
+/* 将指定数据写入文件描述符 fd。
+ * 如果在 timeout 毫秒内写完所有数据，则操作成功并返回 size。
+ * 否则操作失败，返回 -1，且可能发生部分写入。 */
 ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
-    ssize_t nwritten, ret = size;
-    long long start = mstime();
-    long long remaining = timeout;
+    ssize_t nwritten, ret = size;       /* nwritten: 本次写入字节数 */
+    long long start = mstime();         /* 记录起始时间 */
+    long long remaining = timeout;      /* 剩余超时时间 */
 
     while(1) {
+        /* 每次等待至少保证 SYNCIO__RESOLUTION 毫秒 */
         long long wait = (remaining > SYNCIO__RESOLUTION) ?
                           remaining : SYNCIO__RESOLUTION;
         long long elapsed;
 
-        /* Optimistically try to write before checking if the file descriptor
-         * is actually writable. At worst we get EAGAIN. */
+        /* 先乐观尝试写入，不必先检查 fd 是否可写。
+         * 最坏情况会得到 EAGAIN 错误。 */
         nwritten = write(fd,ptr,size);
         if (nwritten == -1) {
             if (errno != EAGAIN) return -1;
@@ -44,27 +44,26 @@ ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
             ptr += nwritten;
             size -= nwritten;
         }
-        if (size == 0) return ret;
+        if (size == 0) return ret; /* 全部写完 */
 
-        /* Wait */
+        /* 等待 fd 变为可写 */
         aeWait(fd,AE_WRITABLE,wait);
         elapsed = mstime() - start;
         if (elapsed >= timeout) {
-            errno = ETIMEDOUT;
+            errno = ETIMEDOUT;  /* 超时 */
             return -1;
         }
         remaining = timeout - elapsed;
     }
 }
 
-/* Read the specified amount of bytes from 'fd'. If all the bytes are read
- * within 'timeout' milliseconds the operation succeed and 'size' is returned.
- * Otherwise the operation fails, -1 is returned, and an unspecified amount of
- * data could be read from the file descriptor. */
+/* 从文件描述符 fd 读取指定字节数的数据。
+ * 如果在 timeout 毫秒内读完所有数据，则操作成功并返回 size。
+ * 否则操作失败，返回 -1，且可能已读取了部分数据。 */
 ssize_t syncRead(int fd, char *ptr, ssize_t size, long long timeout) {
-    ssize_t nread, totread = 0;
-    long long start = mstime();
-    long long remaining = timeout;
+    ssize_t nread, totread = 0;  /* nread: 本次读取字节数 */
+    long long start = mstime();  /* 记录起始时间 */
+    long long remaining = timeout; /* 剩余超时时间 */
 
     if (size == 0) return 0;
     while(1) {
@@ -72,10 +71,10 @@ ssize_t syncRead(int fd, char *ptr, ssize_t size, long long timeout) {
                           remaining : SYNCIO__RESOLUTION;
         long long elapsed;
 
-        /* Optimistically try to read before checking if the file descriptor
-         * is actually readable. At worst we get EAGAIN. */
+        /* 先乐观尝试读取，不必先检查 fd 是否可读。
+         * 最坏情况会得到 EAGAIN 错误。 */
         nread = read(fd,ptr,size);
-        if (nread == 0) return -1; /* short read. */
+        if (nread == 0) return -1; /* 对端关闭连接（短读） */
         if (nread == -1) {
             if (errno != EAGAIN) return -1;
         } else {
@@ -83,39 +82,40 @@ ssize_t syncRead(int fd, char *ptr, ssize_t size, long long timeout) {
             size -= nread;
             totread += nread;
         }
-        if (size == 0) return totread;
+        if (size == 0) return totread; /* 全部读完 */
 
-        /* Wait */
+        /* 等待 fd 变为可读 */
         aeWait(fd,AE_READABLE,wait);
         elapsed = mstime() - start;
         if (elapsed >= timeout) {
-            errno = ETIMEDOUT;
+            errno = ETIMEDOUT;  /* 超时 */
             return -1;
         }
         remaining = timeout - elapsed;
     }
 }
 
-/* Read a line making sure that every char will not require more than 'timeout'
- * milliseconds to be read.
+/* 从 fd 读取一行数据，保证每个字符的读取不超过 timeout 毫秒。
  *
- * On success the number of bytes read is returned, otherwise -1.
- * On success the string is always correctly terminated with a 0 byte. */
+ * 成功时返回读取的字节数，失败返回 -1。
+ * 成功时字符串总是以 '\0' 正确结尾。 */
 ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout) {
-    ssize_t nread = 0;
+    ssize_t nread = 0; /* 已读取字节数 */
 
-    size--;
+    size--; /* 保留一个字节用于 '\0' 终止符 */
     while(size) {
         char c;
 
+        /* 每次只读一个字符 */
         if (syncRead(fd,&c,1,timeout) == -1) return -1;
         if (c == '\n') {
             *ptr = '\0';
+            /* 将行尾的 CR (\r) 替换为 '\0'（处理 CRLF 行尾） */
             if (nread && *(ptr-1) == '\r') *(ptr-1) = '\0';
             return nread;
         } else {
             *ptr++ = c;
-            *ptr = '\0';
+            *ptr = '\0'; /* 始终保持字符串以 '\0' 结尾 */
             nread++;
         }
         size--;

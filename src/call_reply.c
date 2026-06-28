@@ -9,40 +9,44 @@
 #include "server.h"
 #include "call_reply.h"
 
+/* 标志位：标识该 reply 是根节点（即由 callReplyCreate 创建的顶层对象） */
 #define REPLY_FLAG_ROOT (1<<0)
+/* 标志位：标识该 reply 已经被解析过 */
 #define REPLY_FLAG_PARSED (1<<1)
+/* 标志位：标识该 reply 使用 RESP3 协议格式 */
 #define REPLY_FLAG_RESP3 (1<<2)
 
 /* --------------------------------------------------------
- * An opaque struct used to parse a RESP protocol reply and
- * represent it. Used when parsing replies such as in RM_Call
- * or Lua scripts.
+ * 一个不透明的结构体，用于解析 RESP 协议回复并将其表示为
+ * 内部对象。用于解析 RM_Call 或 Lua 脚本中的回复。
  * -------------------------------------------------------- */
 struct CallReply {
-    void *private_data;
-    sds original_proto; /* Available only for root reply. */
-    const char *proto;
-    size_t proto_len;
-    int type;       /* REPLY_... */
-    int flags;      /* REPLY_FLAG... */
-    size_t len;     /* Length of a string, or the number elements in an array. */
+    void *private_data;        /* 调用者传入的私有数据指针 */
+    sds original_proto;        /* 原始协议缓冲区，仅根 reply 可用 */
+    const char *proto;         /* 当前 reply 对应的协议数据指针 */
+    size_t proto_len;          /* 协议数据长度 */
+    int type;                  /* 回复类型：REPLY_... */
+    int flags;                 /* 标志位：REPLY_FLAG... */
+    size_t len;                /* 字符串长度，或数组中元素的数量 */
     union {
-        const char *str; /* String pointer for string and error replies. This
-                          * does not need to be freed, always points inside
-                          * a reply->proto buffer of the reply object or, in
-                          * case of array elements, of parent reply objects. */
+        const char *str;       /* 字符串和错误回复的指针。无需释放，
+                                * 始终指向 reply 对象自身的 proto
+                                * 缓冲区内部，或（对于数组元素）
+                                * 指向父 reply 对象的 proto 缓冲区 */
         struct {
             const char *str;
             const char *format;
-        } verbatim_str;  /* Reply value for verbatim string */
-        long long ll;    /* Reply value for integer reply. */
-        double d;        /* Reply value for double reply. */
-        struct CallReply *array; /* Array of sub-reply elements. used for set, array, map, and attribute */
+        } verbatim_str;        /* verbatim string 回复的值 */
+        long long ll;          /* 整数回复的值 */
+        double d;              /* 浮点数回复的值 */
+        struct CallReply *array; /* 子回复元素数组，用于 set、array、
+                                   map 和 attribute 类型 */
     } val;
-    list *deferred_error_list;   /* list of errors in sds form or NULL */
-    struct CallReply *attribute; /* attribute reply, NULL if not exists */
+    list *deferred_error_list;   /* sds 形式的错误列表，或 NULL */
+    struct CallReply *attribute; /* attribute 回复，不存在时为 NULL */
 };
 
+/* 设置 CallReply 的公共字段：类型、协议指针、协议长度和额外标志 */
 static void callReplySetSharedData(CallReply *rep, int type, const char *proto, size_t proto_len, int extra_flags) {
     rep->type = type;
     rep->proto = proto;
@@ -50,21 +54,25 @@ static void callReplySetSharedData(CallReply *rep, int type, const char *proto, 
     rep->flags |= extra_flags;
 }
 
+/* 回调：解析 RESP3 null 回复 */
 static void callReplyNull(void *ctx, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_NULL, proto, proto_len, REPLY_FLAG_RESP3);
 }
 
+/* 回调：解析 RESP2 null bulk string 回复 */
 static void callReplyNullBulkString(void *ctx, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_NULL, proto, proto_len, 0);
 }
 
+/* 回调：解析 RESP2 null array 回复 */
 static void callReplyNullArray(void *ctx, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_NULL, proto, proto_len, 0);
 }
 
+/* 回调：解析 bulk string 回复 */
 static void callReplyBulkString(void *ctx, const char *str, size_t len, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_STRING, proto, proto_len, 0);
@@ -72,6 +80,7 @@ static void callReplyBulkString(void *ctx, const char *str, size_t len, const ch
     rep->val.str = str;
 }
 
+/* 回调：解析 error 回复 */
 static void callReplyError(void *ctx, const char *str, size_t len, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_ERROR, proto, proto_len, 0);
@@ -79,6 +88,7 @@ static void callReplyError(void *ctx, const char *str, size_t len, const char *p
     rep->val.str = str;
 }
 
+/* 回调：解析 simple string 回复 */
 static void callReplySimpleStr(void *ctx, const char *str, size_t len, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_STRING, proto, proto_len, 0);
@@ -86,18 +96,21 @@ static void callReplySimpleStr(void *ctx, const char *str, size_t len, const cha
     rep->val.str = str;
 }
 
+/* 回调：解析整数回复 */
 static void callReplyLong(void *ctx, long long val, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_INTEGER, proto, proto_len, 0);
     rep->val.ll = val;
 }
 
+/* 回调：解析 RESP3 浮点数回复 */
 static void callReplyDouble(void *ctx, double val, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_DOUBLE, proto, proto_len, REPLY_FLAG_RESP3);
     rep->val.d = val;
 }
 
+/* 回调：解析 RESP3 verbatim string 回复 */
 static void callReplyVerbatimString(void *ctx, const char *format, const char *str, size_t len, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_VERBATIM_STRING, proto, proto_len, REPLY_FLAG_RESP3);
@@ -106,6 +119,7 @@ static void callReplyVerbatimString(void *ctx, const char *format, const char *s
     rep->val.verbatim_str.format = format;
 }
 
+/* 回调：解析 RESP3 大数回复 */
 static void callReplyBigNumber(void *ctx, const char *str, size_t len, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_BIG_NUMBER, proto, proto_len, REPLY_FLAG_RESP3);
@@ -113,12 +127,16 @@ static void callReplyBigNumber(void *ctx, const char *str, size_t len, const cha
     rep->val.str = str;
 }
 
+/* 回调：解析 RESP3 布尔值回复 */
 static void callReplyBool(void *ctx, int val, const char *proto, size_t proto_len) {
     CallReply *rep = ctx;
     callReplySetSharedData(rep, REDISMODULE_REPLY_BOOL, proto, proto_len, REPLY_FLAG_RESP3);
     rep->val.ll = val;
 }
 
+/* 解析集合类型回复（数组、集合、映射等），为每个元素
+ * 递归调用 parseReply。elements_per_entry 指定每个条目
+ * 包含的元素数（如 map 为 2，其他为 1）。 */
 static void callReplyParseCollection(ReplyParser *parser, CallReply *rep, size_t len, const char *proto, size_t elements_per_entry) {
     rep->len = len;
     rep->val.array = zcalloc(elements_per_entry * len * sizeof(CallReply));
@@ -128,7 +146,7 @@ static void callReplyParseCollection(ReplyParser *parser, CallReply *rep, size_t
             parseReply(parser, rep->val.array + i + j);
             rep->val.array[i + j].flags |= REPLY_FLAG_PARSED;
             if (rep->val.array[i + j].flags & REPLY_FLAG_RESP3) {
-                /* If one of the sub-replies is RESP3, then the current reply is also RESP3. */
+                /* 如果某个子回复是 RESP3，则当前回复也标记为 RESP3 */
                 rep->flags |= REPLY_FLAG_RESP3;
             }
         }
@@ -137,11 +155,13 @@ static void callReplyParseCollection(ReplyParser *parser, CallReply *rep, size_t
     rep->proto_len = parser->curr_location - proto;
 }
 
+/* 回调：解析 RESP3 attribute 回复。attribute 附加在
+ * 主回复之上，需要先解析 attribute，再继续解析主回复。 */
 static void callReplyAttribute(ReplyParser *parser, void *ctx, size_t len, const char *proto) {
     CallReply *rep = ctx;
     rep->attribute = zcalloc(sizeof(CallReply));
 
-    /* Continue parsing the attribute reply */
+    /* 继续解析 attribute 回复 */
     rep->attribute->len = len;
     rep->attribute->type = REDISMODULE_REPLY_ATTRIBUTE;
     callReplyParseCollection(parser, rep->attribute, len, proto, 2);

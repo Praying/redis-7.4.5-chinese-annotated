@@ -1,4 +1,4 @@
-/* SORT command and helper functions.
+/* SORT 命令及其辅助函数。
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -9,12 +9,16 @@
 
 
 #include "server.h"
-#include "pqsort.h" /* Partial qsort for SORT+LIMIT */
+#include "pqsort.h" /* 用于 SORT+LIMIT 的部分快速排序 */
 #include <math.h> /* isnan() */
 #include "cluster.h"
 
+/* 从跳表中按排名获取元素的前置声明 */
 zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
+/* 创建一个排序操作对象。
+ * type: 操作类型（如 SORT_OP_GET）
+ * pattern: 用于 GET/BY 的键模式字符串 */
 redisSortOperation *createSortOperation(int type, robj *pattern) {
     redisSortOperation *so = zmalloc(sizeof(*so));
     so->type = type;
@@ -22,51 +26,45 @@ redisSortOperation *createSortOperation(int type, robj *pattern) {
     return so;
 }
 
-/* Return the value associated to the key with a name obtained using
- * the following rules:
+/* 根据模式查找键的值，规则如下：
  *
- * 1) The first occurrence of '*' in 'pattern' is substituted with 'subst'.
+ * 1) 将 pattern 中第一个 '*' 替换为 subst 的值。
  *
- * 2) If 'pattern' matches the "->" string, everything on the left of
- *    the arrow is treated as the name of a hash field, and the part on the
- *    left as the key name containing a hash. The value of the specified
- *    field is returned.
+ * 2) 如果 pattern 包含 "->"，箭头左侧部分作为包含哈希的键名，
+ *    箭头右侧部分作为哈希字段名，返回该字段的值。
  *
- * 3) If 'pattern' equals "#", the function simply returns 'subst' itself so
- *    that the SORT command can be used like: SORT key GET # to retrieve
- *    the Set/List elements directly.
+ * 3) 如果 pattern 等于 "#"，函数直接返回 subst 本身，
+ *    从而支持 SORT key GET # 这种用法来直接获取集合/列表元素。
  *
- * The returned object will always have its refcount increased by 1
- * when it is non-NULL. */
+ * 返回的对象（非 NULL 时）引用计数总是 +1。 */
 robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
     char *p, *f, *k;
     sds spat, ssub;
     robj *keyobj, *fieldobj = NULL, *o;
     int prefixlen, sublen, postfixlen, fieldlen;
 
-    /* If the pattern is "#" return the substitution object itself in order
-     * to implement the "SORT ... GET #" feature. */
+    /* 如果 pattern 是 "#"，直接返回替换对象本身，
+     * 以实现 "SORT ... GET #" 功能。 */
     spat = pattern->ptr;
     if (spat[0] == '#' && spat[1] == '\0') {
         incrRefCount(subst);
         return subst;
     }
 
-    /* The substitution object may be specially encoded. If so we create
-     * a decoded object on the fly. Otherwise getDecodedObject will just
-     * increment the ref count, that we'll decrement later. */
+    /* 替换对象可能有特殊编码，如果是则动态创建解码后的对象。
+     * 否则 getDecodedObject 仅增加引用计数，后续会减少。 */
     subst = getDecodedObject(subst);
     ssub = subst->ptr;
 
-    /* If we can't find '*' in the pattern we return NULL as to GET a
-     * fixed key does not make sense. */
+    /* 如果 pattern 中没有 '*'，返回 NULL，
+     * 因为 GET 一个固定的键名没有意义。 */
     p = strchr(spat,'*');
     if (!p) {
         decrRefCount(subst);
         return NULL;
     }
 
-    /* Find out if we're dealing with a hash dereference. */
+    /* 判断是否为哈希字段解引用（即 pattern 中包含 "->"）。 */
     if ((f = strstr(p+1, "->")) != NULL && *(f+2) != '\0') {
         fieldlen = sdslen(spat)-(f-spat)-2;
         fieldobj = createStringObject(f+2,fieldlen);
@@ -74,7 +72,7 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
         fieldlen = 0;
     }
 
-    /* Perform the '*' substitution. */
+    /* 执行 '*' 替换：拼接前缀 + 替换值 + 后缀 */
     prefixlen = p-spat;
     sublen = sdslen(ssub);
     postfixlen = sdslen(spat)-(prefixlen+1)-(fieldlen ? fieldlen+2 : 0);
@@ -83,17 +81,17 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
     memcpy(k,spat,prefixlen);
     memcpy(k+prefixlen,ssub,sublen);
     memcpy(k+prefixlen+sublen,p+1,postfixlen);
-    decrRefCount(subst); /* Incremented by decodeObject() */
+    decrRefCount(subst); /* decodeObject() 增加了引用计数，此处减少 */
 
-    /* Lookup substituted key */
+    /* 查找替换后的键 */
     o = lookupKeyRead(db, keyobj);
     if (o == NULL) goto noobj;
 
     if (fieldobj) {
         if (o->type != OBJ_HASH) goto noobj;
 
-        /* Retrieve value from hash by the field name. The returned object
-         * is a new object with refcount already incremented. */
+        /* 根据字段名从哈希中获取值。
+         * 返回的对象是新对象，引用计数已增加。 */
         int isHashDeleted;
         o = hashTypeGetValueObject(db, o, fieldobj->ptr, HFE_LAZY_EXPIRE, &isHashDeleted);
 
@@ -103,8 +101,8 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
     } else {
         if (o->type != OBJ_STRING) goto noobj;
 
-        /* Every object that this function returns needs to have its refcount
-         * increased. sortCommand decreases it again. */
+        /* 本函数返回的所有对象都需要增加引用计数，
+         * 由 sortCommand 负责减少。 */
         incrRefCount(o);
     }
     decrRefCount(keyobj);
@@ -117,30 +115,28 @@ noobj:
     return NULL;
 }
 
-/* sortCompare() is used by qsort in sortCommand(). Given that qsort_r with
- * the additional parameter is not standard but a BSD-specific we have to
- * pass sorting parameters via the global 'server' structure */
+/* sortCompare() 被 sortCommand() 中的 qsort 调用。
+ * 由于带额外参数的 qsort_r 不是标准函数（仅为 BSD 扩展），
+ * 因此通过全局 server 结构体传递排序参数。 */
 int sortCompare(const void *s1, const void *s2) {
     const redisSortObject *so1 = s1, *so2 = s2;
     int cmp;
 
     if (!server.sort_alpha) {
-        /* Numeric sorting. Here it's trivial as we precomputed scores */
+        /* 数值排序：直接比较预计算的分数值 */
         if (so1->u.score > so2->u.score) {
             cmp = 1;
         } else if (so1->u.score < so2->u.score) {
             cmp = -1;
         } else {
-            /* Objects have the same score, but we don't want the comparison
-             * to be undefined, so we compare objects lexicographically.
-             * This way the result of SORT is deterministic. */
+            /* 分数相同时，按字典序比较以保证结果确定性 */
             cmp = compareStringObjects(so1->obj,so2->obj);
         }
     } else {
-        /* Alphanumeric sorting */
+        /* 字母排序 */
         if (server.sort_bypattern) {
             if (!so1->u.cmpobj || !so2->u.cmpobj) {
-                /* At least one compare object is NULL */
+                /* 至少一个比较对象为 NULL */
                 if (so1->u.cmpobj == so2->u.cmpobj)
                     cmp = 0;
                 else if (so1->u.cmpobj == NULL)
@@ -148,17 +144,16 @@ int sortCompare(const void *s1, const void *s2) {
                 else
                     cmp = 1;
             } else {
-                /* We have both the objects, compare them. */
+                /* 两个对象都存在，进行比较 */
                 if (server.sort_store) {
                     cmp = compareStringObjects(so1->u.cmpobj,so2->u.cmpobj);
                 } else {
-                    /* Here we can use strcoll() directly as we are sure that
-                     * the objects are decoded string objects. */
+                    /* 可直接使用 strcoll()，因为对象已确认为解码后的字符串 */
                     cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
                 }
             }
         } else {
-            /* Compare elements directly. */
+            /* 直接比较元素 */
             if (server.sort_store) {
                 cmp = compareStringObjects(so1->obj,so2->obj);
             } else {
@@ -166,6 +161,7 @@ int sortCompare(const void *s1, const void *s2) {
             }
         }
     }
+    /* 如果是降序排列，反转比较结果 */
     return server.sort_desc ? -cmp : cmp;
 }
 
