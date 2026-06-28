@@ -1,13 +1,13 @@
 /*
- * Index-based KV store implementation
- * This file implements a KV store comprised of an array of dicts (see dict.c)
- * The purpose of this KV store is to have easy access to all keys that belong
- * in the same dict (i.e. are in the same dict-index)
+ * 基于索引的 KV 存储实现
+ * 本文件实现了一个由 dict 数组组成的 KV 存储（参见 dict.c）
+ * 该 KV 存储的目的是方便地访问属于同一个 dict
+ * （即同一个 dict-index）的所有键。
  *
- * For example, when Redis is running in cluster mode, we use kvstore to save
- * all keys that map to the same hash-slot in a separate dict within the kvstore
- * struct.
- * This enables us to easily access all keys that map to a specific hash-slot.
+ * 例如，当 Redis 以集群模式运行时，我们使用 kvstore
+ * 将映射到同一哈希槽的所有键保存在 kvstore 结构中的
+ * 一个独立 dict 里。
+ * 这使得我们可以轻松访问映射到特定哈希槽的所有键。
  *
  * Copyright (c) 2011-Present, Redis Ltd. and contributors.
  * All rights reserved.
@@ -27,23 +27,24 @@
 
 #define UNUSED(V) ((void) V)
 
+/* kvstore 核心结构体：由 dict 数组组成的键值存储 */
 struct _kvstore {
-    int flags;
-    dictType dtype;
-    dict **dicts;
-    long long num_dicts;
-    long long num_dicts_bits;
-    list *rehashing;                       /* List of dictionaries in this kvstore that are currently rehashing. */
-    int resize_cursor;                     /* Cron job uses this cursor to gradually resize dictionaries (only used if num_dicts > 1). */
-    int allocated_dicts;                   /* The number of allocated dicts. */
-    int non_empty_dicts;                   /* The number of non-empty dicts. */
-    unsigned long long key_count;          /* Total number of keys in this kvstore. */
-    unsigned long long bucket_count;       /* Total number of buckets in this kvstore across dictionaries. */
-    unsigned long long *dict_size_index;   /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
-    size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
+    int flags;                             /* 标志位，控制分配和释放策略 */
+    dictType dtype;                        /* dict 类型定义，包含哈希函数等回调 */
+    dict **dicts;                          /* dict 指针数组，每个元素对应一个子字典 */
+    long long num_dicts;                   /* 子字典总数（2 的幂次） */
+    long long num_dicts_bits;              /* num_dicts 的对数值（以 2 为底） */
+    list *rehashing;                       /* 当前正在 rehash 的字典列表 */
+    int resize_cursor;                     /* 定时任务用此游标逐步调整字典大小（仅在 num_dicts > 1 时使用） */
+    int allocated_dicts;                   /* 已分配的字典数量 */
+    int non_empty_dicts;                   /* 非空字典数量 */
+    unsigned long long key_count;          /* 此 kvstore 中的键总数 */
+    unsigned long long bucket_count;       /* 此 kvstore 所有字典的桶总数 */
+    unsigned long long *dict_size_index;   /* 树状数组（BIT），描述到给定 dict-index 为止的累计键频率 */
+    size_t overhead_hashtable_rehashing;   /* 字典 rehash 过程中的额外开销 */
 };
 
-/* Structure for kvstore iterator that allows iterating across multiple dicts. */
+/* 允许跨多个 dict 迭代的 kvstore 迭代器结构体 */
 struct _kvstoreIterator {
     kvstore *kvs;
     long long didx;
@@ -51,23 +52,23 @@ struct _kvstoreIterator {
     dictIterator di;
 };
 
-/* Structure for kvstore dict iterator that allows iterating the corresponding dict. */
+/* 允许遍历对应单个 dict 的 kvstore dict 迭代器结构体 */
 struct _kvstoreDictIterator {
     kvstore *kvs;
     long long didx;
     dictIterator di;
 };
 
-/* Dict metadata for database, used for record the position in rehashing list. */
+/* 数据库的 dict 元数据，用于记录在 rehashing 列表中的位置 */
 typedef struct {
-    listNode *rehashing_node;   /* list node in rehashing list */
+    listNode *rehashing_node;   /* rehashing 列表中的节点 */
 } kvstoreDictMetadata;
 
 /**********************************/
-/*** Helpers **********************/
+/*** 辅助函数 *********************/
 /**********************************/
 
-/* Get the dictionary pointer based on dict-index. */
+/* 根据 dict-index 获取对应的字典指针 */
 static dict *kvstoreGetDict(kvstore *kvs, int didx) {
     return kvs->dicts[didx];
 }
@@ -82,8 +83,8 @@ static int kvstoreDictIsRehashingPaused(kvstore *kvs, int didx)
     return d ? dictIsRehashingPaused(d) : 0;
 }
 
-/* Returns total (cumulative) number of keys up until given dict-index (inclusive).
- * Time complexity is O(log(kvs->num_dicts)). */
+/* 返回从开头到给定 dict-index（包含）的累计键数量。
+ * 时间复杂度 O(log(kvs->num_dicts)) */
 static unsigned long long cumulativeKeyCountRead(kvstore *kvs, int didx) {
     if (kvs->num_dicts == 1) {
         assert(didx == 0);
@@ -98,15 +99,17 @@ static unsigned long long cumulativeKeyCountRead(kvstore *kvs, int didx) {
     return sum;
 }
 
+/* 将 dict-index 编码到游标的高位中，用于游标扫描时定位子字典 */
 static void addDictIndexToCursor(kvstore *kvs, int didx, unsigned long long *cursor) {
     if (kvs->num_dicts == 1)
         return;
-    /* didx can be -1 when iteration is over and there are no more dicts to visit. */
+    /* 当迭代结束且没有更多 dict 可访问时，didx 可能为 -1 */
     if (didx < 0)
         return;
     *cursor = (*cursor << kvs->num_dicts_bits) | didx;
 }
 
+/* 从游标的低位中提取 dict-index 并清除，返回 dict-index 值 */
 static int getAndClearDictIndexFromCursor(kvstore *kvs, unsigned long long *cursor) {
     if (kvs->num_dicts == 1)
         return 0;
@@ -115,25 +118,26 @@ static int getAndClearDictIndexFromCursor(kvstore *kvs, unsigned long long *curs
     return didx;
 }
 
-/* Updates binary index tree (also known as Fenwick tree), increasing key count for a given dict.
- * You can read more about this data structure here https://en.wikipedia.org/wiki/Fenwick_tree
- * Time complexity is O(log(kvs->num_dicts)). */
+/* 更新树状数组（也称为 Fenwick 树），增加给定 dict 的键计数。
+ * 更多关于此数据结构的信息：
+ * https://en.wikipedia.org/wiki/Fenwick_tree
+ * 时间复杂度 O(log(kvs->num_dicts)) */
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
     kvs->key_count += delta;
 
     dict *d = kvstoreGetDict(kvs, didx);
     size_t dsize = dictSize(d);
-    /* Increment if dsize is 1 and delta is positive (first element inserted, dict becomes non-empty).
-     * Decrement if dsize is 0 (dict becomes empty). */
+    /* 当 dsize 为 1 且 delta 为正时递增（首个元素插入，字典变为非空）；
+     * 当 dsize 为 0 时递减（字典变为空） */
     int non_empty_dicts_delta = (dsize == 1 && delta > 0) ? 1 : (dsize == 0) ? -1 : 0;
     kvs->non_empty_dicts += non_empty_dicts_delta;
 
-    /* BIT does not need to be calculated when there's only one dict. */
+    /* 只有一个 dict 时不需要计算 BIT */
     if (kvs->num_dicts == 1)
         return;
 
-    /* Update the BIT */
-    int idx = didx + 1; /* Unlike dict indices, BIT is 1-based, so we need to add 1. */
+    /* 更新树状数组（BIT） */
+    int idx = didx + 1; /* 与 dict 索引不同，BIT 是从 1 开始的，所以需要加 1 */
     while (idx <= kvs->num_dicts) {
         if (delta < 0) {
             assert(kvs->dict_size_index[idx] >= (unsigned long long)labs(delta));
@@ -143,7 +147,7 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
     }
 }
 
-/* Create the dict if it does not exist and return it. */
+/* 如果 dict 不存在则创建它，并返回该 dict */
 static dict *createDictIfNeeded(kvstore *kvs, int didx) {
     dict *d = kvstoreGetDict(kvs, didx);
     if (d) return d;
@@ -153,13 +157,11 @@ static dict *createDictIfNeeded(kvstore *kvs, int didx) {
     return kvs->dicts[didx];
 }
 
-/* Called when the dict will delete entries, the function will check
- * KVSTORE_FREE_EMPTY_DICTS to determine whether the empty dict needs
- * to be freed.
+/* 当 dict 将要删除条目时调用，此函数会检查
+ * KVSTORE_FREE_EMPTY_DICTS 标志来决定是否需要释放空字典。
  *
- * Note that for rehashing dicts, that is, in the case of safe iterators
- * and Scan, we won't delete the dict. We will check whether it needs
- * to be deleted when we're releasing the iterator. */
+ * 注意：对于正在 rehash 的字典（即安全迭代器和 Scan 的情况），
+ * 我们不会删除该字典。我们会在释放迭代器时检查是否需要删除它 */
 static void freeDictIfNeeded(kvstore *kvs, int didx) {
     if (!(kvs->flags & KVSTORE_FREE_EMPTY_DICTS) ||
         !kvstoreGetDict(kvs, didx) ||
@@ -172,15 +174,15 @@ static void freeDictIfNeeded(kvstore *kvs, int didx) {
 }
 
 /**********************************/
-/*** dict callbacks ***************/
+/*** dict 回调函数 ****************/
 /**********************************/
 
-/* Adds dictionary to the rehashing list, which allows us
- * to quickly find rehash targets during incremental rehashing.
+/* 将字典添加到 rehashing 列表中，使我们能在增量
+ * rehash 期间快速找到 rehash 目标。
  *
- * If there are multiple dicts, updates the bucket count for the given dictionary
- * in a DB, bucket count incremented with the new ht size during the rehashing phase.
- * If there's one dict, bucket count can be retrieved directly from single dict bucket. */
+ * 如果有多个 dict，在 rehash 阶段会更新给定字典
+ * 的桶计数（用新的哈希表大小递增）。
+ * 如果只有一个 dict，桶计数可以直接从单个 dict 获取 */
 static void kvstoreDictRehashingStarted(dict *d) {
     kvstore *kvs = d->type->userdata;
     kvstoreDictMetadata *metadata = (kvstoreDictMetadata *)dictMetadata(d);
