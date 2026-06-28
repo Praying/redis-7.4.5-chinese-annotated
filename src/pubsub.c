@@ -9,47 +9,46 @@
 #include "server.h"
 #include "cluster.h"
 
-/* Structure to hold the pubsub related metadata. Currently used
- * for pubsub and pubsubshard feature. */
+/* 用于保存 Pub/Sub 相关元数据的结构体。
+ * 目前同时用于全局 Pub/Sub 和分片 Pub/Sub 功能。 */
 typedef struct pubsubtype {
-    int shard;
-    dict *(*clientPubSubChannels)(client*);
-    int (*subscriptionCount)(client*);
-    kvstore **serverPubSubChannels;
-    robj **subscribeMsg;
-    robj **unsubscribeMsg;
-    robj **messageBulk;
+    int shard;                          /* 是否为分片频道，1=是，0=否 */
+    dict *(*clientPubSubChannels)(client*); /* 获取客户端订阅频道字典的函数指针 */
+    int (*subscriptionCount)(client*);      /* 获取客户端订阅数量的函数指针 */
+    kvstore **serverPubSubChannels;     /* 服务端级别频道 -> 客户端列表的 kvstore 指针 */
+    robj **subscribeMsg;                /* 订阅响应消息（如 "subscribe"） */
+    robj **unsubscribeMsg;              /* 取消订阅响应消息（如 "unsubscribe"） */
+    robj **messageBulk;                 /* 消息类型标识（如 "message"） */
 }pubsubtype;
 
 /*
- * Get client's global Pub/Sub channels subscription count.
+ * 获取客户端全局 Pub/Sub 频道的订阅数量。
  */
 int clientSubscriptionsCount(client *c);
 
 /*
- * Get client's shard level Pub/Sub channels subscription count.
+ * 获取客户端分片级别 Pub/Sub 频道的订阅数量。
  */
 int clientShardSubscriptionsCount(client *c);
 
 /*
- * Get client's global Pub/Sub channels dict.
+ * 获取客户端全局 Pub/Sub 频道字典。
  */
 dict* getClientPubSubChannels(client *c);
 
 /*
- * Get client's shard level Pub/Sub channels dict.
+ * 获取客户端分片级别 Pub/Sub 频道字典。
  */
 dict* getClientPubSubShardChannels(client *c);
 
 /*
- * Get list of channels client is subscribed to.
- * If a pattern is provided, the subset of channels is returned
- * matching the pattern.
+ * 获取客户端已订阅的频道列表。
+ * 如果提供了模式参数，则只返回与该模式匹配的频道子集。
  */
 void channelList(client *c, sds pat, kvstore *pubsub_channels);
 
 /*
- * Pub/Sub type for global channels.
+ * 全局频道的 Pub/Sub 类型实例。
  */
 pubsubtype pubSubType = {
     .shard = 0,
@@ -62,7 +61,8 @@ pubsubtype pubSubType = {
 };
 
 /*
- * Pub/Sub type for shard level channels bounded to a slot.
+ * 分片级别频道的 Pub/Sub 类型实例，
+ * 与特定哈希槽绑定。
  */
 pubsubtype pubSubShardType = {
     .shard = 1,
@@ -75,14 +75,13 @@ pubsubtype pubSubShardType = {
 };
 
 /*-----------------------------------------------------------------------------
- * Pubsub client replies API
+ * Pub/Sub 客户端响应 API
  *----------------------------------------------------------------------------*/
 
-/* Send a pubsub message of type "message" to the client.
- * Normally 'msg' is a Redis object containing the string to send as
- * message. However if the caller sets 'msg' as NULL, it will be able
- * to send a special message (for instance an Array type) by using the
- * addReply*() API family. */
+/* 向客户端发送类型为 "message" 的 Pub/Sub 消息。
+ * 通常 'msg' 是包含要发送消息字符串的 Redis 对象。
+ * 但如果调用者将 'msg' 设为 NULL，则可以通过
+ * addReply*() 系列 API 发送特殊消息（例如数组类型）。 */
 void addReplyPubsubMessage(client *c, robj *channel, robj *msg, robj *message_bulk) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -96,9 +95,9 @@ void addReplyPubsubMessage(client *c, robj *channel, robj *msg, robj *message_bu
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
-/* Send a pubsub message of type "pmessage" to the client. The difference
- * with the "message" type delivered by addReplyPubsubMessage() is that
- * this message format also includes the pattern that matched the message. */
+/* 向客户端发送类型为 "pmessage" 的 Pub/Sub 消息。
+ * 与 addReplyPubsubMessage() 发送的 "message" 类型的区别是，
+ * 此消息格式还包含匹配到消息的模式字符串。 */
 void addReplyPubsubPatMessage(client *c, robj *pat, robj *channel, robj *msg) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -113,7 +112,7 @@ void addReplyPubsubPatMessage(client *c, robj *pat, robj *channel, robj *msg) {
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
-/* Send the pubsub subscription notification to the client. */
+/* 向客户端发送 Pub/Sub 订阅确认通知。 */
 void addReplyPubsubSubscribed(client *c, robj *channel, pubsubtype type) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -127,10 +126,9 @@ void addReplyPubsubSubscribed(client *c, robj *channel, pubsubtype type) {
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
-/* Send the pubsub unsubscription notification to the client.
- * Channel can be NULL: this is useful when the client sends a mass
- * unsubscribe command but there are no channels to unsubscribe from: we
- * still send a notification. */
+/* 向客户端发送 Pub/Sub 取消订阅确认通知。
+ * channel 可以为 NULL：当客户端执行批量取消订阅命令但没有
+ * 可取消的频道时，仍然需要发送通知。 */
 void addReplyPubsubUnsubscribed(client *c, robj *channel, pubsubtype type) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -147,7 +145,7 @@ void addReplyPubsubUnsubscribed(client *c, robj *channel, pubsubtype type) {
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
-/* Send the pubsub pattern subscription notification to the client. */
+/* 向客户端发送模式订阅确认通知。 */
 void addReplyPubsubPatSubscribed(client *c, robj *pattern) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -161,10 +159,9 @@ void addReplyPubsubPatSubscribed(client *c, robj *pattern) {
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
-/* Send the pubsub pattern unsubscription notification to the client.
- * Pattern can be NULL: this is useful when the client sends a mass
- * punsubscribe command but there are no pattern to unsubscribe from: we
- * still send a notification. */
+/* 向客户端发送模式取消订阅确认通知。
+ * pattern 可以为 NULL：当客户端执行批量模式取消订阅命令
+ * 但没有可取消的模式时，仍然需要发送通知。 */
 void addReplyPubsubPatUnsubscribed(client *c, robj *pattern) {
     uint64_t old_flags = c->flags;
     c->flags |= CLIENT_PUSHING;
@@ -182,25 +179,25 @@ void addReplyPubsubPatUnsubscribed(client *c, robj *pattern) {
 }
 
 /*-----------------------------------------------------------------------------
- * Pubsub low level API
+ * Pub/Sub 底层 API
  *----------------------------------------------------------------------------*/
 
-/* Return the number of pubsub channels + patterns is handled. */
+/* 返回当前服务器处理的 Pub/Sub 频道 + 模式的总数量。 */
 int serverPubsubSubscriptionCount(void) {
     return kvstoreSize(server.pubsub_channels) + dictSize(server.pubsub_patterns);
 }
 
-/* Return the number of pubsub shard level channels is handled. */
+/* 返回当前服务器处理的分片级别 Pub/Sub 频道数量。 */
 int serverPubsubShardSubscriptionCount(void) {
     return kvstoreSize(server.pubsubshard_channels);
 }
 
-/* Return the number of channels + patterns a client is subscribed to. */
+/* 返回客户端订阅的频道 + 模式的总数量。 */
 int clientSubscriptionsCount(client *c) {
     return dictSize(c->pubsub_channels) + dictSize(c->pubsub_patterns);
 }
 
-/* Return the number of shard level channels a client is subscribed to. */
+/* 返回客户端订阅的分片级别频道数量。 */
 int clientShardSubscriptionsCount(client *c) {
     return dictSize(c->pubsubshard_channels);
 }
@@ -213,12 +210,12 @@ dict* getClientPubSubShardChannels(client *c) {
     return c->pubsubshard_channels;
 }
 
-/* Return the number of pubsub + pubsub shard level channels
- * a client is subscribed to. */
+/* 返回客户端订阅的全局 Pub/Sub + 分片级别频道的总数量。 */
 int clientTotalPubSubSubscriptionCount(client *c) {
     return clientSubscriptionsCount(c) + clientShardSubscriptionsCount(c);
 }
 
+/* 将客户端标记为 Pub/Sub 模式，并增加服务器的 Pub/Sub 客户端计数。 */
 void markClientAsPubSub(client *c) {
     if (!(c->flags & CLIENT_PUBSUB)) {
         c->flags |= CLIENT_PUBSUB;
@@ -226,6 +223,7 @@ void markClientAsPubSub(client *c) {
     }
 }
 
+/* 取消客户端的 Pub/Sub 模式标记，并减少服务器的 Pub/Sub 客户端计数。 */
 void unmarkClientAsPubSub(client *c) {
     if (c->flags & CLIENT_PUBSUB) {
         c->flags &= ~CLIENT_PUBSUB;
@@ -233,19 +231,19 @@ void unmarkClientAsPubSub(client *c) {
     }
 }
 
-/* Subscribe a client to a channel. Returns 1 if the operation succeeded, or
- * 0 if the client was already subscribed to that channel. */
+/* 将客户端订阅到指定频道。操作成功返回 1，
+ * 如果客户端已经订阅了该频道则返回 0。 */
 int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
     dictEntry *de, *existing;
     dict *clients = NULL;
     int retval = 0;
     unsigned int slot = 0;
 
-    /* Add the channel to the client -> channels hash table */
+    /* 将频道添加到客户端 -> 频道哈希表中 */
     void *position = dictFindPositionForInsert(type.clientPubSubChannels(c),channel,NULL);
-    if (position) { /* Not yet subscribed to this channel */
+    if (position) { /* 客户端尚未订阅此频道 */
         retval = 1;
-        /* Add the client to the channel -> list of clients hash table */
+        /* 将客户端添加到频道 -> 客户端列表哈希表中 */
         if (server.cluster_enabled && type.shard) {
             slot = getKeySlot(channel->ptr);
         }
@@ -265,25 +263,25 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
         serverAssert(dictInsertAtPosition(type.clientPubSubChannels(c), channel, position));
         incrRefCount(channel);
     }
-    /* Notify the client */
+    /* 通知客户端 */
     addReplyPubsubSubscribed(c,channel,type);
     return retval;
 }
 
-/* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
- * 0 if the client was not subscribed to the specified channel. */
+/* 取消客户端对指定频道的订阅。操作成功返回 1，
+ * 如果客户端未订阅该频道则返回 0。 */
 int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype type) {
     dictEntry *de;
     dict *clients;
     int retval = 0;
     int slot = 0;
 
-    /* Remove the channel from the client -> channels hash table */
-    incrRefCount(channel); /* channel may be just a pointer to the same object
-                            we have in the hash tables. Protect it... */
+    /* 从客户端 -> 频道哈希表中移除该频道 */
+    incrRefCount(channel); /* channel 可能只是指向哈希表中同一对象的指针，
+                            此处增加引用计数以保护该对象... */
     if (dictDelete(type.clientPubSubChannels(c),channel) == DICT_OK) {
         retval = 1;
-        /* Remove the client from the channel -> clients list hash table */
+        /* 从频道 -> 客户端列表哈希表中移除该客户端 */
         if (server.cluster_enabled && type.shard) {
             slot = getKeySlot(channel->ptr);
         }
@@ -292,21 +290,20 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
         clients = dictGetVal(de);
         serverAssertWithInfo(c, NULL, dictDelete(clients, c) == DICT_OK);
         if (dictSize(clients) == 0) {
-            /* Free the dict and associated hash entry at all if this was
-             * the latest client, so that it will be possible to abuse
-             * Redis PUBSUB creating millions of channels. */
+            /* 如果这是最后一个客户端，则释放字典及关联的哈希表条目，
+             * 这样可以防止滥用 Redis PUBSUB 命令创建海量频道。 */
             kvstoreDictDelete(*type.serverPubSubChannels, slot, channel);
         }
     }
-    /* Notify the client */
+    /* 通知客户端 */
     if (notify) {
         addReplyPubsubUnsubscribed(c,channel,type);
     }
-    decrRefCount(channel); /* it is finally safe to release it */
+    decrRefCount(channel); /* 此时可以安全释放引用计数 */
     return retval;
 }
 
-/* Unsubscribe all shard channels in a slot. */
+/* 取消指定槽位中所有分片频道的订阅。 */
 void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
     if (!kvstoreDictSize(server.pubsubshard_channels, slot))
         return;
@@ -316,7 +313,7 @@ void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
     while ((de = kvstoreDictIteratorNext(kvs_di)) != NULL) {
         robj *channel = dictGetKey(de);
         dict *clients = dictGetVal(de);
-        /* For each client subscribed to the channel, unsubscribe it. */
+        /* 遍历订阅该频道的每个客户端，取消其订阅。 */
         dictIterator *iter = dictGetIterator(clients);
         dictEntry *entry;
         while ((entry = dictNext(iter)) != NULL) {
@@ -324,8 +321,8 @@ void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
             int retval = dictDelete(c->pubsubshard_channels, channel);
             serverAssertWithInfo(c,channel,retval == DICT_OK);
             addReplyPubsubUnsubscribed(c, channel, pubSubShardType);
-            /* If the client has no other pubsub subscription,
-             * move out of pubsub mode. */
+            /* 如果客户端没有其他 Pub/Sub 订阅，
+             * 则退出 Pub/Sub 模式。 */
             if (clientTotalPubSubSubscriptionCount(c) == 0) {
                 unmarkClientAsPubSub(c);
             }
@@ -336,7 +333,8 @@ void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
     kvstoreReleaseDictIterator(kvs_di);
 }
 
-/* Subscribe a client to a pattern. Returns 1 if the operation succeeded, or 0 if the client was already subscribed to that pattern. */
+/* 将客户端订阅到指定模式。操作成功返回 1，
+ * 如果客户端已经订阅了该模式则返回 0。 */
 int pubsubSubscribePattern(client *c, robj *pattern) {
     dictEntry *de;
     dict *clients;
@@ -345,7 +343,7 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
     if (dictAdd(c->pubsub_patterns, pattern, NULL) == DICT_OK) {
         retval = 1;
         incrRefCount(pattern);
-        /* Add the client to the pattern -> list of clients hash table */
+        /* 将客户端添加到模式 -> 客户端列表哈希表中 */
         de = dictFind(server.pubsub_patterns,pattern);
         if (de == NULL) {
             clients = dictCreate(&clientDictType);
@@ -356,40 +354,38 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
         }
         serverAssert(dictAdd(clients, c, NULL) != DICT_ERR);
     }
-    /* Notify the client */
+    /* 通知客户端 */
     addReplyPubsubPatSubscribed(c,pattern);
     return retval;
 }
 
-/* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
- * 0 if the client was not subscribed to the specified channel. */
+/* 取消客户端对指定模式的订阅。操作成功返回 1，
+ * 如果客户端未订阅该模式则返回 0。 */
 int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
     dictEntry *de;
     dict *clients;
     int retval = 0;
 
-    incrRefCount(pattern); /* Protect the object. May be the same we remove */
+    incrRefCount(pattern); /* 保护对象，因为可能要移除的就是它本身 */
     if (dictDelete(c->pubsub_patterns, pattern) == DICT_OK) {
         retval = 1;
-        /* Remove the client from the pattern -> clients list hash table */
+        /* 从模式 -> 客户端列表哈希表中移除该客户端 */
         de = dictFind(server.pubsub_patterns,pattern);
         serverAssertWithInfo(c,NULL,de != NULL);
         clients = dictGetVal(de);
         serverAssertWithInfo(c, NULL, dictDelete(clients, c) == DICT_OK);
         if (dictSize(clients) == 0) {
-            /* Free the dict and associated hash entry at all if this was
-             * the latest client. */
+            /* 如果这是最后一个客户端，则释放字典及关联的哈希表条目。 */
             dictDelete(server.pubsub_patterns,pattern);
         }
     }
-    /* Notify the client */
+    /* 通知客户端 */
     if (notify) addReplyPubsubPatUnsubscribed(c,pattern);
     decrRefCount(pattern);
     return retval;
 }
 
-/* Unsubscribe from all the channels. Return the number of channels the
- * client was subscribed to. */
+/* 取消客户端对所有频道的订阅。返回客户端之前订阅的频道数量。 */
 int pubsubUnsubscribeAllChannelsInternal(client *c, int notify, pubsubtype type) {
     int count = 0;
     if (dictSize(type.clientPubSubChannels(c)) > 0) {
@@ -403,7 +399,7 @@ int pubsubUnsubscribeAllChannelsInternal(client *c, int notify, pubsubtype type)
         }
         dictReleaseIterator(di);
     }
-    /* We were subscribed to nothing? Still reply to the client. */
+    /* 没有任何订阅？仍然需要回复客户端。 */
     if (notify && count == 0) {
         addReplyPubsubUnsubscribed(c,NULL,type);
     }
@@ -411,7 +407,7 @@ int pubsubUnsubscribeAllChannelsInternal(client *c, int notify, pubsubtype type)
 }
 
 /*
- * Unsubscribe a client from all global channels.
+ * 取消客户端对所有全局频道的订阅。
  */
 int pubsubUnsubscribeAllChannels(client *c, int notify) {
     int count = pubsubUnsubscribeAllChannelsInternal(c,notify,pubSubType);
@@ -419,15 +415,14 @@ int pubsubUnsubscribeAllChannels(client *c, int notify) {
 }
 
 /*
- * Unsubscribe a client from all shard subscribed channels.
+ * 取消客户端对所有分片频道的订阅。
  */
 int pubsubUnsubscribeShardAllChannels(client *c, int notify) {
     int count = pubsubUnsubscribeAllChannelsInternal(c, notify, pubSubShardType);
     return count;
 }
 
-/* Unsubscribe from all the patterns. Return the number of patterns the
- * client was subscribed from. */
+/* 取消客户端对所有模式的订阅。返回客户端之前订阅的模式数量。 */
 int pubsubUnsubscribeAllPatterns(client *c, int notify) {
     int count = 0;
 
@@ -442,13 +437,13 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify) {
         dictReleaseIterator(di);
     }
 
-    /* We were subscribed to nothing? Still reply to the client. */
+    /* 没有任何订阅？仍然需要回复客户端。 */
     if (notify && count == 0) addReplyPubsubPatUnsubscribed(c,NULL);
     return count;
 }
 
 /*
- * Publish a message to all the subscribers.
+ * 向所有订阅者发布消息。
  */
 int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) {
     int receivers = 0;
@@ -456,7 +451,7 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     dictIterator *di;
     unsigned int slot = 0;
 
-    /* Send to clients listening for that channel */
+    /* 发送给正在监听该频道的客户端 */
     if (server.cluster_enabled && type.shard) {
         slot = keyHashSlot(channel->ptr, sdslen(channel->ptr));
     }
@@ -475,11 +470,11 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     }
 
     if (type.shard) {
-        /* Shard pubsub ignores patterns. */
+        /* 分片 Pub/Sub 不支持模式匹配。 */
         return receivers;
     }
 
-    /* Send to clients listening to matching channels */
+    /* 发送给正在监听匹配频道的客户端 */
     di = dictGetIterator(server.pubsub_patterns);
     if (di) {
         channel = getDecodedObject(channel);
@@ -507,13 +502,13 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     return receivers;
 }
 
-/* Publish a message to all the subscribers. */
+/* 向所有订阅者发布消息。 */
 int pubsubPublishMessage(robj *channel, robj *message, int sharded) {
     return pubsubPublishMessageInternal(channel, message, sharded? pubSubShardType : pubSubType);
 }
 
 /*-----------------------------------------------------------------------------
- * Pubsub commands implementation
+ * Pub/Sub 命令实现
  *----------------------------------------------------------------------------*/
 
 /* SUBSCRIBE channel [channel ...] */
@@ -521,11 +516,11 @@ void subscribeCommand(client *c) {
     int j;
     if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
         /**
-         * A client that has CLIENT_DENY_BLOCKING flag on
-         * expect a reply per command and so can not execute subscribe.
+         * 带有 CLIENT_DENY_BLOCKING 标志的客户端期望
+         * 每条命令都有响应，因此不能执行 subscribe 操作。
          *
-         * Notice that we have a special treatment for multi because of
-         * backward compatibility
+         * 注意：出于向后兼容的考虑，
+         * MULTI 事务中有特殊处理。
          */
         addReplyError(c, "SUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
@@ -555,11 +550,11 @@ void psubscribeCommand(client *c) {
     int j;
     if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
         /**
-         * A client that has CLIENT_DENY_BLOCKING flag on
-         * expect a reply per command and so can not execute subscribe.
+         * 带有 CLIENT_DENY_BLOCKING 标志的客户端期望
+         * 每条命令都有响应，因此不能执行 subscribe 操作。
          *
-         * Notice that we have a special treatment for multi because of
-         * backward compatibility
+         * 注意：出于向后兼容的考虑，
+         * MULTI 事务中有特殊处理。
          */
         addReplyError(c, "PSUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
@@ -585,8 +580,8 @@ void punsubscribeCommand(client *c) {
     }
 }
 
-/* This function wraps pubsubPublishMessage and also propagates the message to cluster.
- * Used by the commands PUBLISH/SPUBLISH and their respective module APIs.*/
+/* 此函数封装了 pubsubPublishMessage，并将消息传播到集群。
+ * 被 PUBLISH/SPUBLISH 命令及相应的模块 API 使用。 */
 int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int sharded) {
     int receivers = pubsubPublishMessage(channel, message, sharded);
     if (server.cluster_enabled)
@@ -607,7 +602,7 @@ void publishCommand(client *c) {
     addReplyLongLong(c,receivers);
 }
 
-/* PUBSUB command for Pub/Sub introspection. */
+/* PUBSUB 命令：用于 Pub/Sub 自省查询。 */
 void pubsubCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
@@ -628,11 +623,11 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"channels") &&
         (c->argc == 2 || c->argc == 3))
     {
-        /* PUBSUB CHANNELS [<pattern>] */
+        /* PUBSUB CHANNELS [<pattern>]：列出匹配模式的活跃频道 */
         sds pat = (c->argc == 2) ? NULL : c->argv[2]->ptr;
         channelList(c, pat, server.pubsub_channels);
     } else if (!strcasecmp(c->argv[1]->ptr,"numsub") && c->argc >= 2) {
-        /* PUBSUB NUMSUB [Channel_1 ... Channel_N] */
+        /* PUBSUB NUMSUB [Channel_1 ... Channel_N]：查询指定频道的订阅者数量 */
         int j;
 
         addReplyArrayLen(c,(c->argc-2)*2);
@@ -643,16 +638,16 @@ NULL
             addReplyLongLong(c, d ? dictSize(d) : 0);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"numpat") && c->argc == 2) {
-        /* PUBSUB NUMPAT */
+        /* PUBSUB NUMPAT：查询模式订阅的总数量 */
         addReplyLongLong(c,dictSize(server.pubsub_patterns));
     } else if (!strcasecmp(c->argv[1]->ptr,"shardchannels") &&
         (c->argc == 2 || c->argc == 3)) 
     {
-        /* PUBSUB SHARDCHANNELS */
+        /* PUBSUB SHARDCHANNELS：列出匹配模式的分片频道 */
         sds pat = (c->argc == 2) ? NULL : c->argv[2]->ptr;
         channelList(c,pat,server.pubsubshard_channels);
     } else if (!strcasecmp(c->argv[1]->ptr,"shardnumsub") && c->argc >= 2) {
-        /* PUBSUB SHARDNUMSUB [ShardChannel_1 ... ShardChannel_N] */
+        /* PUBSUB SHARDNUMSUB [...]：查询分片频道的订阅者数量 */
         int j;
         addReplyArrayLen(c, (c->argc-2)*2);
         for (j = 2; j < c->argc; j++) {
@@ -667,6 +662,7 @@ NULL
     }
 }
 
+/* 返回客户端订阅的频道列表，可按模式过滤。 */
 void channelList(client *c, sds pat, kvstore *pubsub_channels) {
     long mblen = 0;
     void *replylen;
@@ -694,7 +690,7 @@ void channelList(client *c, sds pat, kvstore *pubsub_channels) {
     setDeferredArrayLen(c,replylen,mblen);
 }
 
-/* SPUBLISH <shardchannel> <message> */
+/* SPUBLISH <shardchannel> <message>：向分片频道发布消息 */
 void spublishCommand(client *c) {
     int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1],c->argv[2],1);
     if (!server.cluster_enabled)
@@ -702,11 +698,11 @@ void spublishCommand(client *c) {
     addReplyLongLong(c,receivers);
 }
 
-/* SSUBSCRIBE shardchannel [shardchannel ...] */
+/* SSUBSCRIBE shardchannel [shardchannel ...]：订阅分片频道 */
 void ssubscribeCommand(client *c) {
     if (c->flags & CLIENT_DENY_BLOCKING) {
-        /* A client that has CLIENT_DENY_BLOCKING flag on
-         * expect a reply per command and so can not execute subscribe. */
+        /* 带有 CLIENT_DENY_BLOCKING 标志的客户端期望
+         * 每条命令都有响应，因此不能执行 subscribe 操作。 */
         addReplyError(c, "SSUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
     }
@@ -717,7 +713,7 @@ void ssubscribeCommand(client *c) {
     markClientAsPubSub(c);
 }
 
-/* SUNSUBSCRIBE [shardchannel [shardchannel ...]] */
+/* SUNSUBSCRIBE [shardchannel [shardchannel ...]]：取消订阅分片频道 */
 void sunsubscribeCommand(client *c) {
     if (c->argc == 1) {
         pubsubUnsubscribeShardAllChannels(c, 1);
@@ -731,16 +727,18 @@ void sunsubscribeCommand(client *c) {
     }
 }
 
+/* 计算客户端 Pub/Sub 相关数据结构的内存开销。 */
 size_t pubsubMemOverhead(client *c) {
-    /* PubSub patterns */
+    /* Pub/Sub 模式订阅的内存开销 */
     size_t mem = dictMemUsage(c->pubsub_patterns);
-    /* Global PubSub channels */
+    /* 全局 Pub/Sub 频道的内存开销 */
     mem += dictMemUsage(c->pubsub_channels);
-    /* Sharded PubSub channels */
+    /* 分片 Pub/Sub 频道的内存开销 */
     mem += dictMemUsage(c->pubsubshard_channels);
     return mem;
 }
 
+/* 返回服务器上所有 Pub/Sub 订阅的总数量（包括模式和分片频道）。 */
 int pubsubTotalSubscriptions(void) {
     return dictSize(server.pubsub_patterns) +
            kvstoreSize(server.pubsub_channels) +

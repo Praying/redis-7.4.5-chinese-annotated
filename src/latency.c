@@ -1,7 +1,5 @@
-/* The latency monitor allows to easily observe the sources of latency
- * in a Redis instance using the LATENCY command. Different latency
- * sources are monitored, like disk I/O, execution of commands, fork
- * system call, and so forth.
+/* 延迟监控器允许通过 LATENCY 命令轻松观察 Redis 实例中的延迟来源。
+ * 不同的延迟来源会被监控，如磁盘 I/O、命令执行、fork 系统调用等。
  *
  * ----------------------------------------------------------------------------
  *
@@ -15,7 +13,7 @@
 #include "server.h"
 #include "hdr_histogram.h"
 
-/* Dictionary type for latency events. */
+/* 延迟事件的字典类型定义 */
 int dictStringKeyCompare(dict *d, const void *key1, const void *key2) {
     UNUSED(d);
     return strcmp(key1,key2) == 0;
@@ -28,43 +26,42 @@ uint64_t dictStringHash(const void *key) {
 void dictVanillaFree(dict *d, void *val);
 
 dictType latencyTimeSeriesDictType = {
-    dictStringHash,             /* hash function */
-    NULL,                       /* key dup */
-    NULL,                       /* val dup */
-    dictStringKeyCompare,       /* key compare */
-    dictVanillaFree,            /* key destructor */
-    dictVanillaFree,            /* val destructor */
-    NULL                        /* allow to expand */
+    dictStringHash,             /* 哈希函数 */
+    NULL,                       /* 键复制 */
+    NULL,                       /* 值复制 */
+    dictStringKeyCompare,       /* 键比较 */
+    dictVanillaFree,            /* 键析构函数 */
+    dictVanillaFree,            /* 值析构函数 */
+    NULL                        /* 允许扩展 */
 };
 
-/* ------------------------- Utility functions ------------------------------ */
+/* ------------------------- 工具函数 --------------------------------------- */
 
-/* Report the amount of AnonHugePages in smap, in bytes. If the return
- * value of the function is non-zero, the process is being targeted by
- * THP support, and is likely to have memory usage / latency issues. */
+/* 报告 smap 中 AnonHugePages 的大小（字节）。如果返回值非零，
+ * 说明进程启用了 THP（透明大页）支持，可能会出现内存使用 /
+ * 延迟问题。 */
 int THPGetAnonHugePagesSize(void) {
     return zmalloc_get_smap_bytes_by_field("AnonHugePages:",-1);
 }
 
-/* ---------------------------- Latency API --------------------------------- */
+/* ---------------------------- 延迟 API ------------------------------------ */
 
-/* Latency monitor initialization. We just need to create the dictionary
- * of time series, each time series is created on demand in order to avoid
- * having a fixed list to maintain. */
+/* 延迟监控器初始化。只需要创建时间序列的字典，每个时间序列
+ * 按需创建，以避免维护一个固定的列表。 */
 void latencyMonitorInit(void) {
     server.latency_events = dictCreate(&latencyTimeSeriesDictType);
 }
 
-/* Add the specified sample to the specified time series "event".
- * This function is usually called via latencyAddSampleIfNeeded(), that
- * is a macro that only adds the sample if the latency is higher than
- * server.latency_monitor_threshold. */
+/* 将指定的采样值添加到指定的时间序列 "event" 中。
+ * 此函数通常通过 latencyAddSampleIfNeeded() 调用，
+ * 那是一个宏，仅在延迟高于
+ * server.latency_monitor_threshold 时才添加采样。 */
 void latencyAddSample(const char *event, mstime_t latency) {
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events,event);
     time_t now = time(NULL);
     int prev;
 
-    /* Create the time series if it does not exist. */
+    /* 如果时间序列不存在则创建 */
     if (ts == NULL) {
         ts = zmalloc(sizeof(*ts));
         ts->idx = 0;
@@ -75,8 +72,8 @@ void latencyAddSample(const char *event, mstime_t latency) {
 
     if (latency > ts->max) ts->max = latency;
 
-    /* If the previous sample is in the same second, we update our old sample
-     * if this latency is > of the old one, or just return. */
+    /* 如果上一个采样在同一秒内，当新延迟大于旧值时更新旧采样，
+     * 否则直接返回。 */
     prev = (ts->idx + LATENCY_TS_LEN - 1) % LATENCY_TS_LEN;
     if (ts->samples[prev].time == now) {
         if (latency > ts->samples[prev].latency)
@@ -91,11 +88,10 @@ void latencyAddSample(const char *event, mstime_t latency) {
     if (ts->idx == LATENCY_TS_LEN) ts->idx = 0;
 }
 
-/* Reset data for the specified event, or all the events data if 'event' is
- * NULL.
+/* 重置指定事件的数据，若 'event' 为 NULL 则重置所有事件数据。
  *
- * Note: this is O(N) even when event_to_reset is not NULL because makes
- * the code simpler and we have a small fixed max number of events. */
+ * 注意：即使 event_to_reset 不为 NULL，复杂度也是 O(N)，
+ * 因为这样代码更简单，而且事件的最大数量是固定的且很小。 */
 int latencyResetEvent(char *event_to_reset) {
     dictIterator *di;
     dictEntry *de;
@@ -114,13 +110,12 @@ int latencyResetEvent(char *event_to_reset) {
     return resets;
 }
 
-/* ------------------------ Latency reporting (doctor) ---------------------- */
+/* ------------------------ 延迟报告（诊断）--------------------------------- */
 
-/* Analyze the samples available for a given event and return a structure
- * populate with different metrics, average, MAD, min, max, and so forth.
- * Check latency.h definition of struct latencyStats for more info.
- * If the specified event has no elements the structure is populate with
- * zero values. */
+/* 分析给定事件的可用采样，返回填充了不同指标（平均值、MAD、
+ * 最小值、最大值等）的结构体。详情请查看 latency.h 中
+ * struct latencyStats 的定义。
+ * 如果指定事件没有元素，则结构体用零值填充。 */
 void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events,event);
     int j;
@@ -135,7 +130,7 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
     ls->period = 0;
     if (!ts) return;
 
-    /* First pass, populate everything but the MAD. */
+    /* 第一遍遍历，填充除 MAD 之外的所有指标 */
     sum = 0;
     for (j = 0; j < LATENCY_TS_LEN; j++) {
         if (ts->samples[j].time == 0) continue;
@@ -150,21 +145,20 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
         }
         sum += ts->samples[j].latency;
 
-        /* Track the oldest event time in ls->period. */
+        /* 追踪 ls->period 中最旧的事件时间 */
         if (ls->period == 0 || ts->samples[j].time < ls->period)
             ls->period = ts->samples[j].time;
     }
 
-    /* So far avg is actually the sum of the latencies, and period is
-     * the oldest event time. We need to make the first an average and
-     * the second a range of seconds. */
+    /* 目前 avg 实际上是延迟总和，period 是最旧事件时间。
+     * 我们需要将前者转为平均值，将后者转为秒数范围。 */
     if (ls->samples) {
         ls->avg = sum / ls->samples;
         ls->period = time(NULL) - ls->period;
         if (ls->period == 0) ls->period = 1;
     }
 
-    /* Second pass, compute MAD. */
+    /* 第二遍遍历，计算 MAD（平均绝对偏差） */
     sum = 0;
     for (j = 0; j < LATENCY_TS_LEN; j++) {
         int64_t delta;
@@ -177,29 +171,28 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
     if (ls->samples) ls->mad = sum / ls->samples;
 }
 
-/* Create a human readable report of latency events for this Redis instance. */
+/* 为此 Redis 实例创建一份人类可读的延迟事件报告。 */
 sds createLatencyReport(void) {
     sds report = sdsempty();
-    int advise_better_vm = 0;       /* Better virtual machines. */
-    int advise_slowlog_enabled = 0; /* Enable slowlog. */
-    int advise_slowlog_tuning = 0;  /* Reconfigure slowlog. */
-    int advise_slowlog_inspect = 0; /* Check your slowlog. */
-    int advise_disk_contention = 0; /* Try to lower disk contention. */
-    int advise_scheduler = 0;       /* Intrinsic latency. */
-    int advise_data_writeback = 0;  /* data=writeback. */
-    int advise_no_appendfsync = 0;  /* don't fsync during rewrites. */
-    int advise_local_disk = 0;      /* Avoid remote disks. */
-    int advise_ssd = 0;             /* Use an SSD drive. */
-    int advise_write_load_info = 0; /* Print info about AOF and write load. */
-    int advise_hz = 0;              /* Use higher HZ. */
-    int advise_large_objects = 0;   /* Deletion of large objects. */
-    int advise_mass_eviction = 0;   /* Avoid mass eviction of keys. */
-    int advise_relax_fsync_policy = 0; /* appendfsync always is slow. */
-    int advise_disable_thp = 0;     /* AnonHugePages detected. */
+    int advise_better_vm = 0;       /* 使用更好的虚拟机 */
+    int advise_slowlog_enabled = 0; /* 启用慢查询日志 */
+    int advise_slowlog_tuning = 0;  /* 重新配置慢查询日志 */
+    int advise_slowlog_inspect = 0; /* 检查慢查询日志 */
+    int advise_disk_contention = 0; /* 尝试降低磁盘争用 */
+    int advise_scheduler = 0;       /* 固有延迟 */
+    int advise_data_writeback = 0;  /* data=writeback */
+    int advise_no_appendfsync = 0;  /* 重写时不执行 fsync */
+    int advise_local_disk = 0;      /* 避免使用远程磁盘 */
+    int advise_ssd = 0;             /* 使用 SSD 磁盘 */
+    int advise_write_load_info = 0; /* 打印 AOF 和写负载信息 */
+    int advise_hz = 0;              /* 使用更高的 HZ 值 */
+    int advise_large_objects = 0;   /* 大对象的删除 */
+    int advise_mass_eviction = 0;   /* 避免大量键被驱逐 */
+    int advise_relax_fsync_policy = 0; /* appendfsync always 太慢 */
+    int advise_disable_thp = 0;     /* 检测到 AnonHugePages */
     int advices = 0;
 
-    /* Return ASAP if the latency engine is disabled and it looks like it
-     * was never enabled so far. */
+    /* 如果延迟引擎已禁用且看起来从未启用过，则立即返回 */
     if (dictSize(server.latency_events) == 0 &&
         server.latency_monitor_threshold == 0)
     {
@@ -207,8 +200,7 @@ sds createLatencyReport(void) {
         return report;
     }
 
-    /* Show all the events stats and add for each event some event-related
-     * comment depending on the values. */
+    /* 显示所有事件统计信息，并根据值为每个事件添加相关评论 */
     dictIterator *di;
     dictEntry *de;
     int eventnum = 0;
@@ -235,7 +227,7 @@ sds createLatencyReport(void) {
             (double) ls.period/ls.samples,
             (unsigned long) ts->max);
 
-        /* Fork */
+        /* Fork 事件 */
         if (!strcasecmp(event,"fork")) {
             char *fork_quality;
             if (server.stat_fork_rate < 10) {
@@ -256,7 +248,7 @@ sds createLatencyReport(void) {
                 fork_quality);
         }
 
-        /* Potentially commands. */
+        /* 命令相关事件 */
         if (!strcasecmp(event,"command")) {
             if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) {
                 advise_slowlog_enabled = 1;
@@ -272,13 +264,13 @@ sds createLatencyReport(void) {
             advices += 2;
         }
 
-        /* fast-command. */
+        /* 快速命令事件 */
         if (!strcasecmp(event,"fast-command")) {
             advise_scheduler = 1;
             advices++;
         }
 
-        /* AOF and I/O. */
+        /* AOF 和 I/O 相关事件 */
         if (!strcasecmp(event,"aof-write-pending-fsync")) {
             advise_local_disk = 1;
             advise_disk_contention = 1;
@@ -322,14 +314,14 @@ sds createLatencyReport(void) {
             advices += 4;
         }
 
-        /* Expire cycle. */
+        /* 过期周期事件 */
         if (!strcasecmp(event,"expire-cycle")) {
             advise_hz = 1;
             advise_large_objects = 1;
             advices += 2;
         }
 
-        /* Eviction cycle. */
+        /* 驱逐周期事件 */
         if (!strcasecmp(event,"eviction-del")) {
             advise_large_objects = 1;
             advices++;
@@ -344,7 +336,7 @@ sds createLatencyReport(void) {
     }
     dictReleaseIterator(di);
 
-    /* Add non event based advices. */
+    /* 添加非事件相关的建议 */
     if (THPGetAnonHugePagesSize() > 0) {
         advise_disable_thp = 1;
         advices++;
@@ -355,15 +347,15 @@ sds createLatencyReport(void) {
     } else if (eventnum > 0 && advices == 0) {
         report = sdscat(report,"\nWhile there are latency events logged, I'm not able to suggest any easy fix. Please use the Redis community to get some help, providing this report in your help request.\n");
     } else {
-        /* Add all the suggestions accumulated so far. */
+        /* 添加所有累积的建议 */
 
-        /* Better VM. */
+        /* 更好的虚拟机 */
         report = sdscat(report,"\nI have a few advices for you:\n\n");
         if (advise_better_vm) {
             report = sdscat(report,"- If you are using a virtual machine, consider upgrading it with a faster one using a hypervisior that provides less latency during fork() calls. Xen is known to have poor fork() performance. Even in the context of the same VM provider, certain kinds of instances can execute fork faster than others.\n");
         }
 
-        /* Slow log. */
+        /* 慢查询日志 */
         if (advise_slowlog_enabled) {
             report = sdscatprintf(report,"- There are latency issues with potentially slow commands you are using. Try to enable the Slow Log Redis feature using the command 'CONFIG SET slowlog-log-slower-than %llu'. If the Slow log is disabled Redis is not able to log slow commands execution for you.\n", (unsigned long long)server.latency_monitor_threshold*1000);
         }
@@ -376,7 +368,7 @@ sds createLatencyReport(void) {
             report = sdscat(report,"- Check your Slow Log to understand what are the commands you are running which are too slow to execute. Please check https://redis.io/commands/slowlog for more information.\n");
         }
 
-        /* Intrinsic latency. */
+        /* 固有延迟 */
         if (advise_scheduler) {
             report = sdscat(report,"- The system is slow to execute Redis code paths not containing system calls. This usually means the system does not provide Redis CPU time to run for long periods. You should try to:\n"
             "  1) Lower the system load.\n"
@@ -386,7 +378,7 @@ sds createLatencyReport(void) {
             "  5) Check if the problem is allocator-related by recompiling Redis with MALLOC=libc, if you are using Jemalloc. However this may create fragmentation problems.\n");
         }
 
-        /* AOF / Disk latency. */
+        /* AOF / 磁盘延迟 */
         if (advise_local_disk) {
             report = sdscat(report,"- It is strongly advised to use local disks for persistence, especially if you are using AOF. Remote disks provided by platform-as-a-service providers are known to be slow.\n");
         }
@@ -435,15 +427,14 @@ sds createLatencyReport(void) {
     return report;
 }
 
-/* ---------------------- Latency command implementation -------------------- */
+/* ---------------------- 延迟命令实现 --------------------------------------- */
 
-/* latencyCommand() helper to produce a map of time buckets,
- * each representing a latency range,
- * between 1 nanosecond and roughly 1 second.
- * Each bucket covers twice the previous bucket's range.
- * Empty buckets are not printed.
- * Everything above 1 sec is considered +Inf.
- * At max there will be log2(1000000000)=30 buckets */
+/* latencyCommand() 的辅助函数，用于生成一个时间桶映射，
+ * 每个桶代表一个延迟范围，从 1 纳秒到大约 1 秒。
+ * 每个桶覆盖前一个桶范围的两倍。
+ * 空桶不会被打印。
+ * 超过 1 秒的都视为 +Inf。
+ * 最多会有 log2(1000000000)=30 个桶 */
 void fillCommandCDF(client *c, struct hdr_histogram* histogram) {
     addReplyMapLen(c,2);
     addReplyBulkCString(c,"calls");
@@ -467,8 +458,8 @@ void fillCommandCDF(client *c, struct hdr_histogram* histogram) {
     setDeferredMapLen(c,replylen,samples);
 }
 
-/* latencyCommand() helper to produce for all commands,
- * a per command cumulative distribution of latencies. */
+/* latencyCommand() 的辅助函数，为所有命令生成
+ * 每个命令的延迟累积分布。 */
 void latencyAllCommandsFillCDF(client *c, dict *commands, int *command_with_data) {
     dictIterator *di = dictGetSafeIterator(commands);
     dictEntry *de;
@@ -489,14 +480,14 @@ void latencyAllCommandsFillCDF(client *c, dict *commands, int *command_with_data
     dictReleaseIterator(di);
 }
 
-/* latencyCommand() helper to produce for a specific command set,
- * a per command cumulative distribution of latencies. */
+/* latencyCommand() 的辅助函数，为指定的命令集生成
+ * 每个命令的延迟累积分布。 */
 void latencySpecificCommandsFillCDF(client *c) {
     void *replylen = addReplyDeferredLen(c);
     int command_with_data = 0;
     for (int j = 2; j < c->argc; j++){
         struct redisCommand *cmd = lookupCommandBySds(c->argv[j]->ptr);
-        /* If the command does not exist we skip the reply */
+        /* 如果命令不存在则跳过该回复 */
         if (cmd == NULL) {
             continue;
         }
@@ -525,8 +516,8 @@ void latencySpecificCommandsFillCDF(client *c) {
     setDeferredMapLen(c,replylen,command_with_data);
 }
 
-/* latencyCommand() helper to produce a time-delay reply for all the samples
- * in memory for the specified time series. */
+/* latencyCommand() 的辅助函数，为指定时间序列中内存里
+ * 的所有采样生成时间-延迟回复。 */
 void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
     void *replylen = addReplyDeferredLen(c);
     int samples = 0, j;
@@ -543,8 +534,8 @@ void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
     setDeferredArrayLen(c,replylen,samples);
 }
 
-/* latencyCommand() helper to produce the reply for the LATEST subcommand,
- * listing the last latency sample for every event type registered so far. */
+/* latencyCommand() 的辅助函数，为 LATEST 子命令生成回复，
+ * 列出迄今为止注册的每种事件类型的最新延迟采样。 */
 void latencyCommandReplyWithLatestEvents(client *c) {
     dictIterator *di;
     dictEntry *de;
@@ -578,15 +569,14 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
         char buf[64];
 
         if (ts->samples[i].time == 0) continue;
-        /* Update min and max. */
+        /* 更新最小值和最大值 */
         if (seq->length == 0) {
             min = max = ts->samples[i].latency;
         } else {
             if (ts->samples[i].latency > max) max = ts->samples[i].latency;
             if (ts->samples[i].latency < min) min = ts->samples[i].latency;
         }
-        /* Use as label the number of seconds / minutes / hours / days
-         * ago the event happened. */
+        /* 使用事件发生前的秒/分/小时/天数作为标签 */
         elapsed = time(NULL) - ts->samples[i].time;
         if (elapsed < 60)
             snprintf(buf,sizeof(buf),"%ds",elapsed);
@@ -610,20 +600,20 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
     return graph;
 }
 
-/* LATENCY command implementations.
+/* LATENCY 命令实现。
  *
- * LATENCY HISTORY: return time-latency samples for the specified event.
- * LATENCY LATEST: return the latest latency for all the events classes.
- * LATENCY DOCTOR: returns a human readable analysis of instance latency.
- * LATENCY GRAPH: provide an ASCII graph of the latency of the specified event.
- * LATENCY RESET: reset data of a specified event or all the data if no event provided.
- * LATENCY HISTOGRAM: return a cumulative distribution of latencies in the format of an histogram for the specified command names.
+ * LATENCY HISTORY: 返回指定事件的时间-延迟采样。
+ * LATENCY LATEST: 返回所有事件类别的最新延迟。
+ * LATENCY DOCTOR: 返回实例延迟的人类可读分析报告。
+ * LATENCY GRAPH: 提供指定事件延迟的 ASCII 图形。
+ * LATENCY RESET: 重置指定事件的数据，若未提供事件则重置所有数据。
+ * LATENCY HISTOGRAM: 以直方图格式返回指定命令名称的延迟累积分布。
  */
 void latencyCommand(client *c) {
     struct latencyTimeSeries *ts;
 
     if (!strcasecmp(c->argv[1]->ptr,"history") && c->argc == 3) {
-        /* LATENCY HISTORY <event> */
+        /* LATENCY HISTORY <event> - 返回指定事件的历史采样 */
         ts = dictFetchValue(server.latency_events,c->argv[2]->ptr);
         if (ts == NULL) {
             addReplyArrayLen(c,0);
@@ -631,7 +621,7 @@ void latencyCommand(client *c) {
             latencyCommandReplyWithSamples(c,ts);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"graph") && c->argc == 3) {
-        /* LATENCY GRAPH <event> */
+        /* LATENCY GRAPH <event> - 返回指定事件的 ASCII 图形 */
         sds graph;
         dictEntry *de;
         char *event;
@@ -645,16 +635,16 @@ void latencyCommand(client *c) {
         addReplyVerbatim(c,graph,sdslen(graph),"txt");
         sdsfree(graph);
     } else if (!strcasecmp(c->argv[1]->ptr,"latest") && c->argc == 2) {
-        /* LATENCY LATEST */
+        /* LATENCY LATEST - 返回最新延迟采样 */
         latencyCommandReplyWithLatestEvents(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"doctor") && c->argc == 2) {
-        /* LATENCY DOCTOR */
+        /* LATENCY DOCTOR - 生成延迟诊断报告 */
         sds report = createLatencyReport();
 
         addReplyVerbatim(c,report,sdslen(report),"txt");
         sdsfree(report);
     } else if (!strcasecmp(c->argv[1]->ptr,"reset") && c->argc >= 2) {
-        /* LATENCY RESET */
+        /* LATENCY RESET - 重置延迟数据 */
         if (c->argc == 2) {
             addReplyLongLong(c,latencyResetEvent(NULL));
         } else {
@@ -665,7 +655,7 @@ void latencyCommand(client *c) {
             addReplyLongLong(c,resets);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"histogram") && c->argc >= 2) {
-        /* LATENCY HISTOGRAM*/
+        /* LATENCY HISTOGRAM - 返回延迟直方图 */
         if (c->argc == 2) {
             int command_with_data = 0;
             void *replylen = addReplyDeferredLen(c);
@@ -699,12 +689,12 @@ NULL
     return;
 
 nodataerr:
-    /* Common error when the user asks for an event we have no latency
-     * information about. */
+    /* 当用户请求的事件没有延迟信息时的常见错误 */
     addReplyErrorFormat(c,
         "No samples available for event '%s'", (char*) c->argv[2]->ptr);
 }
 
+/* 添加持续时间采样到指定类型的统计中 */
 void durationAddSample(int type, monotime duration) {
     if (type >= EL_DURATION_TYPE_NUM) {
         return;

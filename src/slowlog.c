@@ -1,12 +1,12 @@
-/* Slowlog implements a system that is able to remember the latest N
- * queries that took more than M microseconds to execute.
+/* Slowlog（慢查询日志）实现了一个能够记住最近 N 个
+ * 执行时间超过 M 微秒的查询的系统。
  *
- * The execution time to reach to be logged in the slow log is set
- * using the 'slowlog-log-slower-than' config directive, that is also
- * readable and writable using the CONFIG SET/GET command.
+ * 被记录到慢查询日志中的执行时间阈值通过
+ * 'slowlog-log-slower-than' 配置指令设置，该指令也可以
+ * 通过 CONFIG SET/GET 命令进行读写。
  *
- * The slow queries log is actually not "logged" in the Redis log file
- * but is accessible thanks to the SLOWLOG command.
+ * 慢查询日志实际上并不"记录"到 Redis 日志文件中，
+ * 而是通过 SLOWLOG 命令来访问。
  *
  * ----------------------------------------------------------------------------
  *
@@ -21,9 +21,8 @@
 #include "server.h"
 #include "slowlog.h"
 
-/* Create a new slowlog entry.
- * Incrementing the ref count of all the objects retained is up to
- * this function. */
+/* 创建一个新的慢查询日志条目。
+ * 增加所有保留对象的引用计数由此函数负责。 */
 slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long duration) {
     slowlogEntry *se = zmalloc(sizeof(*se));
     int j, slargc = argc;
@@ -32,15 +31,15 @@ slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long dur
     se->argc = slargc;
     se->argv = zmalloc(sizeof(robj*)*slargc);
     for (j = 0; j < slargc; j++) {
-        /* Logging too many arguments is a useless memory waste, so we stop
-         * at SLOWLOG_ENTRY_MAX_ARGC, but use the last argument to specify
-         * how many remaining arguments there were in the original command. */
+        /* 记录过多参数是无用的内存浪费，因此我们在
+         * SLOWLOG_ENTRY_MAX_ARGC 处停止，但用最后一个参数
+         * 说明原始命令中还有多少剩余参数。 */
         if (slargc != argc && j == slargc-1) {
             se->argv[j] = createObject(OBJ_STRING,
                 sdscatprintf(sdsempty(),"... (%d more arguments)",
                 argc-slargc+1));
         } else {
-            /* Trim too long strings as well... */
+            /* 同时截断过长的字符串 */
             if (argv[j]->type == OBJ_STRING &&
                 sdsEncodedObject(argv[j]) &&
                 sdslen(argv[j]->ptr) > SLOWLOG_ENTRY_MAX_STRING)
@@ -54,12 +53,11 @@ slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long dur
             } else if (argv[j]->refcount == OBJ_SHARED_REFCOUNT) {
                 se->argv[j] = argv[j];
             } else {
-                /* Here we need to duplicate the string objects composing the
-                 * argument vector of the command, because those may otherwise
-                 * end shared with string objects stored into keys. Having
-                 * shared objects between any part of Redis, and the data
-                 * structure holding the data, is a problem: FLUSHALL ASYNC
-                 * may release the shared string object and create a race. */
+                /* 这里需要复制构成命令参数向量的字符串对象，
+                 * 因为它们可能与存储在键中的字符串对象共享。
+                 * 在 Redis 的任何部分和存储数据的数据结构之间
+                 * 共享对象是一个问题：FLUSHALL ASYNC 可能释放
+                 * 共享的字符串对象并产生竞态条件。 */
                 se->argv[j] = dupStringObject(argv[j]);
             }
         }
@@ -72,10 +70,10 @@ slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long dur
     return se;
 }
 
-/* Free a slow log entry. The argument is void so that the prototype of this
- * function matches the one of the 'free' method of adlist.c.
+/* 释放一个慢查询日志条目。参数类型为 void，
+ * 以匹配 adlist.c 中 'free' 方法的函数原型。
  *
- * This function will take care to release all the retained object. */
+ * 此函数负责释放所有保留的对象。 */
 void slowlogFreeEntry(void *septr) {
     slowlogEntry *se = septr;
     int j;
@@ -88,36 +86,33 @@ void slowlogFreeEntry(void *septr) {
     zfree(se);
 }
 
-/* Initialize the slow log. This function should be called a single time
- * at server startup. */
+/* 初始化慢查询日志。此函数应在服务器启动时调用一次。 */
 void slowlogInit(void) {
     server.slowlog = listCreate();
     server.slowlog_entry_id = 0;
     listSetFreeMethod(server.slowlog,slowlogFreeEntry);
 }
 
-/* Push a new entry into the slow log.
- * This function will make sure to trim the slow log accordingly to the
- * configured max length. */
+/* 向慢查询日志中推入一个新条目。
+ * 此函数会确保根据配置的最大长度修剪慢查询日志。 */
 void slowlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long duration) {
-    if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) return; /* Slowlog disabled */
+    if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) return; /* 慢查询日志已禁用 */
     if (duration >= server.slowlog_log_slower_than)
         listAddNodeHead(server.slowlog,
                         slowlogCreateEntry(c,argv,argc,duration));
 
-    /* Remove old entries if needed. */
+    /* 如有需要，移除旧条目 */
     while (listLength(server.slowlog) > server.slowlog_max_len)
         listDelNode(server.slowlog,listLast(server.slowlog));
 }
 
-/* Remove all the entries from the current slow log. */
+/* 移除当前慢查询日志中的所有条目。 */
 void slowlogReset(void) {
     while (listLength(server.slowlog) > 0)
         listDelNode(server.slowlog,listLast(server.slowlog));
 }
 
-/* The SLOWLOG command. Implements all the subcommands needed to handle the
- * Redis slow log. */
+/* SLOWLOG 命令。实现处理 Redis 慢查询日志所需的所有子命令。 */
 void slowlogCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
@@ -147,14 +142,14 @@ NULL
         slowlogEntry *se;
 
         if (c->argc == 3) {
-            /* Consume count arg. */
+            /* 解析 count 参数 */
             if (getRangeLongFromObjectOrReply(c, c->argv[2], -1,
                     LONG_MAX, &count, "count should be greater than or equal to -1") != C_OK)
                 return;
 
             if (count == -1) {
-                /* We treat -1 as a special value, which means to get all slow logs.
-                 * Simply set count to the length of server.slowlog.*/
+                /* 将 -1 视为特殊值，表示获取所有慢查询日志。
+                 * 将 count 设置为 server.slowlog 的长度即可。*/
                 count = listLength(server.slowlog);
             }
         }
